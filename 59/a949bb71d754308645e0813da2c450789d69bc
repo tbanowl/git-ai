@@ -1,0 +1,24 @@
+docs/plans/2026-03-29-rest-notes-store-design.md
+  5d881ebe1ee955dc 1-383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "59a949bb71d754308645e0813da2c450789d69bc",
+  "prompts": {
+    "5d881ebe1ee955dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bd94717a-82f0-46a2-9f83-f03fb42a6fb2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "ZhangLei <tbanowl@gmail.com>",
+      "messages": [],
+      "total_additions": 383,
+      "total_deletions": 0,
+      "accepted_lines": 383,
+      "overriden_lines": 0,
+      "messages_url": "https://usegitai.com/cas/1237b6791ffec9b21b04786a63b1c8630e0ab73bc14191f6153f9957c007dc8a"
+    }
+  }
+}
