@@ -108,6 +108,7 @@ fn print_config_help() {
     eprintln!("  feature_flags                Feature flags (object)");
     eprintln!("  api_key                      API key for X-API-Key header");
     eprintln!("  prompt_storage               Prompt storage mode (default/notes/local)");
+    eprintln!("  notes_store                  Notes sync backend (git/rest)");
     eprintln!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
     eprintln!("  default_prompt_storage       Fallback storage mode for non-included repos");
     eprintln!("  quiet                        Suppress chart output after commits (bool)");
@@ -288,6 +289,10 @@ fn show_all_config() -> Result<(), String> {
         "prompt_storage".to_string(),
         Value::String(runtime_config.prompt_storage().to_string()),
     );
+    effective_config.insert(
+        "notes_store".to_string(),
+        Value::String(runtime_config.notes_store().to_string()),
+    );
 
     // include_prompts_in_repositories
     if let Some(ref repos) = file_config.include_prompts_in_repositories {
@@ -386,6 +391,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "prompt_storage" => Value::String(runtime_config.prompt_storage().to_string()),
+            "notes_store" => Value::String(runtime_config.notes_store().to_string()),
             "include_prompts_in_repositories" => {
                 if let Some(ref repos) = file_config.include_prompts_in_repositories {
                     serde_json::to_value(repos).unwrap()
@@ -535,6 +541,12 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.prompt_storage = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
                 eprintln!("[prompt_storage]: {}", value);
+            }
+            "notes_store" => {
+                validate_notes_store_value(value)?;
+                file_config.notes_store = Some(value.to_string());
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[notes_store]: {}", value);
             }
             "include_prompts_in_repositories" => {
                 let resolved = resolve_repository_value(value)?;
@@ -758,6 +770,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
                     eprintln!("- [prompt_storage]: {}", v);
+                }
+            }
+            "notes_store" => {
+                let old_value = file_config.notes_store.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [notes_store]: {}", v);
                 }
             }
             "include_prompts_in_repositories" => {
@@ -1077,6 +1096,16 @@ fn validate_prompt_storage_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_notes_store_value(value: &str) -> Result<(), String> {
+    if value != "git" && value != "rest" {
+        return Err(format!(
+            "Invalid notes_store value '{}'. Expected 'git' or 'rest'",
+            value
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1135,22 @@ mod tests {
         assert!(err.contains("default"));
         assert!(err.contains("notes"));
         assert!(err.contains("local"));
+    }
+
+    #[test]
+    fn test_notes_store_valid_values() {
+        for value in ["git", "rest"] {
+            let result = validate_notes_store_value(value);
+            assert!(result.is_ok(), "Expected '{}' to be valid", value);
+        }
+    }
+
+    #[test]
+    fn test_notes_store_invalid_value() {
+        for value in ["default", "notes", "", "REST"] {
+            let result = validate_notes_store_value(value);
+            assert!(result.is_err(), "Expected '{}' to be invalid", value);
+        }
     }
 
     #[test]

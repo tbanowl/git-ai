@@ -1,11 +1,17 @@
 use crate::git::refs::{
-    AI_AUTHORSHIP_PUSH_REFSPEC, copy_ref, merge_notes_from_ref, ref_exists, tracking_ref_for_remote,
+    AI_AUTHORSHIP_PUSH_REFSPEC, CommitAuthorship, copy_ref, get_commits_with_notes_from_list,
+    merge_notes_from_ref, note_blob_oids_for_commits, notes_add_batch, ref_exists,
+    show_authorship_note, tracking_ref_for_remote,
 };
 use crate::{
+    api::{ApiClient, ApiContext},
+    config::Config,
     error::GitAiError,
     git::{cli_parser::ParsedGitInvocation, repository::exec_git},
+    repo_url::normalize_repo_url,
     utils::debug_log,
 };
+use std::collections::{HashMap, HashSet};
 
 use super::repository::Repository;
 
@@ -75,6 +81,18 @@ pub fn fetch_authorship_notes(
     repository: &Repository,
     remote_name: &str,
 ) -> Result<NotesExistence, GitAiError> {
+    if Config::get().notes_store() == "rest" {
+        let api = ApiClient::new(ApiContext::new(None));
+        let remote_url = resolve_remote_name_or_url(repository, remote_name)?;
+        let normalized_repo_url = normalize_repo_url(&remote_url).map_err(|e| {
+            GitAiError::Generic(format!(
+                "Invalid remote URL for REST notes sync '{}': {}",
+                remote_url, e
+            ))
+        })?;
+        return rest_fetch_notes(repository, &api, &normalized_repo_url);
+    }
+
     // Generate tracking ref for this remote
     let tracking_ref = tracking_ref_for_remote(remote_name);
 
@@ -170,6 +188,18 @@ fn is_missing_remote_notes_ref_error(error: &GitAiError) -> bool {
 }
 // for use with post-push hook
 pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Result<(), GitAiError> {
+    if Config::get().notes_store() == "rest" {
+        let api = ApiClient::new(ApiContext::new(None));
+        let remote_url = resolve_remote_name_or_url(repository, remote_name)?;
+        let normalized_repo_url = normalize_repo_url(&remote_url).map_err(|e| {
+            GitAiError::Generic(format!(
+                "Invalid remote URL for REST notes sync '{}': {}",
+                remote_url, e
+            ))
+        })?;
+        return rest_push_notes(repository, &api, &normalized_repo_url);
+    }
+
     // STEP 1: Fetch remote notes into tracking ref and merge before pushing
     // This ensures we don't lose notes from other branches/clones
     let tracking_ref = tracking_ref_for_remote(remote_name);
@@ -315,6 +345,213 @@ fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Ve
     args.push(remote_name.to_string());
     args.push(AI_AUTHORSHIP_PUSH_REFSPEC.to_string());
     args
+}
+
+fn resolve_remote_name_or_url(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<String, GitAiError> {
+    let candidate = remote_name.trim();
+
+    let looks_like_url_or_path = candidate.contains("://")
+        || candidate.starts_with("file://")
+        || (candidate.contains('@') && candidate.contains(':') && !candidate.contains("://"))
+        || candidate.starts_with('/')
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with("~/")
+        || candidate.ends_with(".git")
+        || std::path::Path::new(candidate).exists();
+
+    if looks_like_url_or_path {
+        return Ok(candidate.to_string());
+    }
+
+    let remotes = repository.remotes_with_urls()?;
+    remotes
+        .into_iter()
+        .find(|(name, _)| name == candidate)
+        .map(|(_, url)| url)
+        .ok_or_else(|| {
+            GitAiError::Generic(format!(
+                "Could not resolve remote '{}' to a URL for REST notes sync",
+                candidate
+            ))
+        })
+}
+
+fn list_local_authorship_notes_with_blob_oid(
+    repository: &Repository,
+) -> Result<Vec<(String, String)>, GitAiError> {
+    let mut args = repository.global_args_for_exec();
+    args.push("notes".to_string());
+    args.push("--ref=ai".to_string());
+    args.push("list".to_string());
+
+    let output = match exec_git(&args) {
+        Ok(output) => output,
+        Err(GitAiError::GitCliError { code: Some(1), .. }) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut mappings = Vec::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let Some(note_blob_oid) = parts.next() else {
+            continue;
+        };
+        let Some(commit_sha) = parts.next() else {
+            continue;
+        };
+        mappings.push((commit_sha.to_string(), note_blob_oid.to_string()));
+    }
+
+    Ok(mappings)
+}
+
+fn rest_fetch_notes(
+    repository: &Repository,
+    api: &ApiClient,
+    repo_url: &str,
+) -> Result<NotesExistence, GitAiError> {
+    let list_response = api.notes_list(&crate::api::types::NotesListRequest {
+        repo_url: repo_url.to_string(),
+    })?;
+
+    if list_response.data.notes.is_empty() {
+        return Ok(NotesExistence::NotFound);
+    }
+
+    let remote_commit_shas: Vec<String> = list_response
+        .data
+        .notes
+        .iter()
+        .map(|note| note.commit_sha.clone())
+        .collect();
+    let local_note_blob_oids = note_blob_oids_for_commits(repository, &remote_commit_shas)?;
+
+    let missing_or_changed: Vec<String> = list_response
+        .data
+        .notes
+        .iter()
+        .filter_map(|remote_note| {
+            let local_blob_oid = local_note_blob_oids.get(&remote_note.commit_sha);
+            if local_blob_oid == Some(&remote_note.note_blob_oid) {
+                None
+            } else {
+                Some(remote_note.commit_sha.clone())
+            }
+        })
+        .collect();
+
+    if missing_or_changed.is_empty() {
+        return Ok(NotesExistence::Found);
+    }
+
+    let batch_response = api.notes_batch_get(&crate::api::types::NotesBatchRequest {
+        repo_url: repo_url.to_string(),
+        commit_shas: missing_or_changed.clone(),
+    })?;
+
+    let missing_set: HashSet<String> = missing_or_changed.into_iter().collect();
+    let entries: Vec<(String, String)> = batch_response
+        .data
+        .notes
+        .into_iter()
+        .filter(|note| missing_set.contains(&note.commit_sha))
+        .map(|note| (note.commit_sha, note.content))
+        .collect();
+
+    if !entries.is_empty() {
+        notes_add_batch(repository, &entries)?;
+    }
+
+    Ok(NotesExistence::Found)
+}
+
+fn rest_push_notes(
+    repository: &Repository,
+    api: &ApiClient,
+    repo_url: &str,
+) -> Result<(), GitAiError> {
+    let local_notes = list_local_authorship_notes_with_blob_oid(repository)?;
+    if local_notes.is_empty() {
+        return Ok(());
+    }
+
+    let local_blob_map: HashMap<String, String> = local_notes
+        .iter()
+        .map(|(commit_sha, blob_oid)| (commit_sha.clone(), blob_oid.clone()))
+        .collect();
+
+    let remote_notes = api
+        .notes_list(&crate::api::types::NotesListRequest {
+            repo_url: repo_url.to_string(),
+        })?
+        .data
+        .notes;
+    let remote_blob_map: HashMap<String, String> = remote_notes
+        .into_iter()
+        .map(|note| (note.commit_sha, note.note_blob_oid))
+        .collect();
+
+    let mut commits_to_push = Vec::new();
+    for (commit_sha, local_blob_oid) in &local_blob_map {
+        if remote_blob_map.get(commit_sha) != Some(local_blob_oid) {
+            commits_to_push.push(commit_sha.clone());
+        }
+    }
+
+    if commits_to_push.is_empty() {
+        return Ok(());
+    }
+
+    let commit_authorships = get_commits_with_notes_from_list(repository, &commits_to_push)?;
+    let mut commit_author_map = HashMap::new();
+    for authorship in commit_authorships {
+        match authorship {
+            CommitAuthorship::NoLog { sha, git_author }
+            | CommitAuthorship::Log {
+                sha, git_author, ..
+            } => {
+                commit_author_map.insert(sha, git_author);
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    for commit_sha in commits_to_push {
+        let Some(content) = show_authorship_note(repository, &commit_sha) else {
+            continue;
+        };
+        let Some(note_blob_oid) = local_blob_map.get(&commit_sha) else {
+            continue;
+        };
+
+        let git_author = commit_author_map
+            .get(&commit_sha)
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        notes.push(crate::api::types::NotesPushItem {
+            commit_sha,
+            note_blob_oid: note_blob_oid.clone(),
+            git_author,
+            content,
+        });
+    }
+
+    if notes.is_empty() {
+        return Ok(());
+    }
+
+    api.notes_push(&crate::api::types::NotesPushRequest {
+        repo_url: repo_url.to_string(),
+        notes,
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]

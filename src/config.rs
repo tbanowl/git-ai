@@ -77,6 +77,7 @@ pub struct Config {
     feature_flags: FeatureFlags,
     api_base_url: String,
     prompt_storage: String,
+    notes_store: String,
     default_prompt_storage: Option<String>,
     #[serde(serialize_with = "serialize_masked_api_key")]
     api_key: Option<String>,
@@ -145,6 +146,8 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_store: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -176,6 +179,8 @@ pub struct ConfigPatch {
     pub disable_auto_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_store: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,6 +336,10 @@ impl Config {
     /// - "local": Messages only stored in sqlite (not in notes, not uploaded)
     pub fn prompt_storage(&self) -> &str {
         &self.prompt_storage
+    }
+
+    pub fn notes_store(&self) -> &str {
+        &self.notes_store
     }
 
     /// Returns the effective prompt storage mode for a given repository.
@@ -619,6 +628,21 @@ fn build_config() -> Config {
         }
     };
 
+    let notes_store = env::var("GIT_AI_NOTES_STORE")
+        .ok()
+        .or_else(|| file_cfg.as_ref().and_then(|c| c.notes_store.clone()))
+        .unwrap_or_else(|| "git".to_string());
+    let notes_store = match notes_store.as_str() {
+        "git" | "rest" => notes_store,
+        other => {
+            eprintln!(
+                "Warning: Invalid notes_store value '{}', using 'git'",
+                other
+            );
+            "git".to_string()
+        }
+    };
+
     // Get default_prompt_storage setting (fallback for repos not in include list)
     // Valid values: "default", "notes", "local", or None (defaults to "local")
     let default_prompt_storage = file_cfg
@@ -693,6 +717,7 @@ fn build_config() -> Config {
             feature_flags,
             api_base_url,
             prompt_storage,
+            notes_store,
             default_prompt_storage,
             api_key,
             quiet,
@@ -718,6 +743,7 @@ fn build_config() -> Config {
         feature_flags,
         api_base_url,
         prompt_storage,
+        notes_store,
         default_prompt_storage,
         api_key,
         quiet,
@@ -1030,6 +1056,16 @@ fn apply_test_config_patch(config: &mut Config) {
                 );
             }
         }
+        if let Some(notes_store) = patch.notes_store {
+            if matches!(notes_store.as_str(), "git" | "rest") {
+                config.notes_store = notes_store;
+            } else {
+                eprintln!(
+                    "Warning: Invalid test notes_store value '{}', ignoring",
+                    notes_store
+                );
+            }
+        }
         if let Some(custom_attributes) = patch.custom_attributes {
             config.custom_attributes = custom_attributes;
         }
@@ -1074,12 +1110,19 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            notes_store: "git".to_string(),
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_notes_store_defaults_to_git_in_test_helpers() {
+        let config = create_test_config(vec![], vec![]);
+        assert_eq!(config.notes_store(), "git");
     }
 
     #[test]
@@ -1183,6 +1226,7 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            notes_store: "git".to_string(),
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
@@ -1301,6 +1345,7 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: prompt_storage.to_string(),
+            notes_store: "git".to_string(),
             default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
             api_key: None,
             quiet: false,

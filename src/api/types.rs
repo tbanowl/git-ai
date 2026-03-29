@@ -137,6 +137,80 @@ pub struct CAPromptStoreReadResponse {
     pub failure_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesListRequest {
+    pub repo_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesListItem {
+    pub commit_sha: String,
+    pub note_blob_oid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesListData {
+    pub notes: Vec<NotesListItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesListResponse {
+    pub ok: bool,
+    pub data: NotesListData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesBatchRequest {
+    pub repo_url: String,
+    pub commit_shas: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesBatchItem {
+    pub commit_sha: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_blob_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesBatchData {
+    pub notes: Vec<NotesBatchItem>,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesBatchResponse {
+    pub ok: bool,
+    pub data: NotesBatchData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesPushItem {
+    pub commit_sha: String,
+    pub note_blob_oid: String,
+    pub git_author: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesPushRequest {
+    pub repo_url: String,
+    pub notes: Vec<NotesPushItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesPushData {
+    pub created: usize,
+    pub updated: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesPushResponse {
+    pub ok: bool,
+    pub data: NotesPushData,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +463,16 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("success_count"));
         assert!(json.contains("failure_count"));
+    }
+
+    #[test]
+    fn test_notes_list_response_has_blob_identity() {
+        let body =
+            r#"{"ok":true,"data":{"notes":[{"commit_sha":"abc","note_blob_oid":"deadbeef"}]}}"#;
+        let parsed: NotesListResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.data.notes[0].commit_sha, "abc");
+        assert_eq!(parsed.data.notes[0].note_blob_oid, "deadbeef");
     }
 
     #[test]

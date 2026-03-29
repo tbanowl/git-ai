@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"refs/notes\\\\|git notes\" /Users/neptune/deepDark/fantasy/ai/git-ai/src/git/*.rs)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
