@@ -1,0 +1,154 @@
+name: Release VS Code Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no actual publish)'
+        type: boolean
+        default: true
+      skip_vsce:
+        description: 'Skip VS Code Marketplace (for retry)'
+        type: boolean
+        default: false
+      skip_ovsx:
+        description: 'Skip OpenVSX (for retry)'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-support/vscode
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: agent-support/vscode/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Compile
+        run: yarn compile
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Package extension
+        run: yarn package
+
+      - name: Get version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: vscode-extension
+          path: agent-support/vscode/*.vsix
+          retention-days: 1
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  publish-vsce:
+    needs: build
+    if: ${{ !inputs.dry_run && !inputs.skip_vsce }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-support/vscode
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: agent-support/vscode/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: vscode-extension
+          path: agent-support/vscode
+
+      - name: Publish to VS Code Marketplace
+        run: npx vsce publish --packagePath *.vsix
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-ovsx:
+    needs: build
+    if: ${{ !inputs.dry_run && !inputs.skip_ovsx }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-support/vscode
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: agent-support/vscode/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: vscode-extension
+          path: agent-support/vscode
+
+      - name: Publish to OpenVSX
+        run: npx ovsx publish *.vsix
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+
+  bump-version:
+    needs: [publish-vsce, publish-ovsx]
+    if: |
+      always() &&
+      !inputs.dry_run &&
+      (needs.publish-vsce.result == 'success' || needs.publish-vsce.result == 'skipped') &&
+      (needs.publish-ovsx.result == 'success' || needs.publish-ovsx.result == 'skipped') &&
+      (needs.publish-vsce.result == 'success' || needs.publish-ovsx.result == 'success')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-support/vscode
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Bump patch version
+        run: npm version patch --no-git-tag-version
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(vscode): bump version to $(node -p "require('./package.json').version")"
+          git push
