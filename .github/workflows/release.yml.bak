@@ -28,9 +28,27 @@ jobs:
     strategy:
       matrix:
         include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: git-ai-linux-x64
+            use_docker: true
+            docker_image: ubuntu:22.04
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_name: git-ai-linux-arm64
+            use_docker: true
+            docker_image: ubuntu:22.04
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: git-ai-windows-x64
+            use_docker: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_name: git-ai-windows-arm64
+            use_docker: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: git-ai-macos-arm64
             use_docker: false
 
     steps:
@@ -162,9 +180,75 @@ jobs:
           path: release/${{ matrix.artifact_name }}
           retention-days: 30
 
+  build-macos-intel:
+    name: Build for macOS Intel
+    runs-on: macos-15-intel
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Get version from Cargo.toml
+        id: get-version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin
+
+      - name: Cache dependencies
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-x86_64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-x86_64-apple-darwin-
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+        env:
+          CARGO_INCREMENTAL: 0
+          SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          OSS_BUILD: "1"
+
+      - name: Verify binary architecture
+        run: |
+          file target/x86_64-apple-darwin/release/git-ai
+          lipo -info target/x86_64-apple-darwin/release/git-ai
+
+      - name: Strip binary
+        run: |
+          strip target/x86_64-apple-darwin/release/git-ai
+
+      - name: Create release directory
+        run: |
+          mkdir -p release
+
+      - name: Copy binary to release directory
+        run: |
+          cp target/x86_64-apple-darwin/release/git-ai release/git-ai-macos-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: git-ai-macos-x64
+          path: release/git-ai-macos-x64
+          retention-days: 30
+
   create-release:
     name: Create Release
-    needs: [build]
+    needs: [build, build-macos-intel]
     runs-on: ubuntu-latest
     if: success() && inputs.dry_run != true
 
@@ -299,13 +383,23 @@ jobs:
             ### Installation
             Install this specific version with checksum verification:
 
+            **macOS/Linux:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.sh | bash
+            ```
+
             **Windows (PowerShell):**
             ```powershell
             irm https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.ps1 | iex
             ```
 
             ### Downloads
+            - **Linux (x64)**: `git-ai-linux-x64`
+            - **Linux (ARM64)**: `git-ai-linux-arm64`
             - **Windows (x64)**: `git-ai-windows-x64.exe`
+            - **Windows (ARM64)**: `git-ai-windows-arm64.exe`
+            - **macOS (Intel)**: `git-ai-macos-x64`
+            - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
 
             ### SHA256 Checksums
             ```
