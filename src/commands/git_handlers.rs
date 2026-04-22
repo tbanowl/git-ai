@@ -23,7 +23,7 @@ use std::collections::HashSet;
 
 use crate::observability::wrapper_performance_targets::log_performance_target_if_violated;
 #[cfg(windows)]
-use crate::utils::CREATE_NO_WINDOW;
+use crate::utils::{CREATE_NO_WINDOW, is_debug_enabled};
 #[cfg(windows)]
 use crate::utils::is_interactive_terminal;
 #[cfg(windows)]
@@ -38,6 +38,8 @@ use std::process::Command;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(unix)]
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
@@ -57,10 +59,6 @@ const GIT_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(windows)]
 const GIT_PROXY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
-
-// Windows NTSTATUS for Ctrl+C interruption (STATUS_CONTROL_C_EXIT, 0xC000013A) from Windows API docs.
-#[cfg(windows)]
-const NTSTATUS_CONTROL_C_EXIT: u32 = 0xC000013A;
 
 /// Error type for hook panics
 #[derive(Debug)]
@@ -1115,13 +1113,13 @@ fn wait_for_git_with_retry_windows(
                 }
 
                 let next_attempt = attempt + 2;
-                tracing::debug!(&format!(
+                tracing::debug!(
                     "git command timed out after {}ms on Windows; retrying attempt {}/{}, git args: {:?}",
                     timeout.as_millis(),
                     next_attempt,
                     max_retries + 1,
                     args
-                ));
+                );
                 std::thread::sleep(GIT_PROXY_RETRY_BACKOFF);
                 child = spawn_git_child_windows(
                     args,
@@ -1158,11 +1156,11 @@ fn wait_for_git_process_windows(
 
         if Instant::now() >= deadline {
             let pid = child.id();
-            tracing::debug!(&format!(
+            tracing::debug!(
                 "git process {} timed out after {}ms on Windows; terminating process tree",
                 pid,
                 timeout.as_millis()
-            ));
+            );
             if let Err(err) = kill_process_tree_windows(pid) {
                 eprintln!("Failed to terminate timed out git process {}: {}", pid, err);
                 std::process::exit(1);
@@ -1170,10 +1168,10 @@ fn wait_for_git_process_windows(
 
             match child.wait() {
                 Ok(status) => {
-                    tracing::debug!(&format!(
+                    tracing::debug!(
                         "git process {} terminated after timeout with status {}",
                         pid, status
-                    ));
+                    );
                 }
                 Err(err) => {
                     eprintln!(
