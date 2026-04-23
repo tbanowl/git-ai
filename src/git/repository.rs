@@ -758,25 +758,24 @@ impl<'a> CommitRange<'a> {
         let inferred_refname = match refname {
             Some(name) => name,
             None => {
-                // Try to find refs pointing to resolved end_oid
-                let mut args = repo.global_args_for_exec();
-                args.push("for-each-ref".to_string());
-                args.push("--points-at".to_string());
-                args.push(resolved_end.clone());
-                args.push("--format=%(refname)".to_string());
-
-                let refs = match exec_git(&args) {
-                    Ok(output) => {
-                        let stdout = String::from_utf8(output.stdout).unwrap_or_default();
-                        let refs: Vec<String> = stdout
-                            .lines()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
+                let refs = repo
+                    .open_git2()
+                    .ok()
+                    .and_then(|g2repo| {
+                        let resolved_end = Oid::from_str(&resolved_end).ok()?;
+                        let refs: Vec<String> = g2repo
+                            .references()
+                            .ok()?
+                            .filter_map(|reference| {
+                                let reference = reference.ok()?;
+                                let name = reference.name()?.to_string();
+                                let commit = reference.peel_to_commit().ok()?;
+                                (commit.id() == resolved_end).then_some(name)
+                            })
                             .collect();
-                        refs
-                    }
-                    Err(_) => Vec::new(),
-                };
+                        Some(refs)
+                    })
+                    .unwrap_or_default();
 
                 // If exactly one ref found, use it
                 if refs.len() == 1 {
@@ -1748,39 +1747,40 @@ impl Repository {
 
     // List all remotes for a given repository
     pub fn remotes(&self) -> Result<Vec<String>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("remote".to_string());
+        let g2repo = self
+            .open_git2()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let remotes = g2repo
+            .remotes()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let names: Vec<String> = remotes.iter().map(|name| name.unwrap_or("").to_string()).collect();
 
-        let output = exec_git(&args)?;
-        let remotes = String::from_utf8(output.stdout)?;
-        Ok(remotes.trim().split("\n").map(|s| s.to_string()).collect())
+        if names.is_empty() {
+            Ok(vec![String::new()])
+        } else {
+            Ok(names)
+        }
     }
 
     // List all remotes with their URLs as tuples (name, url)
     pub fn remotes_with_urls(&self) -> Result<Vec<(String, String)>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("remote".to_string());
-        args.push("-v".to_string());
+        let g2repo = self
+            .open_git2()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let remote_names = g2repo
+            .remotes()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-        let output = exec_git(&args)?;
-        let remotes_output = String::from_utf8(output.stdout)?;
-
-        let mut remotes = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for line in remotes_output.trim().split("\n").filter(|s| !s.is_empty()) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let name = parts[0].to_string();
-                let url = parts[1].to_string();
-                // Only add each remote once (git remote -v shows fetch and push)
-                if seen.insert(name.clone()) {
-                    remotes.push((name, url));
-                }
-            }
-        }
-
-        Ok(remotes)
+        remote_names
+            .iter()
+            .flatten()
+            .map(|name| {
+                g2repo
+                    .find_remote(name)
+                    .map_err(|e| GitAiError::Generic(e.to_string()))
+                    .map(|remote| (name.to_string(), remote.url().unwrap_or("").to_string()))
+            })
+            .collect()
     }
 
     fn load_optional_config_file(
@@ -1969,13 +1969,20 @@ impl Repository {
 
     #[allow(dead_code)]
     pub fn remote_head(&self, remote_name: &str) -> Result<String, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("symbolic-ref".to_string());
-        args.push(format!("refs/remotes/{}/HEAD", remote_name));
-        args.push("--short".to_string());
+        let g2repo = self
+            .open_git2()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let reference = g2repo
+            .find_reference(&format!("refs/remotes/{}/HEAD", remote_name))
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let resolved = reference
+            .resolve()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-        let output = exec_git(&args)?;
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        resolved
+            .shorthand()
+            .map(|name| name.to_string())
+            .ok_or_else(|| GitAiError::Generic(format!("reference refs/remotes/{}/HEAD has no target", remote_name)))
     }
 
     // Lookup a reference to one of the objects in a repository. Requires full ref name.
@@ -2294,15 +2301,11 @@ impl Repository {
     }
 
     pub fn upstream_remote(&self) -> Result<Option<String>, GitAiError> {
-        // Get current branch name using exec_git
-        let mut args = self.global_args_for_exec();
-        args.push("branch".to_string());
-        args.push("--show-current".to_string());
-        let output = exec_git(&args)?;
-        let branch = String::from_utf8(output.stdout)?.trim().to_string();
-        if branch.is_empty() {
+        let head = self.head()?;
+        if !head.is_branch() {
             return Ok(None);
         }
+        let branch = head.shorthand()?;
         let config_key = format!("branch.{}.remote", branch);
         self.config_get_str(&config_key)
     }
@@ -2420,11 +2423,27 @@ impl Repository {
         let entry = tree
             .get_path(std::path::Path::new(file_path))
             .map_err(|e| GitAiError::Generic(e.to_string()))?;
-        let entry_obj = entry
-            .to_object(&g2repo)
-            .map_err(|e| GitAiError::Generic(e.to_string()))?;
-        match entry_obj.kind() {
-            Some(git2::ObjectType::Blob) => Ok(entry_obj.as_blob().unwrap().content().to_vec()),
+        match entry.kind() {
+            Some(git2::ObjectType::Blob) => {
+                let blob = g2repo
+                    .find_blob(entry.id())
+                    .map_err(|e| GitAiError::Generic(e.to_string()))?;
+                Ok(blob.content().to_vec())
+            }
+            Some(git2::ObjectType::Tree) => {
+                let tree = g2repo
+                    .find_tree(entry.id())
+                    .map_err(|e| GitAiError::Generic(e.to_string()))?;
+                let mut output = format!("tree {}\n\n", tree.id()).into_bytes();
+                for child in &tree {
+                    output.extend_from_slice(child.name_bytes());
+                    if matches!(child.kind(), Some(git2::ObjectType::Tree)) {
+                        output.push(b'/');
+                    }
+                    output.push(b'\n');
+                }
+                Ok(output)
+            }
             _ => {
                 let mut args = self.global_args_for_exec();
                 args.push("show".to_string());
