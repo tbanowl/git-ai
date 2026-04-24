@@ -70,6 +70,271 @@ pub struct StatusEntry {
     pub orig_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct StatusPathspecPlan {
+    combined_pathspecs: HashSet<String>,
+    should_full_scan: bool,
+    needs_post_filter: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CollectedStatusRecord {
+    path: String,
+    staged: StatusCode,
+    unstaged: StatusCode,
+    kind: EntryKind,
+    orig_path: Option<String>,
+}
+
+fn build_status_pathspec_plan(
+    staged_filenames: HashSet<String>,
+    pathspecs: Option<&HashSet<String>>,
+) -> StatusPathspecPlan {
+    let combined_pathspecs: HashSet<String> = if let Some(paths) = pathspecs {
+        staged_filenames.union(paths).cloned().collect()
+    } else {
+        staged_filenames
+    };
+
+    let should_full_scan = pathspecs.is_none() && combined_pathspecs.is_empty();
+    let has_non_ascii = combined_pathspecs.iter().any(|path| !path.is_ascii());
+    let needs_post_filter =
+        !should_full_scan && (combined_pathspecs.len() > MAX_PATHSPEC_ARGS || has_non_ascii);
+
+    StatusPathspecPlan {
+        combined_pathspecs,
+        should_full_scan,
+        needs_post_filter,
+    }
+}
+
+fn post_filter_status_entries(entries: &mut Vec<StatusEntry>, combined_pathspecs: &HashSet<String>) {
+    let nfc_pathspecs: HashSet<String> = combined_pathspecs
+        .iter()
+        .map(|path| nfc_path(path.clone()))
+        .collect();
+
+    entries.retain(|entry| {
+        nfc_pathspecs.contains(&entry.path)
+            || entry
+                .orig_path
+                .as_ref()
+                .is_some_and(|orig_path| nfc_pathspecs.contains(orig_path))
+    });
+}
+
+pub fn old_cli_status_entries_for_test(
+    repository: &Repository,
+    pathspecs: Option<&HashSet<String>>,
+    skip_untracked: bool,
+) -> Result<Vec<StatusEntry>, GitAiError> {
+    let staged_filenames = repository.get_staged_filenames()?;
+    let plan = build_status_pathspec_plan(staged_filenames, pathspecs);
+
+    if plan.combined_pathspecs.is_empty() && !plan.should_full_scan {
+        return Ok(Vec::new());
+    }
+
+    let mut args = repository.global_args_for_exec();
+    args.push("--no-optional-locks".to_string());
+    args.push("status".to_string());
+    args.push("--porcelain=v2".to_string());
+    args.push("-z".to_string());
+
+    if skip_untracked {
+        args.push("--untracked-files=no".to_string());
+    }
+
+    if !plan.should_full_scan && !plan.needs_post_filter && !plan.combined_pathspecs.is_empty() {
+        args.push("--".to_string());
+        for path in &plan.combined_pathspecs {
+            args.push(path.clone());
+        }
+    }
+
+    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
+
+    if !output.status.success() {
+        return Err(GitAiError::Generic(format!(
+            "git status exited with status {}",
+            output.status
+        )));
+    }
+
+    let mut entries = parse_porcelain_v2(&output.stdout)?;
+
+    if plan.needs_post_filter {
+        post_filter_status_entries(&mut entries, &plan.combined_pathspecs);
+    }
+
+    Ok(entries)
+}
+
+fn collect_status_records(
+    repository: &Repository,
+    plan: &StatusPathspecPlan,
+    skip_untracked: bool,
+) -> Result<Vec<CollectedStatusRecord>, GitAiError> {
+    let repo =
+        git2::Repository::open(repository.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(!skip_untracked)
+        .recurse_untracked_dirs(true)
+        .include_ignored(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true)
+        .include_unmodified(false);
+
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+
+    let mut entries = Vec::new();
+    for entry in statuses.iter() {
+        let Some(mut path) = entry.path().map(|path| nfc_path(path.to_string())) else {
+            continue;
+        };
+        if path.trim().is_empty() {
+            continue;
+        }
+
+        let status = entry.status();
+
+        if status.is_conflicted() {
+            continue;
+        }
+
+        if status.is_ignored() {
+            entries.push(CollectedStatusRecord {
+                path,
+                staged: StatusCode::Unmodified,
+                unstaged: StatusCode::Ignored,
+                kind: EntryKind::Ignored,
+                orig_path: None,
+            });
+            continue;
+        }
+
+        if status.is_wt_new() {
+            entries.push(CollectedStatusRecord {
+                path,
+                staged: StatusCode::Unmodified,
+                unstaged: StatusCode::Untracked,
+                kind: EntryKind::Untracked,
+                orig_path: None,
+            });
+            continue;
+        }
+
+        let mut staged = StatusCode::Unmodified;
+        let mut unstaged = StatusCode::Unmodified;
+        let mut kind = EntryKind::Ordinary;
+        let mut orig_path = None;
+
+        if status.intersects(
+            git2::Status::INDEX_NEW
+                | git2::Status::INDEX_MODIFIED
+                | git2::Status::INDEX_DELETED
+                | git2::Status::INDEX_RENAMED
+                | git2::Status::INDEX_TYPECHANGE,
+        ) {
+            staged = if status.is_index_new() {
+                StatusCode::Added
+            } else if status.is_index_deleted() {
+                StatusCode::Deleted
+            } else if status.is_index_modified() || status.is_index_typechange() {
+                StatusCode::Modified
+            } else if status.is_index_renamed() {
+                kind = EntryKind::Rename;
+                StatusCode::Renamed
+            } else {
+                StatusCode::Unmodified
+            };
+        }
+
+        if status.intersects(
+            git2::Status::WT_MODIFIED
+                | git2::Status::WT_DELETED
+                | git2::Status::WT_RENAMED
+                | git2::Status::WT_TYPECHANGE,
+        ) {
+            unstaged = if status.is_wt_deleted() {
+                StatusCode::Deleted
+            } else if status.is_wt_modified() || status.is_wt_typechange() {
+                StatusCode::Modified
+            } else if status.is_wt_renamed() {
+                kind = EntryKind::Rename;
+                StatusCode::Renamed
+            } else {
+                StatusCode::Unmodified
+            };
+        }
+
+        if let Some(delta) = entry.head_to_index() {
+            if delta.status() == git2::Delta::Renamed {
+                kind = EntryKind::Rename;
+                staged = StatusCode::Renamed;
+                if let Some(new_path) = delta.new_file().path() {
+                    path = nfc_path(new_path.to_string_lossy().replace('\\', "/"));
+                }
+                orig_path = delta
+                    .old_file()
+                    .path()
+                    .map(|path| nfc_path(path.to_string_lossy().replace('\\', "/")));
+            }
+        }
+
+        if let Some(delta) = entry.index_to_workdir() {
+            if delta.status() == git2::Delta::Renamed {
+                kind = EntryKind::Rename;
+                unstaged = StatusCode::Renamed;
+                if let Some(new_path) = delta.new_file().path() {
+                    path = nfc_path(new_path.to_string_lossy().replace('\\', "/"));
+                }
+                orig_path = delta
+                    .old_file()
+                    .path()
+                    .map(|path| nfc_path(path.to_string_lossy().replace('\\', "/")));
+            }
+        }
+
+        entries.push(CollectedStatusRecord {
+            path,
+            staged,
+            unstaged,
+            kind,
+            orig_path,
+        });
+    }
+
+    if !plan.should_full_scan && !plan.needs_post_filter {
+        entries.retain(|entry| {
+            plan.combined_pathspecs.contains(&entry.path)
+                || entry
+                    .orig_path
+                    .as_ref()
+                    .is_some_and(|orig_path| plan.combined_pathspecs.contains(orig_path))
+        });
+    }
+
+    Ok(entries)
+}
+
+fn assemble_status_entries(records: Vec<CollectedStatusRecord>) -> Vec<StatusEntry> {
+    records
+        .into_iter()
+        .map(|record| StatusEntry {
+            path: record.path,
+            staged: record.staged,
+            unstaged: record.unstaged,
+            kind: record.kind,
+            orig_path: record.orig_path,
+        })
+        .collect()
+}
+
 impl Repository {
     // Get status for tracked files that changed
     pub fn get_staged_filenames(&self) -> Result<HashSet<String>, GitAiError> {
@@ -154,69 +419,17 @@ impl Repository {
         skip_untracked: bool,
     ) -> Result<Vec<StatusEntry>, GitAiError> {
         let staged_filenames = self.get_staged_filenames()?;
+        let plan = build_status_pathspec_plan(staged_filenames, pathspecs);
 
-        let combined_pathspecs: HashSet<String> = if let Some(paths) = pathspecs {
-            staged_filenames.union(paths).cloned().collect()
-        } else {
-            staged_filenames
-        };
-
-        // When no explicit pathspecs are provided and nothing is staged,
-        // we still need a full status scan to capture unstaged changes.
-        let should_full_scan = pathspecs.is_none() && combined_pathspecs.is_empty();
-        if combined_pathspecs.is_empty() && !should_full_scan {
+        if plan.combined_pathspecs.is_empty() && !plan.should_full_scan {
             return Ok(Vec::new());
         }
 
-        let mut args = self.global_args_for_exec();
-        args.push("--no-optional-locks".to_string());
-        args.push("status".to_string());
-        args.push("--porcelain=v2".to_string());
-        args.push("-z".to_string());
+        let records = collect_status_records(self, &plan, skip_untracked)?;
+        let mut entries = assemble_status_entries(records);
 
-        if skip_untracked {
-            args.push("--untracked-files=no".to_string());
-        }
-
-        // Add combined pathspecs as CLI args only if under the threshold;
-        // otherwise run without pathspecs and post-filter to avoid E2BIG.
-        // Also force post-filtering when any pathspec contains non-ASCII characters,
-        // because NFC-normalised pathspecs may not match NFD entries in git's
-        // index on macOS when core.precomposeunicode is false.
-        let has_non_ascii = combined_pathspecs.iter().any(|s| !s.is_ascii());
-        let needs_post_filter =
-            !should_full_scan && (combined_pathspecs.len() > MAX_PATHSPEC_ARGS || has_non_ascii);
-        if !should_full_scan && !needs_post_filter && !combined_pathspecs.is_empty() {
-            args.push("--".to_string());
-            for path in &combined_pathspecs {
-                args.push(path.clone());
-            }
-        }
-
-        let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
-
-        if !output.status.success() {
-            return Err(GitAiError::Generic(format!(
-                "git status exited with status {}",
-                output.status
-            )));
-        }
-
-        let mut entries = parse_porcelain_v2(&output.stdout)?;
-
-        if needs_post_filter {
-            // NFC-normalize pathspecs for comparison because parse_porcelain_v2
-            // emits NFC paths, but caller-supplied pathspecs may be NFD.
-            let nfc_pathspecs: HashSet<String> = combined_pathspecs
-                .iter()
-                .map(|s| nfc_path(s.clone()))
-                .collect();
-            entries.retain(|e| {
-                nfc_pathspecs.contains(&e.path)
-                    || e.orig_path
-                        .as_ref()
-                        .is_some_and(|op| nfc_pathspecs.contains(op))
-            });
+        if plan.needs_post_filter {
+            post_filter_status_entries(&mut entries, &plan.combined_pathspecs);
         }
 
         Ok(entries)
@@ -412,6 +625,57 @@ fn parse_porcelain_v2(data: &[u8]) -> Result<Vec<StatusEntry>, GitAiError> {
 mod tests {
     use super::*;
     use insta::assert_debug_snapshot;
+    use std::collections::HashSet;
+
+    fn set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| (*path).to_string()).collect()
+    }
+
+    #[test]
+    fn pathspec_plan_unions_staged_paths_and_enables_post_filter_for_non_ascii() {
+        let staged = set(&["staged.txt"]);
+        let explicit = set(&["unicodé/文件.txt"]);
+
+        let plan = build_status_pathspec_plan(staged, Some(&explicit));
+
+        assert_eq!(
+            plan.combined_pathspecs,
+            set(&["staged.txt", "unicodé/文件.txt"])
+        );
+        assert!(!plan.should_full_scan);
+        assert!(plan.needs_post_filter);
+    }
+
+    #[test]
+    fn post_filter_status_entries_matches_path_and_orig_path_after_nfc_normalization() {
+        let mut entries = vec![
+            StatusEntry {
+                path: "new.txt".to_string(),
+                staged: StatusCode::Renamed,
+                unstaged: StatusCode::Unmodified,
+                kind: EntryKind::Rename,
+                orig_path: Some("old.txt".to_string()),
+            },
+            StatusEntry {
+                path: "space dir/hello world.txt".to_string(),
+                staged: StatusCode::Unmodified,
+                unstaged: StatusCode::Modified,
+                kind: EntryKind::Ordinary,
+                orig_path: None,
+            },
+        ];
+
+        let filter = set(&["old.txt", "space dir/hello world.txt"]);
+        post_filter_status_entries(&mut entries, &filter);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.path == "new.txt"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == "space dir/hello world.txt")
+        );
+    }
 
     #[test]
     fn parse_varied_porcelain_v2_records() {
