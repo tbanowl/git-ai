@@ -1,7 +1,6 @@
 pub mod api;
 pub mod auth;
 pub mod authorship;
-pub mod checkpoint_tasks;
 pub mod ci;
 pub mod commands;
 pub mod config;

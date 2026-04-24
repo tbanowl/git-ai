@@ -314,7 +314,7 @@ impl Repository {
         } else if let Some(ref commit) = options.newest_commit {
             // Read file content from the specified commit.
             // This ensures blame is independent of which branch is checked out.
-            let commit_obj = self.find_commit(commit.clone())?;
+            let commit_obj = self.revparse_single(commit)?.peel_to_commit()?;
             let tree = commit_obj.tree()?;
 
             match tree.get_path(std::path::Path::new(relative_file_path)) {
@@ -451,6 +451,8 @@ impl Repository {
         requests_by_len: &HashMap<usize, Vec<String>>,
     ) -> HashMap<(String, usize), String> {
         let mut resolved: HashMap<(String, usize), String> = HashMap::new();
+        let git2_repo = git2::Repository::open(self.path()).ok();
+        let odb = git2_repo.as_ref().and_then(|repo| repo.odb().ok());
 
         for (&requested_len, commit_shas) in requests_by_len {
             if commit_shas.is_empty() {
@@ -458,28 +460,29 @@ impl Repository {
             }
 
             for commit_sha_batch in commit_shas.chunks(Self::BLAME_ABBREV_BATCH_SIZE) {
-                let mut args = self.global_args_for_exec();
-                args.push("rev-parse".to_string());
-                args.push(format!("--short={requested_len}"));
-                args.extend(commit_sha_batch.iter().cloned());
+                if let Some(odb) = odb.as_ref() {
+                    for commit_sha in commit_sha_batch {
+                        let resolved_abbrev =
+                            git2::Oid::from_str(commit_sha).ok().and_then(|full_oid| {
+                                (requested_len.min(commit_sha.len())..=commit_sha.len()).find_map(
+                                    |len| {
+                                        let prefix = &commit_sha[..len];
+                                        let short_oid = git2::Oid::from_str(prefix).ok()?;
+                                        let found_oid = odb.exists_prefix(short_oid, len).ok()?;
+                                        (found_oid == full_oid).then(|| prefix.to_string())
+                                    },
+                                )
+                            });
 
-                let batched_result = exec_git(&args)
-                    .ok()
-                    .and_then(|output| String::from_utf8(output.stdout).ok())
-                    .map(|stdout| {
-                        stdout
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| !line.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    });
-
-                if let Some(short_shas) = batched_result
-                    && short_shas.len() == commit_sha_batch.len()
-                {
-                    for (commit_sha, short_sha) in commit_sha_batch.iter().zip(short_shas) {
-                        resolved.insert((commit_sha.clone(), requested_len), short_sha);
+                        if let Some(short_sha) = resolved_abbrev {
+                            resolved.insert((commit_sha.clone(), requested_len), short_sha);
+                        } else {
+                            resolved
+                                .entry((commit_sha.clone(), requested_len))
+                                .or_insert_with(|| {
+                                    Self::fallback_blame_abbrev_sha(commit_sha, requested_len)
+                                });
+                        }
                     }
                     continue;
                 }

@@ -189,12 +189,20 @@ fn extract_file_paths_from_note(content: &str, files: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::git::{find_repository_in_path, sync_authorship::fetch_authorship_notes};
     use std::time::Instant;
 
     #[test]
     fn test_load_ai_touched_files_for_specific_commits() {
         smol::block_on(async {
+            if Config::get().notes_store() == "rest" {
+                println!(
+                    "Skipping test: notes_store=rest routes fetch_authorship_notes through REST and depends on external API availability"
+                );
+                return;
+            }
+
             let repo = find_repository_in_path(".").unwrap();
 
             fetch_authorship_notes(&repo, "origin").unwrap();

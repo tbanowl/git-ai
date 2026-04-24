@@ -10,7 +10,8 @@ use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
 use crate::git::find_repository_in_path;
 use crate::git::refs::get_authorship;
-use crate::git::repository::{Repository, exec_git};
+use crate::git::repository::Repository;
+use git2::Sort;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
@@ -146,23 +147,24 @@ pub fn search_by_commit_range(
     start: &str,
     end: &str,
 ) -> Result<SearchResult, GitAiError> {
-    // Use git rev-list to enumerate commits in the range
-    let mut args = repo.global_args_for_exec();
-    args.push("rev-list".to_string());
-    args.push(format!("{}..{}", start, end));
-
-    let output = exec_git(&args)?;
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Invalid UTF-8 in git output: {}", e)))?;
+    let g2repo =
+        git2::Repository::open(repo.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let mut walk = g2repo
+        .revwalk()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    walk.set_sorting(Sort::TIME)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    walk.push_range(&format!("{}..{}", start, end))
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
     let mut result = SearchResult::new();
 
     // Search each commit and merge results
-    for line in stdout.lines() {
-        let commit_sha = line.trim();
-        if !commit_sha.is_empty()
-            && let Ok(commit_result) = search_by_commit(repo, commit_sha)
-        {
+    for oid in walk {
+        let commit_sha = oid
+            .map_err(|e| GitAiError::Generic(e.to_string()))?
+            .to_string();
+        if let Ok(commit_result) = search_by_commit(repo, &commit_sha) {
             result.merge(commit_result);
         }
     }

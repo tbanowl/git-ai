@@ -23,11 +23,13 @@ use std::collections::HashSet;
 
 use crate::observability::wrapper_performance_targets::log_performance_target_if_violated;
 #[cfg(windows)]
-use crate::utils::{CREATE_NO_WINDOW, is_debug_enabled};
+use crate::utils::CREATE_NO_WINDOW;
 #[cfg(windows)]
 use crate::utils::is_interactive_terminal;
 #[cfg(windows)]
 use crate::utils::kill_process_tree_windows;
+#[cfg(windows)]
+use crate::utils::is_debug_enabled;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -37,9 +39,9 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Instant;
 #[cfg(windows)]
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(unix)]
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
@@ -1170,7 +1172,8 @@ fn wait_for_git_process_windows(
                 Ok(status) => {
                     tracing::debug!(
                         "git process {} terminated after timeout with status {}",
-                        pid, status
+                        pid,
+                        status
                     );
                 }
                 Err(err) => {

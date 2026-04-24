@@ -1,6 +1,5 @@
 use crate::authorship::working_log::CheckpointKind;
 use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
-use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::repository::Repository;
 pub fn pre_commit(repo: &Repository, default_author: String) -> Result<(), GitAiError> {
@@ -14,52 +13,7 @@ pub fn pre_commit(repo: &Repository, default_author: String) -> Result<(), GitAi
         agent_run_result,
         true, // should skip if NO AI CHECKPOINTS
     );
-    result.map(|_| ())?;
-
-    if !Config::get().get_feature_flags().checkpoint_tasks {
-        return Ok(());
-    }
-
-    let Some(repo_workdir) = repo
-        .workdir()
-        .ok()
-        .map(|path| path.to_string_lossy().to_string())
-    else {
-        return Ok(());
-    };
-
-    let base_commit = match repo.head() {
-        Ok(head) => head.target().unwrap_or_else(|_| "initial".to_string()),
-        Err(_) => "initial".to_string(),
-    };
-    let lineage_epoch = crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir)?;
-    let remaining =
-        crate::checkpoint_tasks::recovery::drain_relevant_tasks(repo, &base_commit, lineage_epoch)?;
-
-    if remaining.is_empty() {
-        return Ok(());
-    }
-
-    let details = remaining
-        .iter()
-        .map(|task| {
-            let mut message = format!("{}:{}", task.task_id, task.state);
-            if let Some(error) = task.last_error.as_deref()
-                && !error.trim().is_empty()
-            {
-                message.push_str(&format!(" ({})", error));
-            }
-            message
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Err(GitAiError::Generic(format!(
-        "found {} pending checkpoint task(s) relevant to current base commit {}: {}",
-        remaining.len(),
-        base_commit,
-        details
-    )))
+    result.map(|_| ())
 }
 
 fn pre_commit_checkpoint_context(repo: &Repository) -> (CheckpointKind, Option<AgentRunResult>) {
@@ -88,12 +42,7 @@ fn pre_commit_checkpoint_context(repo: &Repository) -> (CheckpointKind, Option<A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint_tasks::store;
-    use crate::checkpoint_tasks::types::{CheckpointTaskRecord, CheckpointTaskState};
-    use crate::config::Config;
-    use crate::feature_flags::FeatureFlags;
     use crate::git::test_utils::TmpRepo;
-    use serial_test::serial;
     use std::fs;
 
     #[test]
@@ -169,98 +118,6 @@ mod tests {
                 // Error case is also acceptable
             }
         }
-    }
-
-    fn pending_task(repo: &TmpRepo, task_id: &str, base_commit: String) -> CheckpointTaskRecord {
-        CheckpointTaskRecord {
-            task_id: task_id.to_string(),
-            repo_workdir: repo
-                .gitai_repo()
-                .workdir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-            base_commit,
-            lineage_epoch: 0,
-            state: CheckpointTaskState::FailedRetryable,
-            dedupe_key: format!("dedupe-{}", task_id),
-            kind: "human".to_string(),
-            author: "claude".to_string(),
-            payload_ref: repo
-                .path()
-                .join(format!("{}.json", task_id))
-                .to_string_lossy()
-                .to_string(),
-            explicit_paths: vec!["test.txt".to_string()],
-            is_pre_commit: false,
-            captured_at_ms: 1,
-            processing_started_at_ms: None,
-            applied_at_ms: None,
-            completed_at_ms: None,
-            obsolete_at_ms: None,
-            attempts: 0,
-            last_error: Some("pending retry".to_string()),
-            next_retry_at_ms: Some(9_000_000_000_000),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_pre_commit_blocks_on_relevant_pending_checkpoint_tasks() {
-        Config::clear_test_feature_flags();
-        Config::set_test_feature_flags(FeatureFlags {
-            rewrite_stash: true,
-            inter_commit_move: false,
-            checkpoint_tasks: true,
-            auth_keyring: false,
-            async_mode: false,
-            git_hooks_enabled: false,
-            git_hooks_externally_managed: false,
-        });
-
-        let repo = TmpRepo::new_with_base_commit().unwrap().0;
-        let base_commit = repo.get_head_commit_sha().unwrap();
-        store::create_task(&pending_task(&repo, "pending-task", base_commit.clone())).unwrap();
-
-        let result = pre_commit(repo.gitai_repo(), "author".to_string());
-
-        Config::clear_test_feature_flags();
-
-        let error = result.expect_err("expected pre_commit to block on pending task");
-        let message = error.to_string();
-        assert!(message.contains("pending checkpoint task"));
-        assert!(message.contains("pending-task"));
-        assert!(message.contains(&base_commit));
-    }
-
-    #[test]
-    #[serial]
-    fn test_pre_commit_ignores_applied_checkpoint_tasks() {
-        Config::clear_test_feature_flags();
-        Config::set_test_feature_flags(FeatureFlags {
-            rewrite_stash: true,
-            inter_commit_move: false,
-            checkpoint_tasks: true,
-            auth_keyring: false,
-            async_mode: false,
-            git_hooks_enabled: false,
-            git_hooks_externally_managed: false,
-        });
-
-        let repo = TmpRepo::new_with_base_commit().unwrap().0;
-        let base_commit = repo.get_head_commit_sha().unwrap();
-        let mut task = pending_task(&repo, "applied-task", base_commit);
-        task.state = CheckpointTaskState::Applied;
-        task.applied_at_ms = Some(10);
-        task.last_error = None;
-        task.next_retry_at_ms = None;
-        store::create_task(&task).unwrap();
-
-        let result = pre_commit(repo.gitai_repo(), "author".to_string());
-
-        Config::clear_test_feature_flags();
-
-        assert!(result.is_ok(), "applied tasks should not block pre_commit");
     }
 
     #[test]

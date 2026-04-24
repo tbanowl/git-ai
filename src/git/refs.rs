@@ -2,6 +2,7 @@ use crate::authorship::authorship_log_serialization::{AUTHORSHIP_LOG_VERSION, Au
 use crate::authorship::working_log::Checkpoint;
 use crate::error::GitAiError;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
+use git2::Oid;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 
@@ -543,13 +544,9 @@ pub fn tracking_ref_for_remote(remote_name: &str) -> String {
 
 /// Check if a ref exists in the repository
 pub fn ref_exists(repo: &Repository, ref_name: &str) -> bool {
-    let mut args = repo.global_args_for_exec();
-    args.push("show-ref".to_string());
-    args.push("--verify".to_string());
-    args.push("--quiet".to_string());
-    args.push(ref_name.to_string());
-
-    exec_git(&args).is_ok()
+    git2::Repository::open(repo.path())
+        .ok()
+        .is_some_and(|g2repo| g2repo.find_reference(ref_name).is_ok())
 }
 
 /// Merge notes from a source ref into refs/notes/ai
@@ -682,13 +679,23 @@ fn rev_parse(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
 
 /// Copy a ref to another location (used for initial setup of local notes from tracking ref)
 pub fn copy_ref(repo: &Repository, source_ref: &str, dest_ref: &str) -> Result<(), GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("update-ref".to_string());
-    args.push(dest_ref.to_string());
-    args.push(source_ref.to_string());
+    let g2repo =
+        git2::Repository::open(repo.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let source_oid = g2repo
+        .revparse_single(source_ref)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?
+        .id();
 
     tracing::debug!("Copying ref {} to {}", source_ref, dest_ref);
-    exec_git(&args)?;
+    g2repo
+        .reference(
+            dest_ref,
+            Oid::from_str(&source_oid.to_string())
+                .map_err(|e| GitAiError::Generic(e.to_string()))?,
+            true,
+            &format!("git-ai copy_ref from {source_ref}"),
+        )
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
     Ok(())
 }
 
@@ -928,6 +935,34 @@ mod tests {
             "refs/heads/nonexistent-branch"
         ));
         assert!(!ref_exists(tmp_repo.gitai_repo(), "refs/notes/ai-test"));
+    }
+
+    #[test]
+    fn test_rev_parse_resolves_existing_and_missing_refs() {
+        let tmp_repo = TmpRepo::new().expect("Failed to create tmp repo");
+
+        tmp_repo
+            .write_file("test.txt", "content\n", true)
+            .expect("write file");
+        tmp_repo
+            .commit_with_message("Initial commit")
+            .expect("commit");
+
+        let head_sha = tmp_repo.get_head_commit_sha().expect("head sha");
+        let parsed_head = rev_parse(tmp_repo.gitai_repo(), "HEAD").expect("rev_parse HEAD");
+        assert_eq!(parsed_head, head_sha);
+
+        let missing_ref = rev_parse(tmp_repo.gitai_repo(), "refs/heads/does-not-exist");
+        assert!(missing_ref.is_err(), "missing ref should fail rev_parse");
+
+        let missing_object = rev_parse(
+            tmp_repo.gitai_repo(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef^{commit}",
+        );
+        assert!(
+            missing_object.is_err(),
+            "missing object should fail rev_parse"
+        );
     }
 
     #[test]

@@ -38,8 +38,8 @@ pub fn handle_git_ai(args: &[String]) {
         return;
     }
 
-    let is_daemon_subcommand = matches!(args[0].as_str(), "bg" | "d" | "daemon");
-    if !is_daemon_subcommand {
+    let is_daemon_command = matches!(args[0].as_str(), "bg" | "d" | "daemon");
+    if !is_daemon_command {
         crate::observability::tracing_file::init_command_tracing("git-ai");
     }
 
@@ -128,9 +128,6 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "status" => {
             commands::status::handle_status(&args[1..]);
-        }
-        "checkpoint-recover" => {
-            commands::checkpoint_recover::handle_checkpoint_recover(&args[1..]);
         }
         "show" => {
             commands::show::handle_show(&args[1..]);

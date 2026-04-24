@@ -71,24 +71,6 @@ pub fn post_reset_hook(
         }
     };
 
-    if let Ok(repo_workdir) = repository
-        .workdir()
-        .map(|path| path.to_string_lossy().to_string())
-        && let Ok(new_epoch) = crate::checkpoint_tasks::lineage::bump_epoch(
-            &repo_workdir,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-    {
-        let _ = crate::checkpoint_tasks::lineage::obsolete_tasks_from_old_epochs(
-            &repo_workdir,
-            new_epoch,
-            "reset",
-        );
-    }
-
     // Use pre-resolved target commit from pre-reset hook
     // This is critical because relative refs like HEAD~1 resolve differently after the reset
     let target_commit_sha = match &repository.pre_reset_target_commit {
@@ -590,83 +572,4 @@ fn has_reset_mode_flag(parsed_args: &ParsedGitInvocation) -> bool {
 /// Check if pathspec-from-file is present
 fn has_pathspec_from_file(parsed_args: &ParsedGitInvocation) -> bool {
     get_pathspec_from_file_path(parsed_args).is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::checkpoint_tasks::store;
-    use crate::checkpoint_tasks::types::{CheckpointTaskRecord, CheckpointTaskState};
-    use crate::git::test_utils::{ResetMode, TmpRepo};
-    use serial_test::serial;
-
-    fn pending_task(repo: &TmpRepo, task_id: &str, base_commit: String) -> CheckpointTaskRecord {
-        CheckpointTaskRecord {
-            task_id: task_id.to_string(),
-            repo_workdir: repo
-                .gitai_repo()
-                .workdir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-            base_commit,
-            lineage_epoch: crate::checkpoint_tasks::lineage::get_current_epoch(
-                repo.gitai_repo()
-                    .workdir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .as_ref(),
-            )
-            .unwrap(),
-            state: CheckpointTaskState::Ready,
-            dedupe_key: format!("dedupe-{}", task_id),
-            kind: "human".to_string(),
-            author: "author".to_string(),
-            payload_ref: repo
-                .path()
-                .join(format!("{}.json", task_id))
-                .to_string_lossy()
-                .to_string(),
-            explicit_paths: vec!["test.txt".to_string()],
-            is_pre_commit: false,
-            captured_at_ms: 1,
-            processing_started_at_ms: None,
-            applied_at_ms: None,
-            completed_at_ms: None,
-            obsolete_at_ms: None,
-            attempts: 0,
-            last_error: None,
-            next_retry_at_ms: None,
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_reset_obsoletes_pending_tasks_and_bumps_epoch() {
-        let (repo, mut file, _) = TmpRepo::new_with_base_commit().unwrap();
-        file.append("commit one\n").unwrap();
-        repo.commit_with_message("commit one").unwrap();
-        file.append("commit two\n").unwrap();
-        repo.commit_with_message("commit two").unwrap();
-
-        let current_head = repo.get_head_commit_sha().unwrap();
-        let repo_workdir = repo
-            .gitai_repo()
-            .workdir()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        store::create_task(&pending_task(&repo, "reset-pending", current_head)).unwrap();
-        let epoch_before =
-            crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir).unwrap();
-
-        repo.reset("HEAD~1", ResetMode::Mixed, &[]).unwrap();
-
-        let epoch_after =
-            crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir).unwrap();
-        assert_eq!(epoch_after, epoch_before + 1);
-
-        let task = store::get_task("reset-pending").unwrap().unwrap();
-        assert_eq!(task.state, CheckpointTaskState::Obsolete);
-        assert_eq!(task.last_error.as_deref(), Some("reset"));
-    }
 }

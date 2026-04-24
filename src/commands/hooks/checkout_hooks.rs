@@ -4,26 +4,6 @@ use crate::commands::hooks::commit_hooks::get_commit_default_author;
 use crate::git::cli_parser::ParsedGitInvocation;
 use crate::git::repository::Repository;
 
-fn invalidate_checkpoint_tasks_on_head_change(repository: &Repository, reason: &str) {
-    if let Ok(repo_workdir) = repository
-        .workdir()
-        .map(|path| path.to_string_lossy().to_string())
-        && let Ok(new_epoch) = crate::checkpoint_tasks::lineage::bump_epoch(
-            &repo_workdir,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-    {
-        let _ = crate::checkpoint_tasks::lineage::obsolete_tasks_from_old_epochs(
-            &repo_workdir,
-            new_epoch,
-            reason,
-        );
-    }
-}
-
 pub fn pre_checkout_hook(
     parsed_args: &ParsedGitInvocation,
     repository: &mut Repository,
@@ -152,8 +132,6 @@ pub fn post_checkout_hook(
         return;
     }
 
-    invalidate_checkpoint_tasks_on_head_change(repository, "checkout");
-
     // Case 3: Force checkout - delete working log (changes discarded)
     if is_force_checkout(parsed_args) {
         tracing::debug!(
@@ -262,118 +240,4 @@ fn matches_any_pathspec(file: &str, pathspecs: &[String]) -> bool {
             || (p.ends_with('/') && file.starts_with(p))
             || file.starts_with(&format!("{}/", p))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::checkpoint_tasks::store;
-    use crate::checkpoint_tasks::types::{CheckpointTaskRecord, CheckpointTaskState};
-    use crate::commands::git_handlers::CommandHooksContext;
-    use crate::git::cli_parser::parse_git_cli_args;
-    use crate::git::find_repository_in_path;
-    use crate::git::test_utils::TmpRepo;
-    use serial_test::serial;
-
-    #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-    #[cfg(windows)]
-    use std::os::windows::process::ExitStatusExt;
-    use std::process::ExitStatus;
-
-    fn success_exit_status() -> ExitStatus {
-        #[cfg(unix)]
-        {
-            ExitStatus::from_raw(0)
-        }
-        #[cfg(windows)]
-        {
-            ExitStatus::from_raw(0)
-        }
-    }
-
-    fn pending_task(repo: &TmpRepo, task_id: &str, base_commit: String) -> CheckpointTaskRecord {
-        CheckpointTaskRecord {
-            task_id: task_id.to_string(),
-            repo_workdir: repo
-                .gitai_repo()
-                .workdir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-            base_commit,
-            lineage_epoch: crate::checkpoint_tasks::lineage::get_current_epoch(
-                repo.gitai_repo()
-                    .workdir()
-                    .unwrap()
-                    .to_string_lossy()
-                    .as_ref(),
-            )
-            .unwrap(),
-            state: CheckpointTaskState::Ready,
-            dedupe_key: format!("dedupe-{}", task_id),
-            kind: "human".to_string(),
-            author: "author".to_string(),
-            payload_ref: repo
-                .path()
-                .join(format!("{}.json", task_id))
-                .to_string_lossy()
-                .to_string(),
-            explicit_paths: vec!["test.txt".to_string()],
-            is_pre_commit: false,
-            captured_at_ms: 1,
-            processing_started_at_ms: None,
-            applied_at_ms: None,
-            completed_at_ms: None,
-            obsolete_at_ms: None,
-            attempts: 0,
-            last_error: None,
-            next_retry_at_ms: None,
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_checkout_obsoletes_pending_tasks_and_bumps_epoch() {
-        let (repo, mut file, _) = TmpRepo::new_with_base_commit().unwrap();
-        let default_branch = repo.repo().head().unwrap().shorthand().unwrap().to_string();
-        repo.create_branch("feature").unwrap();
-        file.append("feature change\n").unwrap();
-        repo.commit_with_message("feature change").unwrap();
-
-        let feature_head = repo.get_head_commit_sha().unwrap();
-        let repo_workdir = repo
-            .gitai_repo()
-            .workdir()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        store::create_task(&pending_task(&repo, "checkout-pending", feature_head)).unwrap();
-        let epoch_before =
-            crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir).unwrap();
-
-        let mut repo_mut = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
-        repo_mut.require_pre_command_head();
-        repo.git_command(&["checkout", &default_branch]).unwrap();
-        let parsed = parse_git_cli_args(&["checkout".to_string(), default_branch.clone()]);
-        let mut ctx = CommandHooksContext {
-            pre_commit_hook_result: None,
-            rebase_original_head: None,
-            rebase_onto: None,
-            fetch_authorship_handle: None,
-            stash_sha: None,
-            push_authorship_handle: None,
-            stashed_va: None,
-        };
-
-        post_checkout_hook(&parsed, &mut repo_mut, success_exit_status(), &mut ctx);
-
-        let epoch_after =
-            crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir).unwrap();
-        assert_eq!(epoch_after, epoch_before + 1);
-
-        let task = store::get_task("checkout-pending").unwrap().unwrap();
-        assert_eq!(task.state, CheckpointTaskState::Obsolete);
-        assert_eq!(task.last_error.as_deref(), Some("checkout"));
-    }
 }

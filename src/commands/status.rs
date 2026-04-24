@@ -4,7 +4,6 @@ use crate::authorship::ignore::{
 use crate::authorship::stats::{CommitStats, stats_from_authorship_log, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::authorship::working_log::CheckpointKind;
-use crate::checkpoint_tasks::store;
 // use crate::commands::checkpoint;
 use crate::error::GitAiError;
 use crate::git::find_repository;
@@ -28,17 +27,6 @@ struct CheckpointInfo {
 struct StatusOutput {
     stats: CommitStats,
     checkpoints: Vec<CheckpointInfo>,
-    checkpoint_tasks: Vec<CheckpointTaskStatusInfo>,
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-struct CheckpointTaskStatusInfo {
-    task_id: String,
-    state: String,
-    base_commit: String,
-    lineage_epoch: u64,
-    attempts: u32,
-    last_error: Option<String>,
 }
 
 pub fn handle_status(args: &[String]) {
@@ -62,8 +50,6 @@ fn run_status(json: bool) -> Result<(), GitAiError> {
     let repo = find_repository(&[])?;
     let ignore_patterns = effective_ignore_patterns(&repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
-    let repo_workdir = repo.workdir()?.to_string_lossy().to_string();
-    let checkpoint_tasks = collect_checkpoint_task_statuses(&repo_workdir)?;
 
     let default_user_name = repo.git_author_identity().name_or_unknown();
 
@@ -87,7 +73,6 @@ fn run_status(json: bool) -> Result<(), GitAiError> {
             let output = StatusOutput {
                 stats: CommitStats::default(),
                 checkpoints: vec![],
-                checkpoint_tasks,
             };
             let json_str = serde_json::to_string(&output)?;
             println!("{}", json_str);
@@ -104,7 +89,6 @@ fn run_status(json: bool) -> Result<(), GitAiError> {
             eprintln!();
             eprintln!("  git-ai install-hooks");
             eprintln!();
-            print_checkpoint_task_statuses(&checkpoint_tasks);
         }
         return Ok(());
     }
@@ -175,7 +159,6 @@ fn run_status(json: bool) -> Result<(), GitAiError> {
         let output = StatusOutput {
             stats,
             checkpoints: checkpoint_infos,
-            checkpoint_tasks,
         };
         let json_str = serde_json::to_string(&output)?;
         println!("{}", json_str);
@@ -209,56 +192,7 @@ fn run_status(json: bool) -> Result<(), GitAiError> {
         }
     }
 
-    print_checkpoint_task_statuses(&checkpoint_tasks);
-
     Ok(())
-}
-
-fn collect_checkpoint_task_statuses(
-    repo_workdir: &str,
-) -> Result<Vec<CheckpointTaskStatusInfo>, GitAiError> {
-    let mut tasks = store::list_tasks_for_repo(repo_workdir)?;
-    tasks.sort_by(|a, b| a.captured_at_ms.cmp(&b.captured_at_ms));
-    Ok(tasks
-        .into_iter()
-        .map(|task| CheckpointTaskStatusInfo {
-            task_id: task.task_id,
-            state: task.state.to_string(),
-            base_commit: task.base_commit,
-            lineage_epoch: task.lineage_epoch,
-            attempts: task.attempts,
-            last_error: task.last_error,
-        })
-        .collect())
-}
-
-fn render_checkpoint_task_status_lines(tasks: &[CheckpointTaskStatusInfo]) -> Vec<String> {
-    if tasks.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::with_capacity(tasks.len() + 2);
-    lines.push(String::new());
-    lines.push("Checkpoint tasks:".to_string());
-    for task in tasks {
-        let mut line = format!(
-            "  {}  state={}  base={}  epoch={}  attempts={}",
-            task.task_id, task.state, task.base_commit, task.lineage_epoch, task.attempts
-        );
-        if let Some(error) = task.last_error.as_deref()
-            && !error.trim().is_empty()
-        {
-            line.push_str(&format!("  error={}", error));
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-fn print_checkpoint_task_statuses(tasks: &[CheckpointTaskStatusInfo]) {
-    for line in render_checkpoint_task_status_lines(tasks) {
-        println!("{}", line);
-    }
 }
 
 fn format_time_ago(timestamp: u64) -> String {
@@ -396,11 +330,8 @@ fn count_ai_lines_from_initial(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint_tasks::store;
-    use crate::checkpoint_tasks::types::{CheckpointTaskRecord, CheckpointTaskState};
     use crate::git::status::MAX_PATHSPEC_ARGS;
     use crate::git::test_utils::TmpRepo;
-    use serial_test::serial;
 
     /// Pad a set of real paths with non-existent paths to exceed MAX_PATHSPEC_ARGS.
     fn padded_pathspecs(real_paths: &[&str]) -> HashSet<String> {
@@ -608,91 +539,5 @@ mod tests {
         let ignore_matcher = build_ignore_matcher(&["Cargo.lock".to_string()]);
         let ai_lines = count_ai_lines_from_initial(&initial, &ignore_matcher);
         assert_eq!(ai_lines, 2);
-    }
-
-    #[test]
-    fn test_render_checkpoint_task_status_lines_includes_expected_fields() {
-        let lines = render_checkpoint_task_status_lines(&[CheckpointTaskStatusInfo {
-            task_id: "task-1".to_string(),
-            state: CheckpointTaskState::FailedRetryable.to_string(),
-            base_commit: "abc123".to_string(),
-            lineage_epoch: 3,
-            attempts: 2,
-            last_error: Some("temporary failure".to_string()),
-        }]);
-
-        assert_eq!(lines[1], "Checkpoint tasks:");
-        assert!(lines[2].contains("task-1"));
-        assert!(lines[2].contains("state=failed_retryable"));
-        assert!(lines[2].contains("base=abc123"));
-        assert!(lines[2].contains("epoch=3"));
-        assert!(lines[2].contains("attempts=2"));
-        assert!(lines[2].contains("error=temporary failure"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_collect_checkpoint_task_statuses_filters_to_current_repo() {
-        let repo = TmpRepo::new_with_base_commit().unwrap().0;
-        let repo_workdir = repo
-            .gitai_repo()
-            .workdir()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let base_commit = repo.get_head_commit_sha().unwrap();
-
-        store::create_task(&CheckpointTaskRecord {
-            task_id: "repo-task".to_string(),
-            repo_workdir: repo_workdir.clone(),
-            base_commit: base_commit.clone(),
-            lineage_epoch: 1,
-            state: CheckpointTaskState::Ready,
-            dedupe_key: "dedupe-repo-task".to_string(),
-            kind: "human".to_string(),
-            author: "author".to_string(),
-            payload_ref: repo
-                .path()
-                .join("repo-task.json")
-                .to_string_lossy()
-                .to_string(),
-            explicit_paths: vec!["test.txt".to_string()],
-            is_pre_commit: false,
-            captured_at_ms: 1,
-            processing_started_at_ms: None,
-            applied_at_ms: None,
-            completed_at_ms: None,
-            obsolete_at_ms: None,
-            attempts: 0,
-            last_error: None,
-            next_retry_at_ms: None,
-        })
-        .unwrap();
-        store::create_task(&CheckpointTaskRecord {
-            task_id: "other-task".to_string(),
-            repo_workdir: "/other/repo".to_string(),
-            base_commit,
-            lineage_epoch: 1,
-            state: CheckpointTaskState::Ready,
-            dedupe_key: "dedupe-other-task".to_string(),
-            kind: "human".to_string(),
-            author: "author".to_string(),
-            payload_ref: "/other/repo/task.json".to_string(),
-            explicit_paths: vec!["test.txt".to_string()],
-            is_pre_commit: false,
-            captured_at_ms: 2,
-            processing_started_at_ms: None,
-            applied_at_ms: None,
-            completed_at_ms: None,
-            obsolete_at_ms: None,
-            attempts: 1,
-            last_error: Some("other".to_string()),
-            next_retry_at_ms: None,
-        })
-        .unwrap();
-
-        let tasks = collect_checkpoint_task_statuses(&repo_workdir).unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task_id, "repo-task");
     }
 }

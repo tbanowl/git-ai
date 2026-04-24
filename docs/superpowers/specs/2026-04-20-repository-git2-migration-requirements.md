@@ -342,6 +342,103 @@ For each PR:
 - Folding in object writes (`commit-tree`, `update-ref`, `hash-object`) too early
   will complicate review and rollback.
 
+## Appendix — Current Cross-Repo Migration Routing
+
+This requirements doc is still primarily about the first-phase `repository.rs`
+`git2` migration. However, the broader repository migration triage is now clear
+enough that we should record the current routing decision in one place:
+
+- **Prefer `git2`** for high-frequency, local, read-only object/ref/commit graph
+  queries.
+- **Prefer `gix`** for status/index/staged-content plumbing that already aligns
+  with existing `gix_index` usage.
+- **Keep CLI** for operations whose behavior depends on Git porcelain text,
+  notes/`fast-import`, raw diff formatting, merge strategy behavior, or network
+  side effects.
+
+This appendix is a supplement to the detailed matrix in
+`docs/git2-对照表.md`. It exists to answer “which backend should own this next?”
+before new migration work begins.
+
+### Prefer `git2` Next
+
+These are the easiest remaining non-CLI candidates where `git2` has a direct or
+near-direct API match and the main value is removing subprocess overhead:
+
+- `src/authorship/rebase_authorship.rs`
+  - `walk_commits_to_base()`
+- `src/commands/search.rs`
+  - `search_by_commit_range()`
+- `src/commands/blame.rs`
+  - `resolve_blame_abbrev_shas_batched()`
+- `src/git/refs.rs`
+  - `ref_exists()`
+  - `rev_parse()`
+  - `copy_ref()`
+- `src/git/sync_authorship.rs`
+  - `get_current_branch()`
+- `src/git/repository.rs`
+  - `new_infer_refname()`
+  - `remote_head()`
+  - `upstream_remote()`
+  - `get_file_content()`
+
+### Prefer `gix` Next
+
+These paths are better treated as status/index plumbing rather than forced into
+`git2` for consistency:
+
+- `src/git/status.rs`
+  - `get_staged_filenames()`
+  - `get_staged_and_unstaged_filenames()`
+- `src/git/repo_state.rs`
+  - branch / detached-HEAD metadata contract via `read_head_state_for_worktree()`
+- `src/git/repository.rs`
+  - `get_all_staged_files_content()`
+
+The reason is structural, not ideological: the status module already depends on
+`--porcelain=v2` semantics, and `repository.rs` already uses `gix_index` for
+index reads. Extending that direction is lower-risk than re-modeling the same
+paths around `git2`.
+
+### Consider `gix` Only as a Scoped Prototype
+
+- `src/git/diff_tree_to_tree.rs`
+  - `diff_tree_to_tree()`
+
+This is not a “simple migration” item. The plausible next step is a
+`gix-diff`-backed prototype that proves we can reconstruct the current raw diff
+contract before replacing the CLI path.
+
+### Keep CLI
+
+These should continue to use Git CLI until there is a stronger product or
+correctness reason to revisit them:
+
+- `src/git/repository.rs`
+  - `diff_*` family
+  - `list_commit_files()`
+  - `merge_trees_favor_ours()`
+- `src/git/refs.rs`
+  - `notes_add_batch()`
+  - `notes_add_blob_batch()`
+  - `merge_notes_from_ref()`
+  - `fallback_merge_notes()`
+  - `grep_ai_notes()`
+- `src/commands/log.rs`
+  - `handle_log()`
+- `src/commands/git_handlers.rs`
+  - `handle_git()` / `run_git_with_hooks()`
+- `src/commands/blame.rs`
+  - `blame_hunks_for_ranges()`
+- `src/git/sync_authorship.rs`
+  - `fetch_authorship_notes()`
+  - `push_authorship_notes()`
+
+The common pattern is that these paths depend on Git's textual output,
+high-level notes behavior, merge semantics, or network effects more than they
+depend on raw object access speed.
+
 ## Acceptance Criteria
 
 This requirements set is satisfied when:

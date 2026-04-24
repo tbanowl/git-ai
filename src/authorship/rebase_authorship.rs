@@ -7,6 +7,7 @@ use crate::git::authorship_traversal::{
 use crate::git::refs::{get_reference_as_authorship_log_v3, note_blob_oids_for_commits};
 use crate::git::repository::{CommitRange, Repository, exec_git, exec_git_stdin};
 use crate::git::rewrite_log::RewriteLogEvent;
+use git2::Sort;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, Default)]
@@ -2988,36 +2989,54 @@ pub fn walk_commits_to_base(
     repository.find_commit(head.to_string())?;
     repository.find_commit(base.to_string())?;
 
+    let g2repo = git2::Repository::open(repository.path())
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let head_oid = g2repo
+        .revparse_single(head)
+        .and_then(|obj| obj.peel_to_commit())
+        .map_err(|e| GitAiError::Generic(e.to_string()))?
+        .id();
+    let base_oid = g2repo
+        .revparse_single(base)
+        .and_then(|obj| obj.peel_to_commit())
+        .map_err(|e| GitAiError::Generic(e.to_string()))?
+        .id();
+
     // Guard against pathological traversals when `base` is not actually an ancestor.
     // The old BFS fallback could walk huge histories in this case.
-    let mut is_ancestor_args = repository.global_args_for_exec();
-    is_ancestor_args.push("merge-base".to_string());
-    is_ancestor_args.push("--is-ancestor".to_string());
-    is_ancestor_args.push(base.to_string());
-    is_ancestor_args.push(head.to_string());
-    if exec_git(&is_ancestor_args).is_err() {
+    if !g2repo
+        .graph_descendant_of(head_oid, base_oid)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?
+    {
         return Err(GitAiError::Generic(format!(
             "Base commit {} is not an ancestor of {}",
             base, head
         )));
     }
 
-    // Use git's native graph walker instead of per-parent subprocess traversal.
-    // Return newest->oldest so existing callers can keep their current reverse() behavior.
-    let mut args = repository.global_args_for_exec();
-    args.push("rev-list".to_string());
-    args.push("--topo-order".to_string());
-    args.push("--ancestry-path".to_string());
-    args.push(format!("{}..{}", base, head));
+    // Match `git rev-list --topo-order --ancestry-path base..head`.
+    // `hide(base)` excludes base and its ancestors, while the descendant filter
+    // keeps merged history that still descends from base.
+    let mut walk = g2repo
+        .revwalk()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    walk.set_sorting(Sort::TOPOLOGICAL)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    walk.push(head_oid)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    walk.hide(base_oid)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-    let output = exec_git(&args)?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let commits = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
+    let mut commits = Vec::new();
+    for oid in walk {
+        let oid = oid.map_err(|e| GitAiError::Generic(e.to_string()))?;
+        if g2repo
+            .graph_descendant_of(oid, base_oid)
+            .map_err(|e| GitAiError::Generic(e.to_string()))?
+        {
+            commits.push(oid.to_string());
+        }
+    }
 
     Ok(commits)
 }

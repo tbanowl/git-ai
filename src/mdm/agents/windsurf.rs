@@ -13,10 +13,12 @@ use std::path::PathBuf;
 
 const WINDSURF_CHECKPOINT_CMD: &str = "checkpoint windsurf --hook-input stdin";
 
-/// The three Windsurf Cascade hook events we install into.
+/// The Windsurf Cascade hook events we install into.
 const HOOK_EVENTS: &[&str] = &[
     "pre_write_code",
     "post_write_code",
+    "pre_run_command",
+    "post_run_command",
     "post_cascade_response_with_transcript",
 ];
 
@@ -209,7 +211,8 @@ impl HookInstaller for WindsurfInstaller {
 
     fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
         let has_cli = resolve_editor_cli("windsurf").is_some();
-        let has_dotfiles = home_dir().join(".codeium").join("windsurf").exists();
+        let has_dotfiles =
+            home_dir().join(".codeium").exists() || home_dir().join(".windsurf").exists();
 
         if !has_cli && !has_dotfiles {
             return Ok(HookCheckResult {

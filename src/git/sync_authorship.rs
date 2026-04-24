@@ -367,30 +367,25 @@ fn is_non_fast_forward_error(error: &GitAiError) -> bool {
 
 fn extract_remote_from_fetch_args(args: &[String]) -> Option<String> {
     let mut after_double_dash = false;
-    let mut i = 0;
+    let mut skip_next_option_value = false;
 
-    while i < args.len() {
-        let arg = &args[i];
+    for arg in args {
+        if skip_next_option_value {
+            skip_next_option_value = false;
+            continue;
+        }
+
         if !after_double_dash {
             if arg == "--" {
                 after_double_dash = true;
-                i += 1;
                 continue;
             }
-
+            if arg == "-C" {
+                skip_next_option_value = true;
+                continue;
+            }
             if arg.starts_with('-') {
-                if is_fetch_option_with_inline_value(arg).is_some() {
-                    i += 1;
-                    continue;
-                }
-
-                if fetch_option_consumes_separate_value(arg) {
-                    i += 2;
-                    continue;
-                }
-
-                // Option without a separate value; skip
-                i += 1;
+                // Option; skip
                 continue;
             }
         }
@@ -429,35 +424,6 @@ fn extract_remote_from_fetch_args(args: &[String]) -> Option<String> {
     }
 
     None
-}
-
-fn is_fetch_option_with_inline_value(arg: &str) -> Option<(&str, &str)> {
-    if let Some((flag, value)) = arg.split_once('=') {
-        Some((flag, value))
-    } else if (arg.starts_with("-C") || arg.starts_with("-c")) && arg.len() > 2 {
-        Some((&arg[..2], &arg[2..]))
-    } else {
-        None
-    }
-}
-
-fn fetch_option_consumes_separate_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-c" | "-C"
-            | "--config-env"
-            | "--upload-pack"
-            | "--server-option"
-            | "-o"
-            | "-j"
-            | "--jobs"
-            | "--depth"
-            | "--deepen"
-            | "--shallow-since"
-            | "--shallow-exclude"
-            | "--negotiation-tip"
-            | "--recurse-submodules-default"
-    )
 }
 
 fn with_disabled_hooks(mut args: Vec<String>) -> Vec<String> {
@@ -753,18 +719,14 @@ fn parse_author_identity(author_str: &str) -> (String, String) {
 
 /// Get current branch name from repository using git rev-parse
 fn get_current_branch(repository: &Repository) -> Result<String, GitAiError> {
-    let mut args = repository.global_args_for_exec();
-    args.push("rev-parse".to_string());
-    args.push("--abbrev-ref".to_string());
-    args.push("HEAD".to_string());
+    let g2repo = git2::Repository::open(repository.path())
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let head = g2repo
+        .head()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let branch = head.shorthand().unwrap_or("HEAD").trim().to_string();
 
-    let output = exec_git(&args)?;
-    let branch = String::from_utf8(output.stdout)
-        .map_err(|_| GitAiError::Generic("Branch name is not valid UTF-8".to_string()))?
-        .trim()
-        .to_string();
-
-    if branch.is_empty() || branch == "HEAD" {
+    if branch.is_empty() || !head.is_branch() || branch == "HEAD" {
         Err(GitAiError::Generic("Not on a branch".to_string()))
     } else {
         Ok(branch)
@@ -774,6 +736,9 @@ fn get_current_branch(repository: &Repository) -> Result<String, GitAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::git::test_utils::TmpRepo;
+    use std::process::Command;
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
@@ -842,5 +807,49 @@ mod tests {
             extract_remote_from_fetch_args(&args).as_deref(),
             Some("https://github.com/example/repo.git")
         );
+    }
+
+    #[test]
+    fn get_current_branch_returns_checked_out_branch_name() {
+        let tmp_repo = TmpRepo::new().expect("create tmp repo");
+
+        tmp_repo
+            .write_file("tracked.txt", "content\n", true)
+            .expect("write file");
+        tmp_repo
+            .commit_with_message("Initial commit")
+            .expect("commit");
+
+        let branch = get_current_branch(tmp_repo.gitai_repo()).expect("branch name");
+        assert_eq!(branch, tmp_repo.current_branch().expect("current branch"));
+    }
+
+    #[test]
+    fn get_current_branch_errors_for_detached_head() {
+        let tmp_repo = TmpRepo::new().expect("create tmp repo");
+
+        tmp_repo
+            .write_file("tracked.txt", "content\n", true)
+            .expect("write file");
+        tmp_repo
+            .commit_with_message("Initial commit")
+            .expect("commit");
+
+        let head_sha = tmp_repo.get_head_commit_sha().expect("head sha");
+        let output = Command::new(Config::get().git_cmd())
+            .current_dir(tmp_repo.path())
+            .args(["checkout", &head_sha])
+            .output()
+            .expect("detach HEAD");
+        assert!(
+            output.status.success(),
+            "git checkout should detach HEAD: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let err = get_current_branch(tmp_repo.gitai_repo())
+            .expect_err("detached HEAD should produce an error")
+            .to_string();
+        assert!(err.contains("Not on a branch"), "unexpected error: {err}");
     }
 }

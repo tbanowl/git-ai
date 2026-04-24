@@ -769,8 +769,7 @@ impl<'a> CommitRange<'a> {
                             .filter_map(|reference| {
                                 let reference = reference.ok()?;
                                 let name = reference.name()?.to_string();
-                                let commit = reference.peel_to_commit().ok()?;
-                                (commit.id() == resolved_end).then_some(name)
+                                (reference.target() == Some(resolved_end)).then_some(name)
                             })
                             .collect();
                         Some(refs)
@@ -1753,7 +1752,10 @@ impl Repository {
         let remotes = g2repo
             .remotes()
             .map_err(|e| GitAiError::Generic(e.to_string()))?;
-        let names: Vec<String> = remotes.iter().map(|name| name.unwrap_or("").to_string()).collect();
+        let names: Vec<String> = remotes
+            .iter()
+            .map(|name| name.unwrap_or("").to_string())
+            .collect();
 
         if names.is_empty() {
             Ok(vec![String::new()])
@@ -1975,14 +1977,17 @@ impl Repository {
         let reference = g2repo
             .find_reference(&format!("refs/remotes/{}/HEAD", remote_name))
             .map_err(|e| GitAiError::Generic(e.to_string()))?;
-        let resolved = reference
-            .resolve()
-            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let target = reference.symbolic_target().ok_or_else(|| {
+            GitAiError::Generic(format!(
+                "reference refs/remotes/{}/HEAD has no target",
+                remote_name
+            ))
+        })?;
 
-        resolved
-            .shorthand()
-            .map(|name| name.to_string())
-            .ok_or_else(|| GitAiError::Generic(format!("reference refs/remotes/{}/HEAD has no target", remote_name)))
+        Ok(target
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(target)
+            .to_string())
     }
 
     // Lookup a reference to one of the objects in a repository. Requires full ref name.
@@ -2465,24 +2470,50 @@ impl Repository {
 
         const MAX_CONCURRENT: usize = if cfg!(windows) { 4 } else { 30 };
 
-        let repo_global_args = self.global_args_for_exec();
+        let normalize_path = |path: &str| {
+            if path.is_ascii() {
+                path.to_string()
+            } else {
+                path.nfc().collect()
+            }
+        };
+
+        let staged_blob_oids = Arc::new(
+            self.get_all_staged_file_blob_oids()?
+                .into_iter()
+                .map(|(path, oid)| (normalize_path(&path), oid))
+                .collect::<HashMap<_, _>>(),
+        );
+        let git_dir = self.path().to_path_buf();
         let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
 
         let futures: Vec<_> = file_paths
             .iter()
             .map(|file_path| {
-                let mut args = repo_global_args.clone();
-                args.push("show".to_string());
-                args.push(format!(":{}", file_path));
                 let file_path = file_path.clone();
+                let git_dir = git_dir.clone();
                 let semaphore = semaphore.clone();
+                let staged_blob_oids = staged_blob_oids.clone();
 
                 async move {
                     let _permit = semaphore.acquire().await;
-                    let result = exec_git(&args).and_then(|output| {
-                        String::from_utf8(output.stdout)
-                            .map_err(|e| GitAiError::Utf8Error(e.utf8_error()))
-                    });
+                    let result = (|| {
+                        let normalized_path = normalize_path(&file_path);
+                        let Some(blob_oid) = staged_blob_oids.get(&normalized_path) else {
+                            return Err(GitAiError::Generic(
+                                "Path is not staged at stage 0".into(),
+                            ));
+                        };
+                        let repo = git2::Repository::open(&git_dir)
+                            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+                        let blob = repo
+                            .find_blob(
+                                Oid::from_str(blob_oid)
+                                    .map_err(|e| GitAiError::Generic(e.to_string()))?,
+                            )
+                            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+                        String::from_utf8(blob.content().to_vec()).map_err(GitAiError::from)
+                    })();
                     (file_path, result)
                 }
             })
@@ -3168,7 +3199,7 @@ pub fn config_get_str_for_path_no_git_exec(
         .map(|cfg| cfg.string(key).map(|cow| cow.to_string()))
 }
 
-fn repository_object_hash_kind_for_path_no_git_exec(
+pub fn repository_object_hash_kind_for_path_no_git_exec(
     path: &Path,
 ) -> Result<gix_index::hash::Kind, GitAiError> {
     match config_get_str_for_path_no_git_exec(path, "extensions.objectformat")?

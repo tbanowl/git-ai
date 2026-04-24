@@ -11,7 +11,6 @@ use crate::authorship::imara_diff_utils::{
 };
 use crate::authorship::working_log::CheckpointKind;
 use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
-use crate::checkpoint_tasks::types::{CheckpointTaskRecord, CheckpointTaskState};
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
 use crate::config::Config;
@@ -106,19 +105,6 @@ pub struct PreparedCheckpointCapture {
     pub capture_id: String,
     pub repo_working_dir: String,
     pub file_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DurableCheckpointTaskPayload {
-    pub(crate) author: String,
-    pub(crate) kind: CheckpointKind,
-    pub(crate) is_pre_commit: bool,
-    pub(crate) base_commit: String,
-    pub(crate) captured_at_ms: u128,
-    pub(crate) files: Vec<String>,
-    pub(crate) dirty_files: HashMap<String, String>,
-    pub(crate) explicit_paths: Vec<String>,
-    pub(crate) agent_run_result: Option<AgentRunResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -362,213 +348,6 @@ fn new_async_checkpoint_capture_id() -> String {
     format!("capture-{}-{}", std::process::id(), now_ns)
 }
 
-fn new_checkpoint_task_id() -> String {
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("checkpoint-task-{}-{}", std::process::id(), now_ns)
-}
-
-fn checkpoint_task_payloads_dir() -> Result<PathBuf, GitAiError> {
-    Ok(async_checkpoint_internal_dir()?.join("checkpoint-task-payloads"))
-}
-
-fn checkpoint_task_payload_path(task_id: &str) -> Result<PathBuf, GitAiError> {
-    Ok(checkpoint_task_payloads_dir()?.join(format!("{}.json", task_id)))
-}
-
-fn checkpoint_tasks_enabled() -> bool {
-    Config::get().get_feature_flags().checkpoint_tasks
-}
-
-fn checkpoint_task_explicit_paths(
-    repo: &Repository,
-    kind: CheckpointKind,
-    agent_run_result: Option<&AgentRunResult>,
-    resolved: &ResolvedCheckpointExecution,
-) -> Vec<String> {
-    filtered_pathspecs_for_agent_run_result(repo, kind, agent_run_result)
-        .filter(|paths| !paths.is_empty())
-        .unwrap_or_else(|| resolved.files.clone())
-}
-
-fn generate_checkpoint_task_dedupe_key(
-    repo: &Repository,
-    author: &str,
-    kind: CheckpointKind,
-    is_pre_commit: bool,
-    agent_run_result: Option<&AgentRunResult>,
-    resolved: &ResolvedCheckpointExecution,
-) -> String {
-    let mut hasher = Sha256::new();
-    if let Ok(workdir) = repo.workdir() {
-        hasher.update(workdir.to_string_lossy().as_bytes());
-    }
-    hasher.update(author.as_bytes());
-    hasher.update(kind.to_str().as_bytes());
-    hasher.update(if is_pre_commit { b"1" } else { b"0" });
-    hasher.update(resolved.base_commit.as_bytes());
-
-    let mut files = resolved.files.clone();
-    files.sort();
-    for file in files {
-        hasher.update(file.as_bytes());
-    }
-
-    let mut dirty_files = resolved.dirty_files.iter().collect::<Vec<_>>();
-    dirty_files.sort_by(|a, b| a.0.cmp(b.0));
-    for (path, content) in dirty_files {
-        hasher.update(path.as_bytes());
-        hasher.update(content.as_bytes());
-    }
-
-    if let Some(agent_run_result) = agent_run_result {
-        hasher.update(agent_run_result.agent_id.tool.as_bytes());
-        hasher.update(agent_run_result.agent_id.id.as_bytes());
-        hasher.update(agent_run_result.agent_id.model.as_bytes());
-
-        if let Some(capture_id) = &agent_run_result.captured_checkpoint_id {
-            hasher.update(capture_id.as_bytes());
-        }
-
-        if let Some(paths) = &agent_run_result.edited_filepaths {
-            let mut paths = paths.clone();
-            paths.sort();
-            for path in paths {
-                hasher.update(path.as_bytes());
-            }
-        }
-
-        if let Some(paths) = &agent_run_result.will_edit_filepaths {
-            let mut paths = paths.clone();
-            paths.sort();
-            for path in paths {
-                hasher.update(path.as_bytes());
-            }
-        }
-    }
-
-    format!("{:x}", hasher.finalize())
-}
-
-fn maybe_capture_checkpoint_task(
-    repo: &Repository,
-    author: &str,
-    kind: CheckpointKind,
-    agent_run_result: Option<&AgentRunResult>,
-    is_pre_commit: bool,
-    resolved: &ResolvedCheckpointExecution,
-) -> Result<Option<String>, GitAiError> {
-    if !checkpoint_tasks_enabled() || agent_run_result.is_none() {
-        return Ok(None);
-    }
-
-    let explicit_paths = checkpoint_task_explicit_paths(repo, kind, agent_run_result, resolved);
-    let dedupe_key = generate_checkpoint_task_dedupe_key(
-        repo,
-        author,
-        kind,
-        is_pre_commit,
-        agent_run_result,
-        resolved,
-    );
-
-    if let Some(existing) = crate::checkpoint_tasks::store::get_task_by_dedupe_key(&dedupe_key)? {
-        if existing.state == CheckpointTaskState::Captured {
-            crate::checkpoint_tasks::store::update_task_state(
-                &existing.task_id,
-                CheckpointTaskState::Ready,
-            )?;
-        }
-        return Ok(Some(existing.task_id));
-    }
-
-    let task_id = new_checkpoint_task_id();
-    let payload = DurableCheckpointTaskPayload {
-        author: author.to_string(),
-        kind,
-        is_pre_commit,
-        base_commit: resolved.base_commit.clone(),
-        captured_at_ms: resolved.ts,
-        files: resolved.files.clone(),
-        dirty_files: resolved.dirty_files.clone(),
-        explicit_paths: explicit_paths.clone(),
-        agent_run_result: agent_run_result.cloned(),
-    };
-
-    let payload_path = checkpoint_task_payload_path(&task_id)?;
-    if let Some(parent) = payload_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&payload_path, serde_json::to_vec(&payload)?)?;
-
-    let repo_workdir = repo.workdir()?.to_string_lossy().to_string();
-    let lineage_epoch = crate::checkpoint_tasks::lineage::get_current_epoch(&repo_workdir)?;
-
-    let record = CheckpointTaskRecord {
-        task_id: task_id.clone(),
-        repo_workdir,
-        base_commit: resolved.base_commit.clone(),
-        lineage_epoch,
-        state: CheckpointTaskState::Captured,
-        dedupe_key,
-        kind: kind.to_str().to_string(),
-        author: author.to_string(),
-        payload_ref: payload_path.to_string_lossy().to_string(),
-        explicit_paths,
-        is_pre_commit,
-        captured_at_ms: resolved.ts,
-        processing_started_at_ms: None,
-        applied_at_ms: None,
-        completed_at_ms: None,
-        obsolete_at_ms: None,
-        attempts: 0,
-        last_error: None,
-        next_retry_at_ms: None,
-    };
-
-    crate::checkpoint_tasks::store::create_task(&record)?;
-    crate::checkpoint_tasks::store::update_task_state(&task_id, CheckpointTaskState::Ready)?;
-
-    Ok(Some(task_id))
-}
-
-pub(crate) fn load_durable_checkpoint_task_payload(
-    task: &CheckpointTaskRecord,
-) -> Result<DurableCheckpointTaskPayload, GitAiError> {
-    let payload = fs::read_to_string(&task.payload_ref).map_err(|error| {
-        GitAiError::Generic(format!(
-            "failed reading durable checkpoint payload {}: {}",
-            task.payload_ref, error
-        ))
-    })?;
-    Ok(serde_json::from_str(&payload)?)
-}
-
-pub(crate) fn execute_durable_checkpoint_payload(
-    repo: &Repository,
-    payload: &DurableCheckpointTaskPayload,
-) -> Result<(usize, usize, usize), GitAiError> {
-    let checkpoint_start = Instant::now();
-    let resolved = ResolvedCheckpointExecution {
-        base_commit: payload.base_commit.clone(),
-        ts: payload.captured_at_ms,
-        files: payload.files.clone(),
-        dirty_files: payload.dirty_files.clone(),
-    };
-    execute_resolved_checkpoint(
-        repo,
-        &payload.author,
-        payload.kind,
-        true,
-        payload.agent_run_result.clone(),
-        payload.is_pre_commit,
-        resolved,
-        checkpoint_start,
-    )
-}
-
 pub fn delete_captured_checkpoint(capture_id: &str) -> Result<(), GitAiError> {
     let capture_dir = async_checkpoint_capture_dir(capture_id)?;
     if capture_dir.exists() {
@@ -678,19 +457,6 @@ pub(crate) fn run_with_base_commit_override_with_policy(
         );
         return Ok((0, 0, 0));
     };
-
-    let checkpoint_task_id = maybe_capture_checkpoint_task(
-        repo,
-        author,
-        kind,
-        agent_run_result.as_ref(),
-        is_pre_commit,
-        &resolved,
-    )?;
-
-    if let Some(task_id) = checkpoint_task_id {
-        return crate::checkpoint_tasks::runner::run_task(repo, &task_id);
-    }
 
     execute_resolved_checkpoint(
         repo,
@@ -2583,10 +2349,7 @@ mod tests {
     use crate::authorship::transcript::AiTranscript;
     use crate::authorship::working_log::AgentId;
     use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
-    use crate::config::Config;
-    use crate::feature_flags::FeatureFlags;
     use crate::git::test_utils::TmpRepo;
-    use serial_test::serial;
     use std::collections::HashMap;
 
     fn test_agent_run_result(
@@ -2717,116 +2480,6 @@ mod tests {
             explicit_capture_target_paths(CheckpointKind::AiAgent, Some(&ai_result)),
             None
         );
-    }
-
-    #[test]
-    fn test_checkpoint_task_dedupe_key_is_stable_for_same_inputs() {
-        let (tmp_repo, _file, _) = TmpRepo::new_with_base_commit().unwrap();
-        let resolved = ResolvedCheckpointExecution {
-            base_commit: "abc123".to_string(),
-            ts: 100,
-            files: vec!["src/lib.rs".to_string()],
-            dirty_files: HashMap::from([("src/lib.rs".to_string(), "fn main() {}\n".to_string())]),
-        };
-        let agent_run_result = test_agent_run_result(
-            CheckpointKind::AiAgent,
-            Some(vec!["src/lib.rs"]),
-            None,
-            Some(HashMap::from([("src/lib.rs", "fn main() {}\n")])),
-        );
-
-        let key_a = generate_checkpoint_task_dedupe_key(
-            tmp_repo.gitai_repo(),
-            "Claude",
-            CheckpointKind::AiAgent,
-            false,
-            Some(&agent_run_result),
-            &resolved,
-        );
-        let key_b = generate_checkpoint_task_dedupe_key(
-            tmp_repo.gitai_repo(),
-            "Claude",
-            CheckpointKind::AiAgent,
-            false,
-            Some(&agent_run_result),
-            &resolved,
-        );
-
-        assert_eq!(key_a, key_b);
-    }
-
-    #[test]
-    #[serial]
-    fn test_checkpoint_task_runner_marks_task_applied_and_records_evidence() {
-        Config::clear_test_feature_flags();
-        Config::set_test_feature_flags(FeatureFlags {
-            rewrite_stash: true,
-            inter_commit_move: false,
-            checkpoint_tasks: true,
-            auth_keyring: false,
-            async_mode: false,
-            git_hooks_enabled: false,
-            git_hooks_externally_managed: false,
-        });
-
-        let (tmp_repo, mut file, _) = TmpRepo::new_with_base_commit().unwrap();
-        file.append("AI-generated line\n").unwrap();
-
-        let base_commit = tmp_repo.get_head_commit_sha().unwrap();
-        let filename = file.filename().to_string();
-        let agent_run_result = AgentRunResult {
-            agent_id: AgentId {
-                tool: "codex".to_string(),
-                id: "ai-task-capture".to_string(),
-                model: "gpt-5".to_string(),
-            },
-            agent_metadata: None,
-            checkpoint_kind: CheckpointKind::AiAgent,
-            transcript: Some(AiTranscript { messages: vec![] }),
-            repo_working_dir: Some(tmp_repo.path().to_string_lossy().to_string()),
-            edited_filepaths: Some(vec![filename.clone()]),
-            will_edit_filepaths: None,
-            dirty_files: None,
-            captured_checkpoint_id: None,
-        };
-        let dedupe_key = generate_checkpoint_task_dedupe_key(
-            tmp_repo.gitai_repo(),
-            "ai-task-capture",
-            CheckpointKind::AiAgent,
-            false,
-            Some(&agent_run_result),
-            &ResolvedCheckpointExecution {
-                base_commit: base_commit.clone(),
-                ts: 0,
-                files: vec![filename],
-                dirty_files: HashMap::new(),
-            },
-        );
-
-        let checkpoint_result = tmp_repo
-            .trigger_checkpoint_with_agent_result("ai-task-capture", Some(agent_run_result));
-
-        Config::clear_test_feature_flags();
-
-        checkpoint_result.expect("checkpoint should succeed with checkpoint_tasks enabled");
-
-        let task = crate::checkpoint_tasks::store::get_task_by_dedupe_key(&dedupe_key)
-            .unwrap()
-            .expect("expected checkpoint task to be persisted");
-
-        assert_eq!(task.state, CheckpointTaskState::Applied);
-        assert_eq!(task.base_commit, base_commit);
-        assert!(task.applied_at_ms.is_some(), "expected applied timestamp");
-        assert!(
-            std::path::Path::new(&task.payload_ref).exists(),
-            "expected durable payload file to exist"
-        );
-
-        let evidence = crate::checkpoint_tasks::evidence::get_applied_evidence(&task.task_id)
-            .unwrap()
-            .expect("expected applied evidence to be recorded");
-        assert_eq!(evidence.task_id, task.task_id);
-        assert_eq!(evidence.dedupe_key, task.dedupe_key);
     }
 
     #[test]

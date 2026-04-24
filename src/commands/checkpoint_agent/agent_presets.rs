@@ -120,6 +120,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_escape_control_chars_in_json_strings_fixes_raw_newlines() {
+        let raw =
+            "{\n  \"tool_info\": {\"command\": \"echo hi\nbye\tend\"},\n  \"other\": \"ok\"\n}";
+        let sanitized = escape_control_chars_in_json_strings(raw);
+        // Strict parse must now succeed.
+        let v: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(
+            v.get("tool_info")
+                .and_then(|t| t.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap(),
+            "echo hi\nbye\tend"
+        );
+        assert_eq!(v.get("other").and_then(|v| v.as_str()).unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_escape_control_chars_preserves_escaped_quotes_and_utf8() {
+        let raw = "{\"msg\": \"line1\nquote:\\\"x\\\" — 你好\"}";
+        let sanitized = escape_control_chars_in_json_strings(raw);
+        let v: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(
+            v.get("msg").and_then(|v| v.as_str()).unwrap(),
+            "line1\nquote:\"x\" — 你好"
+        );
+    }
+
+    #[test]
     fn test_prepare_agent_bash_pre_hook_swallows_snapshot_errors() {
         let temp = tempfile::tempdir().unwrap();
         let missing_repo = temp.path().join("missing-repo");
@@ -685,6 +713,50 @@ impl GeminiPreset {
         Ok((transcript, model))
     }
 }
+/// Escape raw ASCII control characters (0x00..=0x1F) that appear inside JSON
+/// string literals so the input parses under strict serde_json. Bytes outside
+/// string literals, already-escaped sequences, and non-control bytes are left
+/// untouched. This is a byte-level pass; it does not validate the rest of the
+/// JSON grammar.
+fn escape_control_chars_in_json_strings(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in bytes {
+        if in_string {
+            if escaped {
+                out.push(b);
+                escaped = false;
+            } else if b == b'\\' {
+                out.push(b);
+                escaped = true;
+            } else if b == b'"' {
+                out.push(b);
+                in_string = false;
+            } else if b < 0x20 {
+                match b {
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0C => out.extend_from_slice(b"\\f"),
+                    _ => out.extend_from_slice(format!("\\u{:04x}", b).as_bytes()),
+                }
+            } else {
+                out.push(b);
+            }
+        } else {
+            if b == b'"' {
+                in_string = true;
+            }
+            out.push(b);
+        }
+    }
+    // Safe: input was valid UTF-8, and we only inserted ASCII escape sequences.
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
 pub struct WindsurfPreset;
 impl AgentCheckpointPreset for WindsurfPreset {
     fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
@@ -692,7 +764,11 @@ impl AgentCheckpointPreset for WindsurfPreset {
             GitAiError::PresetError("hook_input is required for Windsurf preset".to_string())
         })?;
 
-        let hook_data: serde_json::Value = serde_json::from_str(&stdin_json)
+        // Windsurf sometimes emits raw control characters (unescaped newlines, tabs, etc.)
+        // inside JSON string values (e.g. captured command output in `tool_info`). Strict
+        // serde_json rejects those, so escape them inside string literals before parsing.
+        let sanitized = escape_control_chars_in_json_strings(&stdin_json);
+        let hook_data: serde_json::Value = serde_json::from_str(&sanitized)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
         let trajectory_id = hook_data
@@ -739,6 +815,13 @@ impl AgentCheckpointPreset for WindsurfPreset {
         let (transcript, transcript_model) =
             match WindsurfPreset::transcript_and_model_from_windsurf_jsonl(&transcript_path) {
                 Ok((transcript, model)) => (transcript, model),
+                Err(GitAiError::IoError(ref io_err))
+                    if io_err.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    // JSONL may not exist yet on the first hook event of a session; treat
+                    // as empty transcript without warning/logging.
+                    (crate::authorship::transcript::AiTranscript::new(), None)
+                }
                 Err(e) => {
                     eprintln!("[Warning] Failed to parse Windsurf JSONL: {e}");
                     log_error(
@@ -773,6 +856,94 @@ impl AgentCheckpointPreset for WindsurfPreset {
         // Store transcript_path in metadata
         let agent_metadata =
             HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]);
+
+        // Windsurf's run_command is the bash-tool equivalent.  Mirror the Claude
+        // pre/post stat-diff flow so file changes made by shell commands can be
+        // attributed to the Windsurf agent.
+        if matches!(agent_action_name, "pre_run_command" | "post_run_command") {
+            // run_command payloads nest cwd under tool_info; fall back to the
+            // top-level cwd for payload-shape resilience.
+            let bash_cwd = hook_data
+                .get("tool_info")
+                .and_then(|ti| ti.get("cwd"))
+                .and_then(|v| v.as_str())
+                .or_else(|| hook_data.get("cwd").and_then(|v| v.as_str()))
+                .map(|s| s.to_string());
+
+            let session_id = trajectory_id;
+            let tool_use_id = hook_data
+                .get("execution_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bash");
+
+            if agent_action_name == "pre_run_command" {
+                let pre_hook_captured_id = prepare_agent_bash_pre_hook(
+                    true,
+                    bash_cwd.as_deref(),
+                    session_id,
+                    tool_use_id,
+                    &agent_id,
+                    Some(&agent_metadata),
+                    BashPreHookStrategy::EmitHumanCheckpoint,
+                )?
+                .captured_checkpoint_id();
+
+                return Ok(AgentRunResult {
+                    agent_id,
+                    agent_metadata: None,
+                    checkpoint_kind: CheckpointKind::Human,
+                    transcript: None,
+                    repo_working_dir: bash_cwd,
+                    edited_filepaths: None,
+                    will_edit_filepaths: None,
+                    dirty_files: None,
+                    captured_checkpoint_id: pre_hook_captured_id,
+                });
+            }
+
+            // post_run_command: diff snapshots to recover the files the shell
+            // command touched.
+            let (edited_filepaths, bash_captured_checkpoint_id) = match bash_cwd.as_deref() {
+                Some(cwd_str) => {
+                    let repo_root = Path::new(cwd_str);
+                    match bash_tool::handle_bash_tool(
+                        HookEvent::PostToolUse,
+                        repo_root,
+                        session_id,
+                        tool_use_id,
+                    ) {
+                        Ok(result) => {
+                            let paths = match &result.action {
+                                BashCheckpointAction::Checkpoint(paths) => Some(paths.clone()),
+                                _ => None,
+                            };
+                            let capture_id = result
+                                .captured_checkpoint
+                                .as_ref()
+                                .map(|info| info.capture_id.clone());
+                            (paths, capture_id)
+                        }
+                        Err(e) => {
+                            tracing::debug!("Windsurf bash post-hook error: {}", e);
+                            (None, None)
+                        }
+                    }
+                }
+                None => (None, None),
+            };
+
+            return Ok(AgentRunResult {
+                agent_id,
+                agent_metadata: Some(agent_metadata),
+                checkpoint_kind: CheckpointKind::AiAgent,
+                transcript: Some(transcript),
+                repo_working_dir: bash_cwd,
+                edited_filepaths,
+                will_edit_filepaths: None,
+                dirty_files: None,
+                captured_checkpoint_id: bash_captured_checkpoint_id,
+            });
+        }
 
         // pre_write_code is the human checkpoint (before AI edit)
         if agent_action_name == "pre_write_code" {

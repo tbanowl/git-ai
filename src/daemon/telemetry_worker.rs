@@ -236,7 +236,6 @@ async fn telemetry_flush_loop(buffer: Arc<Mutex<TelemetryBuffer>>) {
 
     loop {
         ticker.tick().await;
-        tracing::debug!("telemetry flush loop tick");
 
         let snapshot = {
             let mut buf = buffer.lock().await;

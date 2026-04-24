@@ -1,7 +1,6 @@
 pub mod blame;
 pub mod checkpoint;
 pub mod checkpoint_agent;
-pub mod checkpoint_recover;
 pub mod ci_handlers;
 pub mod config;
 pub mod continue_session;

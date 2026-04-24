@@ -1,6 +1,8 @@
 use crate::error::GitAiError;
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
-use std::collections::HashSet;
+use gix_index::entry::Stage;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::str;
 use unicode_normalization::UnicodeNormalization;
 
@@ -71,60 +73,77 @@ pub struct StatusEntry {
 impl Repository {
     // Get status for tracked files that changed
     pub fn get_staged_filenames(&self) -> Result<HashSet<String>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("diff".to_string());
-        args.push("--cached".to_string());
-        args.push("--name-only".to_string());
-        args.push("-z".to_string()); // NUL-separated output for proper UTF-8 handling
-        args.push("--no-renames".to_string());
+        let object_hash =
+            crate::git::repository::repository_object_hash_kind_for_path_no_git_exec(self.path())?;
+        let index_path = self.path().join("index");
+        let index = match gix_index::File::at(index_path, object_hash, true, Default::default()) {
+            Ok(index) => index,
+            Err(_) => return Ok(HashSet::new()),
+        };
 
-        let output = exec_git_with_profile(&args, InternalGitProfile::RawDiffParse)?;
+        let mut index_entries = HashMap::new();
+        let mut conflict_paths = HashSet::new();
+        for entry in index.entries() {
+            let file_path = nfc_path(entry.path(&index).to_string());
+            if file_path.trim().is_empty() {
+                continue;
+            }
 
-        if !output.status.success() {
-            return Err(GitAiError::Generic(format!(
-                "git diff exited with status {}",
-                output.status
-            )));
+            if entry.stage() == Stage::Unconflicted {
+                index_entries.insert(file_path, (entry.id.to_string(), entry.mode.bits() as i32));
+            } else {
+                conflict_paths.insert(file_path);
+            }
         }
 
-        // With -z, output is NUL-separated. The output may contain a trailing NUL.
-        // Apply NFC normalization so that decomposed (NFD) paths from macOS match
-        // precomposed (NFC) paths used internally (see normalize_to_posix).
-        let filenames: HashSet<String> = output
-            .stdout
-            .split(|&b| b == 0)
-            .filter(|bytes| !bytes.is_empty())
-            .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
-            .map(nfc_path)
-            .collect();
+        let repo =
+            git2::Repository::open(self.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let head_entries = collect_head_tree_entries(&repo)?;
+
+        let mut filenames = conflict_paths;
+        for (path, (oid, mode)) in &index_entries {
+            match head_entries.get(path) {
+                Some((head_oid, head_mode)) if head_oid == oid && head_mode == mode => {}
+                _ => {
+                    filenames.insert(path.clone());
+                }
+            }
+        }
+
+        for path in head_entries.keys() {
+            if !index_entries.contains_key(path) {
+                filenames.insert(path.clone());
+            }
+        }
 
         Ok(filenames)
     }
 
     // Get status for tracked files that changed
     pub fn get_staged_and_unstaged_filenames(&self) -> Result<HashSet<String>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("--no-optional-locks".to_string());
-        args.push("status".to_string());
-        args.push("--porcelain=v2".to_string());
-        args.push("-z".to_string());
+        let repo =
+            git2::Repository::open(self.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let mut options = git2::StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false)
+            .renames_head_to_index(false)
+            .renames_index_to_workdir(false);
 
-        let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
+        let statuses = repo
+            .statuses(Some(&mut options))
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-        if !output.status.success() {
-            return Err(GitAiError::Generic(format!(
-                "git status exited with status {}",
-                output.status
-            )));
+        let mut filenames = HashSet::new();
+        for entry in statuses.iter() {
+            if let Some(path) = entry.path() {
+                let normalized = nfc_path(path.to_string());
+                if !normalized.trim().is_empty() {
+                    filenames.insert(normalized);
+                }
+            }
         }
-
-        let entries = parse_porcelain_v2(&output.stdout)?;
-
-        let filenames: HashSet<String> = entries
-            .iter()
-            .filter(|entry| entry.kind != EntryKind::Ignored)
-            .map(|entry| entry.path.clone())
-            .collect();
 
         Ok(filenames)
     }
@@ -202,6 +221,55 @@ impl Repository {
 
         Ok(entries)
     }
+}
+
+fn collect_head_tree_entries(
+    repo: &git2::Repository,
+) -> Result<HashMap<String, (String, i32)>, GitAiError> {
+    let mut entries = HashMap::new();
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => return Ok(entries),
+        Err(err) => return Err(GitAiError::Generic(err.to_string())),
+    };
+    let commit = head
+        .peel_to_commit()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    collect_tree_entries(repo, &tree, Path::new(""), &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_tree_entries(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    prefix: &Path,
+    entries: &mut HashMap<String, (String, i32)>,
+) -> Result<(), GitAiError> {
+    for entry in tree {
+        let Ok(name) = str::from_utf8(entry.name_bytes()) else {
+            continue;
+        };
+        let path = prefix.join(name);
+        if entry.kind() == Some(git2::ObjectType::Tree) {
+            let subtree = repo
+                .find_tree(entry.id())
+                .map_err(|e| GitAiError::Generic(e.to_string()))?;
+            collect_tree_entries(repo, &subtree, &path, entries)?;
+            continue;
+        }
+
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        entries.insert(
+            nfc_path(path_str.replace('\\', "/")),
+            (entry.id().to_string(), entry.filemode()),
+        );
+    }
+    Ok(())
 }
 
 fn parse_porcelain_v2(data: &[u8]) -> Result<Vec<StatusEntry>, GitAiError> {

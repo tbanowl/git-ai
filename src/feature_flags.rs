@@ -54,7 +54,6 @@ macro_rules! define_feature_flags {
 define_feature_flags!(
     rewrite_stash: rewrite_stash, debug = true, release = true,
     inter_commit_move: checkpoint_inter_commit_move, debug = false, release = false,
-    checkpoint_tasks: checkpoint_tasks, debug = false, release = false,
     auth_keyring: auth_keyring, debug = false, release = false,
     async_mode: async_mode, debug = false, release = true,
     git_hooks_enabled: git_hooks_enabled, debug = false, release = false,
@@ -130,7 +129,6 @@ mod tests {
         {
             assert!(flags.rewrite_stash);
             assert!(!flags.inter_commit_move);
-            assert!(!flags.checkpoint_tasks);
             assert!(!flags.auth_keyring);
             assert!(!flags.async_mode);
             assert!(!flags.git_hooks_enabled);
@@ -140,7 +138,6 @@ mod tests {
         {
             assert!(flags.rewrite_stash);
             assert!(!flags.inter_commit_move);
-            assert!(!flags.checkpoint_tasks);
             assert!(!flags.auth_keyring);
             assert!(flags.async_mode);
             assert!(!flags.git_hooks_enabled);
@@ -155,7 +152,6 @@ mod tests {
         let defaults = FeatureFlags::default();
         assert_eq!(flags.rewrite_stash, defaults.rewrite_stash);
         assert_eq!(flags.inter_commit_move, defaults.inter_commit_move);
-        assert_eq!(flags.checkpoint_tasks, defaults.checkpoint_tasks);
         assert_eq!(flags.auth_keyring, defaults.auth_keyring);
     }
 
@@ -164,7 +160,6 @@ mod tests {
         let deserializable = DeserializableFeatureFlags {
             rewrite_stash: Some(false),
             checkpoint_inter_commit_move: Some(true),
-            checkpoint_tasks: Some(true),
             auth_keyring: Some(true),
             ..Default::default()
         };
@@ -172,7 +167,6 @@ mod tests {
         let flags = FeatureFlags::from_file_config(Some(deserializable));
         assert!(!flags.rewrite_stash);
         assert!(flags.inter_commit_move);
-        assert!(flags.checkpoint_tasks);
         assert!(flags.auth_keyring);
     }
 
@@ -189,7 +183,6 @@ mod tests {
 
         let defaults = FeatureFlags::default();
         assert_eq!(flags.inter_commit_move, defaults.inter_commit_move);
-        assert_eq!(flags.checkpoint_tasks, defaults.checkpoint_tasks);
         assert_eq!(flags.auth_keyring, defaults.auth_keyring);
     }
 
@@ -198,7 +191,6 @@ mod tests {
         let deserializable = DeserializableFeatureFlags {
             rewrite_stash: Some(false),
             checkpoint_inter_commit_move: Some(false),
-            checkpoint_tasks: Some(true),
             auth_keyring: Some(true),
             ..Default::default()
         };
@@ -206,7 +198,6 @@ mod tests {
         let flags = FeatureFlags::from_deserializable(deserializable);
         assert!(!flags.rewrite_stash);
         assert!(!flags.inter_commit_move);
-        assert!(flags.checkpoint_tasks);
         assert!(flags.auth_keyring);
     }
 
@@ -217,7 +208,6 @@ mod tests {
         unsafe {
             std::env::remove_var("GIT_AI_REWRITE_STASH");
             std::env::remove_var("GIT_AI_CHECKPOINT_INTER_COMMIT_MOVE");
-            std::env::remove_var("GIT_AI_CHECKPOINT_TASKS");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
             std::env::remove_var("GIT_AI_ASYNC_MODE");
         }
@@ -226,7 +216,6 @@ mod tests {
         let defaults = FeatureFlags::default();
         assert_eq!(flags.rewrite_stash, defaults.rewrite_stash);
         assert_eq!(flags.inter_commit_move, defaults.inter_commit_move);
-        assert_eq!(flags.checkpoint_tasks, defaults.checkpoint_tasks);
         assert_eq!(flags.auth_keyring, defaults.auth_keyring);
     }
 
@@ -236,14 +225,12 @@ mod tests {
         unsafe {
             std::env::remove_var("GIT_AI_REWRITE_STASH");
             std::env::remove_var("GIT_AI_CHECKPOINT_INTER_COMMIT_MOVE");
-            std::env::remove_var("GIT_AI_CHECKPOINT_TASKS");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
             std::env::remove_var("GIT_AI_ASYNC_MODE");
         }
 
         let file_flags = DeserializableFeatureFlags {
             rewrite_stash: Some(true),
-            checkpoint_tasks: Some(true),
             auth_keyring: Some(true),
             async_mode: Some(true),
             ..Default::default()
@@ -251,7 +238,6 @@ mod tests {
 
         let flags = FeatureFlags::from_env_and_file(Some(file_flags));
         assert!(flags.rewrite_stash);
-        assert!(flags.checkpoint_tasks);
         assert!(flags.auth_keyring);
         assert!(flags.async_mode);
     }
@@ -261,7 +247,6 @@ mod tests {
         let flags = FeatureFlags {
             rewrite_stash: true,
             inter_commit_move: false,
-            checkpoint_tasks: true,
             auth_keyring: true,
             async_mode: true,
             git_hooks_enabled: false,
@@ -271,7 +256,6 @@ mod tests {
         let serialized = serde_json::to_string(&flags).unwrap();
         assert!(serialized.contains("rewrite_stash"));
         assert!(serialized.contains("inter_commit_move"));
-        assert!(serialized.contains("checkpoint_tasks"));
         assert!(serialized.contains("auth_keyring"));
         assert!(serialized.contains("async_mode"));
         assert!(serialized.contains("git_hooks_enabled"));
@@ -283,7 +267,6 @@ mod tests {
         let flags = FeatureFlags {
             rewrite_stash: true,
             inter_commit_move: false,
-            checkpoint_tasks: true,
             auth_keyring: true,
             async_mode: true,
             git_hooks_enabled: true,
@@ -292,7 +275,6 @@ mod tests {
         let cloned = flags.clone();
         assert_eq!(cloned.rewrite_stash, flags.rewrite_stash);
         assert_eq!(cloned.inter_commit_move, flags.inter_commit_move);
-        assert_eq!(cloned.checkpoint_tasks, flags.checkpoint_tasks);
         assert_eq!(cloned.auth_keyring, flags.auth_keyring);
         assert_eq!(cloned.async_mode, flags.async_mode);
         assert_eq!(cloned.git_hooks_enabled, flags.git_hooks_enabled);
