@@ -125,6 +125,7 @@ fn test_status_post_filter_rename_matched_by_new_path() {
 
     assert!(!result.is_empty(), "rename entry should appear");
     let entry = result.iter().find(|e| e.path == "new.txt").unwrap();
+    assert_eq!(entry.kind, git_ai::git::status::EntryKind::Rename);
     assert_eq!(
         entry.orig_path.as_deref(),
         Some("old.txt"),

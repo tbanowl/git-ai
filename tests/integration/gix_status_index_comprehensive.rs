@@ -189,6 +189,42 @@ fn gix_status_index_comprehensive_status_post_filter_handles_non_ascii_and_space
     );
 }
 
+fn gix_status_index_comprehensive_status_without_pathspecs_still_reports_pure_unstaged_changes() {
+    let repo = TestRepo::new();
+
+    write_file(&repo, "tracked.txt", "seed\n");
+    repo.stage_all_and_commit("initial").unwrap();
+
+    write_file(&repo, "tracked.txt", "seed\nunstaged\n");
+
+    let repository = open_repo(&repo);
+    let entries = repository.status(None, true).unwrap();
+
+    let tracked = status_entry_by_path(&entries, "tracked.txt");
+    assert_eq!(tracked.kind, EntryKind::Ordinary);
+    assert_eq!(tracked.staged, StatusCode::Unmodified);
+    assert_eq!(tracked.unstaged, StatusCode::Modified);
+}
+
+#[test]
+fn gix_status_index_comprehensive_status_reports_staged_deletions() {
+    let repo = TestRepo::new();
+
+    write_file(&repo, "gone.txt", "seed\n");
+    repo.stage_all_and_commit("initial").unwrap();
+
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    repo.git_og(&["add", "gone.txt"]).unwrap();
+
+    let repository = open_repo(&repo);
+    let entries = repository.status(None, true).unwrap();
+
+    let gone = status_entry_by_path(&entries, "gone.txt");
+    assert_eq!(gone.kind, EntryKind::Ordinary);
+    assert_eq!(gone.staged, StatusCode::Deleted);
+    assert_eq!(gone.unstaged, StatusCode::Unmodified);
+}
+
 #[test]
 fn gix_status_index_comprehensive_branch_metadata_tracks_attached_and_detached_head_contract() {
     let repo = TestRepo::new();
@@ -314,4 +350,27 @@ fn gix_status_index_comprehensive_get_all_staged_files_content_skips_conflicted_
         !contents.contains_key("conflicted.txt"),
         "unmerged index entries should not be surfaced as stage-0 content"
     );
+}
+
+#[test]
+fn gix_status_index_comprehensive_new_status_matches_cli_for_mixed_repo() {
+    let repo = TestRepo::new();
+
+    write_file(&repo, "rename-me.txt", "seed\n");
+    write_file(&repo, "tracked.txt", "seed\n");
+    repo.stage_all_and_commit("initial").unwrap();
+
+    repo.git_og(&["mv", "rename-me.txt", "renamed.txt"]).unwrap();
+    write_file(&repo, "tracked.txt", "seed\nunstaged\n");
+    write_file(&repo, "untracked.txt", "brand new\n");
+
+    let repository = open_repo(&repo);
+    let mut new_entries = repository.status(None, false).unwrap();
+    new_entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut old_entries = git_ai::git::status::old_cli_status_entries_for_test(&repository, None, false)
+        .expect("old cli-backed status helper should succeed");
+    old_entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    assert_eq!(new_entries, old_entries);
 }
