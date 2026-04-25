@@ -1,10 +1,38 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::{GitTestMode, TestRepo};
+use git_ai::config::ConfigPatch;
 use git_ai::git::refs::get_reference_as_authorship_log_v3;
 use git_ai::git::repository as GitAiRepository;
+use serial_test::serial;
+
+fn with_notes_store_git_patch<T>(f: impl FnOnce() -> T) -> T {
+    let original = std::env::var("GIT_AI_TEST_CONFIG_PATCH").ok();
+    let patch = serde_json::to_string(&ConfigPatch {
+        notes_store: Some("git".to_string()),
+        ..Default::default()
+    })
+    .expect("serialize notes_store patch");
+
+    unsafe {
+        std::env::set_var("GIT_AI_TEST_CONFIG_PATCH", patch);
+    }
+    let result = f();
+    unsafe {
+        if let Some(value) = original {
+            std::env::set_var("GIT_AI_TEST_CONFIG_PATCH", value);
+        } else {
+            std::env::remove_var("GIT_AI_TEST_CONFIG_PATCH");
+        }
+    }
+    result
+}
 
 fn direct_test_repo() -> TestRepo {
-    TestRepo::new_with_mode(GitTestMode::Wrapper)
+    let mut repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    repo.patch_git_ai_config(|patch| {
+        patch.notes_store = Some("git".to_string());
+    });
+    repo
 }
 
 /// Test basic squash merge via CI - AI code from feature branch squashed into main
@@ -531,11 +559,15 @@ fn test_ci_rebase_merge_multiple_commits() {
 /// `pair_commits_for_rewrite` would be inverted: the first original commit's note
 /// would be written to the last rebased commit and vice versa.
 #[test]
+#[serial]
 fn test_ci_rebase_merge_commit_order_pairing() {
     use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
     use git_ai::ci::ci_context::{CiContext, CiEvent, CiRunOptions};
 
-    let repo = direct_test_repo();
+    let mut repo = direct_test_repo();
+    repo.patch_git_ai_config(|patch| {
+        patch.notes_store = Some("git".to_string());
+    });
 
     // --- Set up initial commit on main ---
     let mut base_file = repo.filename("base.txt");
@@ -595,10 +627,12 @@ fn test_ci_rebase_merge_commit_order_pairing() {
         base_sha,
     };
 
-    let ctx = CiContext::with_repository(git_ai_repo, event);
-    let result = ctx.run_with_options(CiRunOptions {
-        skip_fetch_notes: true,
-        skip_fetch_base: true,
+    let result = with_notes_store_git_patch(|| {
+        let ctx = CiContext::with_repository(git_ai_repo, event);
+        ctx.run_with_options(CiRunOptions {
+            skip_fetch_notes: true,
+            skip_fetch_base: true,
+        })
     });
     assert!(
         result.is_ok(),
@@ -675,10 +709,14 @@ fn test_ci_rebase_merge_commit_order_pairing() {
 /// original_commits came back newest-first from `CommitRange::all_commits()`
 /// while new_commits were oldest-first, so each note landed on the wrong commit.
 #[test]
+#[serial]
 fn test_ci_local_rebase_merge_two_commits() {
     use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 
-    let repo = direct_test_repo();
+    let mut repo = direct_test_repo();
+    repo.patch_git_ai_config(|patch| {
+        patch.notes_store = Some("git".to_string());
+    });
 
     // --- Initial commit on main ---
     let mut base_file = repo.filename("base.txt");
@@ -828,10 +866,14 @@ fn test_ci_local_rebase_merge_two_commits() {
 /// own file and none of the others.  This catches both full inversions
 /// (first↔last) and off-by-one shifts in the positional pairing.
 #[test]
+#[serial]
 fn test_ci_local_rebase_merge_three_commits() {
     use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 
-    let repo = direct_test_repo();
+    let mut repo = direct_test_repo();
+    repo.patch_git_ai_config(|patch| {
+        patch.notes_store = Some("git".to_string());
+    });
 
     // --- Initial commit on main ---
     let mut base_file = repo.filename("base.txt");

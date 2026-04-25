@@ -137,7 +137,7 @@ pub fn fetch_authorship_notes(
     repository: &Repository,
     remote_name: &str,
 ) -> Result<NotesExistence, GitAiError> {
-    if Config::get().notes_store() == "rest" {
+    if Config::fresh().notes_store() == "rest" {
         // Fetch notes via REST API instead of git fetch, if configured
         let api = ApiClient::new(ApiContext::new(None));
         let normalized_repo_url = normalized_rest_repo_url(repository, remote_name)?;
@@ -246,7 +246,7 @@ const PUSH_NOTES_MAX_ATTEMPTS: usize = 3;
 
 // for use with post-push hook
 pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Result<(), GitAiError> {
-    if Config::get().notes_store() == "rest" {
+    if Config::fresh().notes_store() == "rest" {
         let api = ApiClient::new(ApiContext::new(None));
         let normalized_repo_url = normalized_rest_repo_url(repository, remote_name)?;
         return rest_push_notes(repository, &api, &normalized_repo_url);
@@ -290,7 +290,7 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
 
 /// Fetch remote notes into a tracking ref and merge into local refs/notes/ai.
 fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
-    if Config::get().notes_store() == "rest" {
+    if Config::fresh().notes_store() == "rest" {
         let api = ApiClient::new(ApiContext::new(None));
         let normalized_repo_url = match normalized_rest_repo_url(repository, remote_name) {
             Ok(repo_url) => repo_url,

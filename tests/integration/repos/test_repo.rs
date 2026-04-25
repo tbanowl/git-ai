@@ -895,9 +895,6 @@ impl TestRepo {
     }
 
     fn sync_test_home_config_for_hooks(&self) {
-        if !self.git_mode.uses_hooks() && !self.git_mode.uses_daemon() {
-            return;
-        }
         self.write_test_config_to_home(&self.test_home);
         if let Some(daemon) = &self.daemon_process
             && daemon.daemon_home != self.test_home
@@ -911,6 +908,7 @@ impl TestRepo {
         self.patch_git_ai_config(|patch| {
             patch.exclude_prompts_in_repositories = Some(vec![]); // No exclusions = share everywhere
             patch.prompt_storage = Some("notes".to_string()); // Use notes mode for tests
+            patch.notes_store = Some("git".to_string()); // Local bare remotes in tests should use git notes transport, not REST
             if git_mode == GitTestMode::WrapperDaemon {
                 patch.feature_flags = Some(serde_json::json!({
                     "async_mode": true

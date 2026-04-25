@@ -215,13 +215,6 @@ pub fn handle_git(args: &[String]) {
 
     let mut parsed_args = parse_git_cli_args(args);
 
-    // Command no hooks
-    if is_command_skip_hooks(&parsed_args) {
-        let orig_args: Vec<String> = std::env::args().skip(1).collect();
-        proxy_to_git(&orig_args, true, None, None);
-        return;
-    }
-
     let find_repository_start = Instant::now();
     let mut repository_option = find_repository(&parsed_args.global_args).ok();
     let find_repository_duration = find_repository_start.elapsed();
@@ -232,6 +225,19 @@ pub fn handle_git(args: &[String]) {
 
     let check_hooks_start = Instant::now();
     let has_repo = repository_option.is_some();
+
+    // Resolve aliases before is_command_skip_hooks() so "ci" → "commit" is recognized.
+    if let Some(repository) = repository_option.as_mut() {
+        if let Some(resolved) = resolve_alias_invocation(&parsed_args, repository) {
+            parsed_args = resolved;
+        }
+    }
+
+    if is_command_skip_hooks(&parsed_args) {
+        let orig_args: Vec<String> = std::env::args().skip(1).collect();
+        proxy_to_git(&orig_args, true, None, None);
+        return;
+    }
 
     let get_config_start = Instant::now();
     let config = config::Config::get();
@@ -283,16 +289,6 @@ pub fn handle_git(args: &[String]) {
         };
 
         let repository = repository_option.as_mut().unwrap();
-
-        let resolve_alias_invocation_start = Instant::now();
-        if let Some(resolved) = resolve_alias_invocation(&parsed_args, repository) {
-            parsed_args = resolved;
-        }
-        let resolve_alias_invocation_duration = resolve_alias_invocation_start.elapsed();
-        tracing::debug!(
-            "[handle-git] resolve_alias_invocation_start {}ms",
-            resolve_alias_invocation_duration.as_millis()
-        );
 
         let pre_command_start = Instant::now();
         run_pre_command_hooks(&mut command_hooks_context, &mut parsed_args, repository);
