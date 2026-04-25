@@ -2,8 +2,18 @@ use crate::config;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Once;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
+}
 
 static COMMAND_TRACING_INIT: Once = Once::new();
 
@@ -67,6 +77,7 @@ pub fn init_command_tracing(command_kind: &'static str) {
             .with(env_filter)
             .with(
                 tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTimer)
                     .with_target(false)
                     .with_thread_ids(false)
                     .with_ansi(false)

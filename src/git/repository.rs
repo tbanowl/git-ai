@@ -3216,7 +3216,7 @@ pub fn config_get_str_for_path_no_git_exec(
         .map(|cfg| cfg.string(key).map(|cow| cow.to_string()))
 }
 
-pub fn repository_object_hash_kind_for_path_no_git_exec(
+pub(crate) fn repository_object_hash_kind_for_path_no_git_exec(
     path: &Path,
 ) -> Result<gix_index::hash::Kind, GitAiError> {
     match config_get_str_for_path_no_git_exec(path, "extensions.objectformat")?
