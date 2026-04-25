@@ -37,6 +37,7 @@ zip = { version = "8.5", default-features = false, features = ["deflate"] }
 crossterm = "0.29"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"], optional = true }
 once_cell = "1.21"
+gix = { version = "0.80", default-features = false, features = ["status"] }
 gix-config = "0.53.0"
 gix-index = "0.48.0"
 regex = "1.12"

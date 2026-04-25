@@ -1753,7 +1753,10 @@ impl Repository {
         let remotes = g2repo
             .remotes()
             .map_err(|e| GitAiError::Generic(e.to_string()))?;
-        let names: Vec<String> = remotes.iter().map(|name| name.unwrap_or("").to_string()).collect();
+        let names: Vec<String> = remotes
+            .iter()
+            .map(|name| name.unwrap_or("").to_string())
+            .collect();
 
         if names.is_empty() {
             Ok(vec![String::new()])
@@ -1982,7 +1985,12 @@ impl Repository {
         resolved
             .shorthand()
             .map(|name| name.to_string())
-            .ok_or_else(|| GitAiError::Generic(format!("reference refs/remotes/{}/HEAD has no target", remote_name)))
+            .ok_or_else(|| {
+                GitAiError::Generic(format!(
+                    "reference refs/remotes/{}/HEAD has no target",
+                    remote_name
+                ))
+            })
     }
 
     // Lookup a reference to one of the objects in a repository. Requires full ref name.
@@ -3168,7 +3176,7 @@ pub fn config_get_str_for_path_no_git_exec(
         .map(|cfg| cfg.string(key).map(|cow| cow.to_string()))
 }
 
-fn repository_object_hash_kind_for_path_no_git_exec(
+pub(crate) fn repository_object_hash_kind_for_path_no_git_exec(
     path: &Path,
 ) -> Result<gix_index::hash::Kind, GitAiError> {
     match config_get_str_for_path_no_git_exec(path, "extensions.objectformat")?

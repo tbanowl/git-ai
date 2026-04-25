@@ -1,6 +1,8 @@
 use crate::error::GitAiError;
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
-use std::collections::HashSet;
+use gix_index::entry::Stage;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::str;
 use unicode_normalization::UnicodeNormalization;
 
@@ -106,7 +108,10 @@ fn build_status_pathspec_plan(
     }
 }
 
-fn post_filter_status_entries(entries: &mut Vec<StatusEntry>, combined_pathspecs: &HashSet<String>) {
+fn post_filter_status_entries(
+    entries: &mut Vec<StatusEntry>,
+    combined_pathspecs: &HashSet<String>,
+) {
     let nfc_pathspecs: HashSet<String> = combined_pathspecs
         .iter()
         .map(|path| nfc_path(path.clone()))
@@ -173,140 +178,97 @@ fn collect_status_records(
     plan: &StatusPathspecPlan,
     skip_untracked: bool,
 ) -> Result<Vec<CollectedStatusRecord>, GitAiError> {
-    let repo =
-        git2::Repository::open(repository.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let gix_repo = gix::discover(repository.workdir()?)
+        .map_err(|e| GitAiError::Generic(format!("gix discover: {}", e)))?;
 
-    let mut options = git2::StatusOptions::new();
-    options
-        .include_untracked(!skip_untracked)
-        .recurse_untracked_dirs(true)
-        .include_ignored(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true)
-        .include_unmodified(false);
+    let platform = gix_repo
+        .status(gix::progress::Discard)
+        .map_err(|e| GitAiError::Generic(format!("gix status: {}", e)))?;
 
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let platform = platform.untracked_files(if skip_untracked {
+        gix::status::UntrackedFiles::None
+    } else {
+        gix::status::UntrackedFiles::Collapsed
+    });
 
-    let mut entries = Vec::new();
-    for entry in statuses.iter() {
-        let Some(mut path) = entry.path().map(|path| nfc_path(path.to_string())) else {
-            continue;
+    let mut staged_map: HashMap<String, CollectedStatusRecord> = HashMap::new();
+    let mut unstaged_map: HashMap<String, CollectedStatusRecord> = HashMap::new();
+
+    let iter = platform
+        .into_iter(Vec::<gix::bstr::BString>::new())
+        .map_err(|e| GitAiError::Generic(format!("gix status iter: {}", e)))?;
+
+    for item_result in iter {
+        let item = match item_result {
+            Ok(item) => item,
+            Err(_) => continue,
         };
-        if path.trim().is_empty() {
-            continue;
-        }
 
-        let status = entry.status();
-
-        if status.is_conflicted() {
-            continue;
-        }
-
-        if status.is_ignored() {
-            entries.push(CollectedStatusRecord {
-                path,
-                staged: StatusCode::Unmodified,
-                unstaged: StatusCode::Ignored,
-                kind: EntryKind::Ignored,
-                orig_path: None,
-            });
-            continue;
-        }
-
-        if status.is_wt_new() {
-            entries.push(CollectedStatusRecord {
-                path,
-                staged: StatusCode::Unmodified,
-                unstaged: StatusCode::Untracked,
-                kind: EntryKind::Untracked,
-                orig_path: None,
-            });
-            continue;
-        }
-
-        let mut staged = StatusCode::Unmodified;
-        let mut unstaged = StatusCode::Unmodified;
-        let mut kind = EntryKind::Ordinary;
-        let mut orig_path = None;
-
-        if status.intersects(
-            git2::Status::INDEX_NEW
-                | git2::Status::INDEX_MODIFIED
-                | git2::Status::INDEX_DELETED
-                | git2::Status::INDEX_RENAMED
-                | git2::Status::INDEX_TYPECHANGE,
-        ) {
-            staged = if status.is_index_new() {
-                StatusCode::Added
-            } else if status.is_index_deleted() {
-                StatusCode::Deleted
-            } else if status.is_index_modified() || status.is_index_typechange() {
-                StatusCode::Modified
-            } else if status.is_index_renamed() {
-                kind = EntryKind::Rename;
-                StatusCode::Renamed
-            } else {
-                StatusCode::Unmodified
-            };
-        }
-
-        if status.intersects(
-            git2::Status::WT_MODIFIED
-                | git2::Status::WT_DELETED
-                | git2::Status::WT_RENAMED
-                | git2::Status::WT_TYPECHANGE,
-        ) {
-            unstaged = if status.is_wt_deleted() {
-                StatusCode::Deleted
-            } else if status.is_wt_modified() || status.is_wt_typechange() {
-                StatusCode::Modified
-            } else if status.is_wt_renamed() {
-                kind = EntryKind::Rename;
-                StatusCode::Renamed
-            } else {
-                StatusCode::Unmodified
-            };
-        }
-
-        if let Some(delta) = entry.head_to_index() {
-            if delta.status() == git2::Delta::Renamed {
-                kind = EntryKind::Rename;
-                staged = StatusCode::Renamed;
-                if let Some(new_path) = delta.new_file().path() {
-                    path = nfc_path(new_path.to_string_lossy().replace('\\', "/"));
+        match item {
+            gix::status::Item::TreeIndex(change) => {
+                let (path, staged, kind, orig_path) = map_tree_index_change(&change);
+                staged_map.insert(
+                    path.clone(),
+                    CollectedStatusRecord {
+                        path,
+                        staged,
+                        unstaged: StatusCode::Unmodified,
+                        kind,
+                        orig_path,
+                    },
+                );
+            }
+            gix::status::Item::IndexWorktree(iw_item) => {
+                let (path, unstaged, kind, orig_path) = map_index_worktree_item(&iw_item);
+                if kind == EntryKind::Unmerged {
+                    continue;
                 }
-                orig_path = delta
-                    .old_file()
-                    .path()
-                    .map(|path| nfc_path(path.to_string_lossy().replace('\\', "/")));
+                unstaged_map.insert(
+                    path.clone(),
+                    CollectedStatusRecord {
+                        path,
+                        staged: StatusCode::Unmodified,
+                        unstaged,
+                        kind,
+                        orig_path,
+                    },
+                );
             }
         }
-
-        if let Some(delta) = entry.index_to_workdir() {
-            if delta.status() == git2::Delta::Renamed {
-                kind = EntryKind::Rename;
-                unstaged = StatusCode::Renamed;
-                if let Some(new_path) = delta.new_file().path() {
-                    path = nfc_path(new_path.to_string_lossy().replace('\\', "/"));
-                }
-                orig_path = delta
-                    .old_file()
-                    .path()
-                    .map(|path| nfc_path(path.to_string_lossy().replace('\\', "/")));
-            }
-        }
-
-        entries.push(CollectedStatusRecord {
-            path,
-            staged,
-            unstaged,
-            kind,
-            orig_path,
-        });
     }
 
+    // Merge staged + unstaged per path
+    let all_paths: HashSet<String> = staged_map
+        .keys()
+        .chain(unstaged_map.keys())
+        .cloned()
+        .collect();
+
+    let mut entries: Vec<CollectedStatusRecord> = all_paths
+        .into_iter()
+        .map(|path| {
+            let staged_rec = staged_map.remove(&path);
+            let unstaged_rec = unstaged_map.remove(&path);
+            match (staged_rec, unstaged_rec) {
+                (Some(s), Some(u)) => CollectedStatusRecord {
+                    path: s.path,
+                    staged: s.staged,
+                    unstaged: u.unstaged,
+                    kind: if s.kind != EntryKind::Ordinary {
+                        s.kind
+                    } else {
+                        u.kind
+                    },
+                    orig_path: s.orig_path.or(u.orig_path),
+                },
+                (Some(s), None) => s,
+                (None, Some(u)) => u,
+                (None, None) => unreachable!(),
+            }
+        })
+        .collect();
+
+    // Apply pathspec filtering
     if !plan.should_full_scan && !plan.needs_post_filter {
         entries.retain(|entry| {
             plan.combined_pathspecs.contains(&entry.path)
@@ -318,6 +280,121 @@ fn collect_status_records(
     }
 
     Ok(entries)
+}
+
+fn map_tree_index_change(
+    change: &gix::diff::index::ChangeRef<'_, '_>,
+) -> (String, StatusCode, EntryKind, Option<String>) {
+    match change {
+        gix::diff::index::ChangeRef::Addition { location, .. } => {
+            let path = nfc_path(location.to_string());
+            (path, StatusCode::Added, EntryKind::Ordinary, None)
+        }
+        gix::diff::index::ChangeRef::Deletion { location, .. } => {
+            let path = nfc_path(location.to_string());
+            (path, StatusCode::Deleted, EntryKind::Ordinary, None)
+        }
+        gix::diff::index::ChangeRef::Modification { location, .. } => {
+            let path = nfc_path(location.to_string());
+            (path, StatusCode::Modified, EntryKind::Ordinary, None)
+        }
+        gix::diff::index::ChangeRef::Rewrite {
+            source_location,
+            location,
+            copy,
+            ..
+        } => {
+            let new_path = nfc_path(location.to_string());
+            let orig_path = source_location.to_string();
+            if *copy {
+                (
+                    new_path,
+                    StatusCode::Copied,
+                    EntryKind::Copy,
+                    Some(nfc_path(orig_path)),
+                )
+            } else {
+                (
+                    new_path,
+                    StatusCode::Renamed,
+                    EntryKind::Rename,
+                    Some(nfc_path(orig_path)),
+                )
+            }
+        }
+    }
+}
+
+fn map_index_worktree_item(
+    item: &gix::status::index_worktree::Item,
+) -> (String, StatusCode, EntryKind, Option<String>) {
+    match item {
+        gix::status::index_worktree::Item::Modification {
+            rela_path, status, ..
+        } => {
+            let path = nfc_path(rela_path.to_string());
+            let unstaged = match status {
+                gix::status::plumbing::index_as_worktree::EntryStatus::Conflict { .. } => {
+                    StatusCode::Unmerged
+                }
+                gix::status::plumbing::index_as_worktree::EntryStatus::Change(
+                    gix::status::plumbing::index_as_worktree::Change::Removed,
+                ) => StatusCode::Deleted,
+                gix::status::plumbing::index_as_worktree::EntryStatus::Change(
+                    gix::status::plumbing::index_as_worktree::Change::Type { .. },
+                ) => StatusCode::Modified,
+                gix::status::plumbing::index_as_worktree::EntryStatus::Change(
+                    gix::status::plumbing::index_as_worktree::Change::Modification { .. },
+                ) => StatusCode::Modified,
+                gix::status::plumbing::index_as_worktree::EntryStatus::Change(
+                    gix::status::plumbing::index_as_worktree::Change::SubmoduleModification(_),
+                ) => StatusCode::Modified,
+                gix::status::plumbing::index_as_worktree::EntryStatus::NeedsUpdate(_) => {
+                    StatusCode::Modified
+                }
+                gix::status::plumbing::index_as_worktree::EntryStatus::IntentToAdd => {
+                    StatusCode::Added
+                }
+            };
+            let kind = if matches!(unstaged, StatusCode::Unmerged) {
+                EntryKind::Unmerged
+            } else {
+                EntryKind::Ordinary
+            };
+            (path, unstaged, kind, None)
+        }
+        gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
+            let mut path = nfc_path(entry.rela_path.to_string());
+            let is_dir = entry.disk_kind.is_some_and(|k| k.is_dir());
+            if is_dir && !path.ends_with('/') {
+                path.push('/');
+            }
+            (path, StatusCode::Untracked, EntryKind::Untracked, None)
+        }
+        gix::status::index_worktree::Item::Rewrite {
+            source,
+            dirwalk_entry,
+            copy,
+            ..
+        } => {
+            let path = nfc_path(dirwalk_entry.rela_path.to_string());
+            let orig_path = match source {
+                gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+                    source_rela_path,
+                    ..
+                } => Some(nfc_path(source_rela_path.to_string())),
+                gix::status::index_worktree::RewriteSource::CopyFromDirectoryEntry {
+                    source_dirwalk_entry,
+                    ..
+                } => Some(nfc_path(source_dirwalk_entry.rela_path.to_string())),
+            };
+            if *copy {
+                (path, StatusCode::Copied, EntryKind::Copy, orig_path)
+            } else {
+                (path, StatusCode::Renamed, EntryKind::Rename, orig_path)
+            }
+        }
+    }
 }
 
 fn assemble_status_entries(records: Vec<CollectedStatusRecord>) -> Vec<StatusEntry> {
@@ -334,63 +411,65 @@ fn assemble_status_entries(records: Vec<CollectedStatusRecord>) -> Vec<StatusEnt
 }
 
 impl Repository {
-    // Get status for tracked files that changed
     pub fn get_staged_filenames(&self) -> Result<HashSet<String>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("diff".to_string());
-        args.push("--cached".to_string());
-        args.push("--name-only".to_string());
-        args.push("-z".to_string()); // NUL-separated output for proper UTF-8 handling
-        args.push("--no-renames".to_string());
+        let object_hash =
+            crate::git::repository::repository_object_hash_kind_for_path_no_git_exec(self.path())?;
+        let index_path = self.path().join("index");
+        let index = match gix_index::File::at(index_path, object_hash, true, Default::default()) {
+            Ok(index) => index,
+            Err(_) => return Ok(HashSet::new()),
+        };
 
-        let output = exec_git_with_profile(&args, InternalGitProfile::RawDiffParse)?;
+        let mut index_entries = HashMap::new();
+        let mut conflict_paths = HashSet::new();
+        for entry in index.entries() {
+            let file_path = nfc_path(entry.path(&index).to_string());
+            if file_path.trim().is_empty() {
+                continue;
+            }
 
-        if !output.status.success() {
-            return Err(GitAiError::Generic(format!(
-                "git diff exited with status {}",
-                output.status
-            )));
+            if entry.stage() == Stage::Unconflicted {
+                index_entries.insert(file_path, (entry.id.to_string(), entry.mode.bits() as i32));
+            } else {
+                conflict_paths.insert(file_path);
+            }
         }
 
-        // With -z, output is NUL-separated. The output may contain a trailing NUL.
-        // Apply NFC normalization so that decomposed (NFD) paths from macOS match
-        // precomposed (NFC) paths used internally (see normalize_to_posix).
-        let filenames: HashSet<String> = output
-            .stdout
-            .split(|&b| b == 0)
-            .filter(|bytes| !bytes.is_empty())
-            .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
-            .map(nfc_path)
-            .collect();
+        let repo =
+            git2::Repository::open(self.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let head_entries = collect_head_tree_entries(&repo)?;
+
+        let mut filenames = conflict_paths;
+        for (path, (oid, mode)) in &index_entries {
+            match head_entries.get(path) {
+                Some((head_oid, head_mode)) if head_oid == oid && head_mode == mode => {}
+                _ => {
+                    filenames.insert(path.clone());
+                }
+            }
+        }
+
+        for path in head_entries.keys() {
+            if !index_entries.contains_key(path) {
+                filenames.insert(path.clone());
+            }
+        }
 
         Ok(filenames)
     }
 
-    // Get status for tracked files that changed
     pub fn get_staged_and_unstaged_filenames(&self) -> Result<HashSet<String>, GitAiError> {
-        let mut args = self.global_args_for_exec();
-        args.push("--no-optional-locks".to_string());
-        args.push("status".to_string());
-        args.push("--porcelain=v2".to_string());
-        args.push("-z".to_string());
-
-        let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
-
-        if !output.status.success() {
-            return Err(GitAiError::Generic(format!(
-                "git status exited with status {}",
-                output.status
-            )));
-        }
-
-        let entries = parse_porcelain_v2(&output.stdout)?;
-
+        let plan = StatusPathspecPlan {
+            combined_pathspecs: HashSet::new(),
+            should_full_scan: true,
+            needs_post_filter: false,
+        };
+        let entries = collect_status_records(self, &plan, false)?;
         let filenames: HashSet<String> = entries
             .iter()
             .filter(|entry| entry.kind != EntryKind::Ignored)
             .map(|entry| entry.path.clone())
             .collect();
-
         Ok(filenames)
     }
 
@@ -415,6 +494,55 @@ impl Repository {
 
         Ok(entries)
     }
+}
+
+fn collect_head_tree_entries(
+    repo: &git2::Repository,
+) -> Result<HashMap<String, (String, i32)>, GitAiError> {
+    let mut entries = HashMap::new();
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => return Ok(entries),
+        Err(err) => return Err(GitAiError::Generic(err.to_string())),
+    };
+    let commit = head
+        .peel_to_commit()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    collect_tree_entries(repo, &tree, Path::new(""), &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_tree_entries(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    prefix: &Path,
+    entries: &mut HashMap<String, (String, i32)>,
+) -> Result<(), GitAiError> {
+    for entry in tree {
+        let Ok(name) = str::from_utf8(entry.name_bytes()) else {
+            continue;
+        };
+        let path = prefix.join(name);
+        if entry.kind() == Some(git2::ObjectType::Tree) {
+            let subtree = repo
+                .find_tree(entry.id())
+                .map_err(|e| GitAiError::Generic(e.to_string()))?;
+            collect_tree_entries(repo, &subtree, &path, entries)?;
+            continue;
+        }
+
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        entries.insert(
+            nfc_path(path_str.replace('\\', "/")),
+            (entry.id().to_string(), entry.filemode()),
+        );
+    }
+    Ok(())
 }
 
 fn parse_porcelain_v2(data: &[u8]) -> Result<Vec<StatusEntry>, GitAiError> {

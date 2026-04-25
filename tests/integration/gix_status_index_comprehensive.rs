@@ -37,7 +37,8 @@ fn sorted_paths(set: HashSet<String>) -> Vec<String> {
 }
 
 #[test]
-fn gix_status_index_comprehensive_get_staged_filenames_only_reports_staged_paths_in_mixed_worktree() {
+fn gix_status_index_comprehensive_get_staged_filenames_only_reports_staged_paths_in_mixed_worktree()
+{
     let repo = TestRepo::new();
 
     write_file(&repo, "staged.txt", "base staged\n");
@@ -57,7 +58,8 @@ fn gix_status_index_comprehensive_get_staged_filenames_only_reports_staged_paths
 }
 
 #[test]
-fn gix_status_index_comprehensive_get_staged_and_unstaged_filenames_includes_untracked_but_not_ignored() {
+fn gix_status_index_comprehensive_get_staged_and_unstaged_filenames_includes_untracked_but_not_ignored()
+ {
     let repo = TestRepo::new();
 
     write_file(&repo, ".gitignore", "ignored.log\n");
@@ -85,7 +87,8 @@ fn gix_status_index_comprehensive_get_staged_and_unstaged_filenames_includes_unt
 }
 
 #[test]
-fn gix_status_index_comprehensive_get_staged_and_unstaged_filenames_recurses_untracked_directories() {
+fn gix_status_index_comprehensive_get_staged_and_unstaged_filenames_recurses_untracked_directories()
+{
     let repo = TestRepo::new();
 
     write_file(&repo, ".gitignore", "ignored-dir/\n");
@@ -131,7 +134,11 @@ fn gix_status_index_comprehensive_status_toggles_untracked_entries_with_skip_unt
     assert_eq!(unstaged.staged, StatusCode::Unmodified);
     assert_eq!(unstaged.unstaged, StatusCode::Modified);
 
-    assert!(without_untracked.iter().all(|entry| entry.path != "untracked.txt"));
+    assert!(
+        without_untracked
+            .iter()
+            .all(|entry| entry.path != "untracked.txt")
+    );
 
     let untracked = status_entry_by_path(&with_untracked, "untracked.txt");
     assert_eq!(untracked.kind, EntryKind::Untracked);
@@ -139,7 +146,8 @@ fn gix_status_index_comprehensive_status_toggles_untracked_entries_with_skip_unt
 }
 
 #[test]
-fn gix_status_index_comprehensive_status_pathspec_union_keeps_staged_paths_and_filters_other_unstaged_paths() {
+fn gix_status_index_comprehensive_status_pathspec_union_keeps_staged_paths_and_filters_other_unstaged_paths()
+ {
     let repo = TestRepo::new();
 
     write_file(&repo, "staged.txt", "seed\n");
@@ -158,7 +166,10 @@ fn gix_status_index_comprehensive_status_pathspec_union_keeps_staged_paths_and_f
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     let paths: Vec<String> = entries.into_iter().map(|entry| entry.path).collect();
-    assert_eq!(paths, vec!["selected.txt".to_string(), "staged.txt".to_string()]);
+    assert_eq!(
+        paths,
+        vec!["selected.txt".to_string(), "staged.txt".to_string()]
+    );
 }
 
 #[test]
@@ -244,7 +255,10 @@ fn gix_status_index_comprehensive_branch_metadata_tracks_attached_and_detached_h
     let detached = read_head_state_for_worktree(repo.path()).expect("detached head state");
     assert_eq!(detached.head.as_deref(), Some(commit.as_str()));
     assert_eq!(detached.branch, None);
-    assert!(detached.detached, "detached checkout should mark detached=true");
+    assert!(
+        detached.detached,
+        "detached checkout should mark detached=true"
+    );
 }
 
 #[test]
@@ -260,14 +274,20 @@ fn gix_status_index_comprehensive_conflicted_index_paths_diverge_from_stage0_sta
     repo.stage_all_and_commit("feature change").unwrap();
 
     let trunk = repo.git_og(&["rev-parse", "--abbrev-ref", "feature@{upstream}"]);
-    assert!(trunk.is_err(), "feature should not have an upstream in test repo");
+    assert!(
+        trunk.is_err(),
+        "feature should not have an upstream in test repo"
+    );
     repo.git_og(&["checkout", "-"]).unwrap();
 
     write_file(&repo, "conflicted.txt", "main\n");
     repo.stage_all_and_commit("main change").unwrap();
 
     let merge = repo.git_og(&["merge", "feature"]);
-    assert!(merge.is_err(), "merge should leave conflicted index entries");
+    assert!(
+        merge.is_err(),
+        "merge should leave conflicted index entries"
+    );
 
     write_file(&repo, "clean.txt", "base\nclean staged\n");
     repo.git_og(&["add", "clean.txt"]).unwrap();
@@ -317,7 +337,8 @@ fn gix_status_index_comprehensive_get_all_staged_files_content_reads_text_and_sk
 }
 
 #[test]
-fn gix_status_index_comprehensive_get_all_staged_files_content_skips_conflicted_paths_but_keeps_stage0_entries() {
+fn gix_status_index_comprehensive_get_all_staged_files_content_skips_conflicted_paths_but_keeps_stage0_entries()
+ {
     let repo = TestRepo::new();
 
     write_file(&repo, "conflicted.txt", "base\n");
@@ -340,13 +361,13 @@ fn gix_status_index_comprehensive_get_all_staged_files_content_skips_conflicted_
 
     let repository = open_repo(&repo);
     let contents: HashMap<String, String> = repository
-        .get_all_staged_files_content(&[
-            "conflicted.txt".to_string(),
-            "clean.txt".to_string(),
-        ])
+        .get_all_staged_files_content(&["conflicted.txt".to_string(), "clean.txt".to_string()])
         .unwrap();
 
-    assert_eq!(contents.get("clean.txt"), Some(&"base\nclean staged\n".to_string()));
+    assert_eq!(
+        contents.get("clean.txt"),
+        Some(&"base\nclean staged\n".to_string())
+    );
     assert!(
         !contents.contains_key("conflicted.txt"),
         "unmerged index entries should not be surfaced as stage-0 content"
@@ -361,7 +382,8 @@ fn gix_status_index_comprehensive_new_status_matches_cli_for_mixed_repo() {
     write_file(&repo, "tracked.txt", "seed\n");
     repo.stage_all_and_commit("initial").unwrap();
 
-    repo.git_og(&["mv", "rename-me.txt", "renamed.txt"]).unwrap();
+    repo.git_og(&["mv", "rename-me.txt", "renamed.txt"])
+        .unwrap();
     write_file(&repo, "tracked.txt", "seed\nunstaged\n");
     write_file(&repo, "untracked.txt", "brand new\n");
 
@@ -369,8 +391,9 @@ fn gix_status_index_comprehensive_new_status_matches_cli_for_mixed_repo() {
     let mut new_entries = repository.status(None, false).unwrap();
     new_entries.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut old_entries = git_ai::git::status::old_cli_status_entries_for_test(&repository, None, false)
-        .expect("old cli-backed status helper should succeed");
+    let mut old_entries =
+        git_ai::git::status::old_cli_status_entries_for_test(&repository, None, false)
+            .expect("old cli-backed status helper should succeed");
     old_entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     assert_eq!(new_entries, old_entries);
