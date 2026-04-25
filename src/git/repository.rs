@@ -430,14 +430,14 @@ fn write_stdin_in_background(
     Some(std::thread::spawn(move || {
         use std::io::Write;
         let mut stdin = stdin;
-        if is_debug_enabled() {
-            let preview = String::from_utf8_lossy(&data).lines().take(10).collect::<Vec<_>>().join("\n");
-            tracing::debug!(
-                "[exec_git] writing {} bytes to stdin, preview:\n{}",
-                data.len(),
-                preview
-            );
-        }
+        // if is_debug_enabled() {
+        //     let preview = String::from_utf8_lossy(&data).lines().take(10).collect::<Vec<_>>().join("\n");
+        //     tracing::debug!(
+        //         "[exec_git] writing {} bytes to stdin, preview:\n{}",
+        //         data.len(),
+        //         preview
+        //     );
+        // }
         stdin.write_all(&data)
     }))
 }
@@ -456,7 +456,7 @@ where
             if is_debug_enabled() {
                 if name == "stderr" && n > 0 {
                     let err = std::str::from_utf8(&buf).unwrap_or("<non-UTF8 stderr>");
-                    tracing::debug!("[exec_git] stderr read {n} bytes: {err}");
+                    tracing::error!("[exec_git] stderr read {n} bytes: \n{err}");
                 } else {
                     tracing::debug!("[exec_git] {name} read {n} bytes");
                 }
@@ -499,8 +499,7 @@ fn run_git_once(request: &GitExecRequest) -> Result<Output, GitAiError> {
     } = build_git_command(request);
 
     let cmd_start = Instant::now();
-    let trace_id = uuid::Uuid::new_v4();
-    tracing::debug!("[exec_git] {} Starting git command execution", trace_id);
+    tracing::debug!("[exec_git] Starting git command execution");
 
     #[cfg(windows)]
     let mut child = {
@@ -585,8 +584,7 @@ fn run_git_once(request: &GitExecRequest) -> Result<Output, GitAiError> {
 
     let elapsed = cmd_start.elapsed();
     tracing::debug!(
-        "[exec_git] {} git command [{:?}] execution total {}ms",
-        trace_id,
+        "[exec_git] git command [{:?}] execution total {}ms",
         effective_args,
         elapsed.as_millis()
     );

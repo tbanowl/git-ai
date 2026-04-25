@@ -2,16 +2,24 @@ use crate::config;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Once;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-struct LocalTimer;
+struct LocalTimer {
+    kind: &'static str,
+}
 
 impl FormatTime for LocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+        write!(
+            w,
+            "{} [{} {}]",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            self.kind,
+            std::process::id()
+        )
     }
 }
 
@@ -42,18 +50,18 @@ fn command_tracing_internal_dir() -> Option<PathBuf> {
 }
 
 fn command_tracing_dir() -> Option<PathBuf> {
-    command_tracing_internal_dir().map(|dir| dir.join("tracing").join("commands"))
+    command_tracing_internal_dir().map(|dir| dir.join("tracing"))
 }
 
-fn command_tracing_log_path(command_kind: &str) -> Option<PathBuf> {
+fn command_tracing_log_path() -> Option<PathBuf> {
     // yyyy-mm-dd
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    command_tracing_dir().map(|dir| dir.join(format!("{}-{}.log", command_kind, date)))
+    command_tracing_dir().map(|dir| dir.join(format!("git-ai-{}.log", date)))
 }
 
 pub fn init_command_tracing(command_kind: &'static str) {
     COMMAND_TRACING_INIT.call_once(|| {
-        let Some(log_path) = command_tracing_log_path(command_kind) else {
+        let Some(log_path) = command_tracing_log_path() else {
             return;
         };
 
@@ -77,10 +85,10 @@ pub fn init_command_tracing(command_kind: &'static str) {
             .with(env_filter)
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTimer)
                     .with_target(false)
                     .with_thread_ids(false)
                     .with_ansi(false)
+                    .with_timer(LocalTimer { kind: command_kind })
                     .with_writer(FileMakeWriter { file }),
             )
             .try_init();

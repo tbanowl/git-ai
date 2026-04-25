@@ -127,7 +127,7 @@ pub fn handle_git(args: &[String]) {
         return;
     }
 
-    crate::observability::tracing_file::init_command_tracing("git");
+    crate::observability::tracing_file::init_command_tracing("git-ai");
 
     // Async mode: wrapper should behave as a pure passthrough to git,
     // but capture and send authoritative pre/post state to the daemon.
