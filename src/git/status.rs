@@ -418,6 +418,7 @@ impl Repository {
         pathspecs: Option<&HashSet<String>>,
         skip_untracked: bool,
     ) -> Result<Vec<StatusEntry>, GitAiError> {
+        let status_start = std::time::Instant::now();
         let staged_filenames = self.get_staged_filenames()?;
         let plan = build_status_pathspec_plan(staged_filenames, pathspecs);
 
@@ -431,6 +432,14 @@ impl Repository {
         if plan.needs_post_filter {
             post_filter_status_entries(&mut entries, &plan.combined_pathspecs);
         }
+        tracing::debug!(
+            "Computed status entries in {:?} (pathspecs={:?}, skip_untracked={}, full_scan={}, post_filter={})",
+            status_start.elapsed(),
+            pathspecs,
+            skip_untracked,
+            plan.should_full_scan,
+            plan.needs_post_filter
+        );
 
         Ok(entries)
     }

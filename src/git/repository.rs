@@ -430,11 +430,20 @@ fn write_stdin_in_background(
     Some(std::thread::spawn(move || {
         use std::io::Write;
         let mut stdin = stdin;
+        if is_debug_enabled() {
+            let preview = String::from_utf8_lossy(&data).lines().take(10).collect::<Vec<_>>().join("\n");
+            tracing::debug!(
+                "[exec_git] writing {} bytes to stdin, preview:\n{}",
+                data.len(),
+                preview
+            );
+        }
         stdin.write_all(&data)
     }))
 }
 
 fn read_pipe_in_background<R>(
+    name: &'static str,
     reader: Option<R>,
 ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>
 where
@@ -443,7 +452,15 @@ where
     reader.map(|mut reader| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            reader.read_to_end(&mut buf)?;
+            let n = reader.read_to_end(&mut buf)?;
+            if is_debug_enabled() {
+                if name == "stderr" && n > 0 {
+                    let err = std::str::from_utf8(&buf).unwrap_or("<non-UTF8 stderr>");
+                    tracing::debug!("[exec_git] stderr read {n} bytes: {err}");
+                } else {
+                    tracing::debug!("[exec_git] {name} read {n} bytes");
+                }
+            }
             Ok(buf)
         })
     })
@@ -511,8 +528,8 @@ fn run_git_once(request: &GitExecRequest) -> Result<Output, GitAiError> {
     let stdout_raw = child.stdout.as_ref().map(|stdout| stdout.as_raw_handle());
     #[cfg(windows)]
     let stderr_raw = child.stderr.as_ref().map(|stderr| stderr.as_raw_handle());
-    let stdout_handle = read_pipe_in_background(child.stdout.take());
-    let stderr_handle = read_pipe_in_background(child.stderr.take());
+    let stdout_handle = read_pipe_in_background("stdout", child.stdout.take());
+    let stderr_handle = read_pipe_in_background("stderr", child.stderr.take());
 
     let status = match request.timeout {
         Some(timeout) => loop {
