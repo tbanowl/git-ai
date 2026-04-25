@@ -40,3 +40,4 @@ fuzz/corpus/
 # Worktrees
 .worktrees/
 .claude/worktrees/
+.claude
