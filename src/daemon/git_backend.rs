@@ -4,7 +4,7 @@ use crate::git::cli_parser::parse_git_cli_args;
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::common_dir_for_worktree;
 use crate::git::repository::discover_repository_in_path_no_git_exec;
-use crate::git::repository::exec_git_allow_nonzero;
+use gix::bstr::ByteSlice;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -297,28 +297,16 @@ impl GitBackend for SystemGitBackend {
     }
 
     fn repo_context(&self, worktree: &Path) -> Result<RepoContext, GitAiError> {
+        // Migrated from: git symbolic-ref --quiet --short HEAD
+        // Backend: git2 + gix (performance-first)
+        let repo = gix::discover(worktree).map_err(|e| GitAiError::GixError(e.to_string()))?;
         let head = rev_parse_head(worktree).ok();
-        let symbolic = run_git_allow_nonzero(
-            [
-                "-C",
-                &worktree.to_string_lossy(),
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "HEAD",
-            ]
-            .as_slice(),
-        )?;
-        let (branch, detached) = if symbolic.status.success() {
-            let value = String::from_utf8_lossy(&symbolic.stdout).trim().to_string();
-            if value.is_empty() {
-                (None, true)
-            } else {
-                (Some(value), false)
-            }
-        } else {
-            (None, true)
-        };
+        let repo_head = repo.head().map_err(|e| GitAiError::GixError(e.to_string()))?;
+        let branch = repo_head
+            .referent_name()
+            .and_then(|name| name.shorten().to_str().ok().map(str::to_owned))
+            .filter(|value| !value.is_empty());
+        let detached = repo_head.is_detached() || branch.is_none();
 
         Ok(RepoContext {
             head,
@@ -455,40 +443,14 @@ impl GitBackend for SystemGitBackend {
 }
 
 fn rev_parse_head(worktree: &Path) -> Result<String, GitAiError> {
-    run_git_str_allow_nonzero(
-        [
-            "-C",
-            &worktree.to_string_lossy(),
-            "rev-parse",
-            "--verify",
-            "HEAD",
-        ]
-        .as_slice(),
-    )
-}
-
-fn run_git_allow_nonzero(args: &[&str]) -> Result<std::process::Output, GitAiError> {
-    let args_owned = args
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect::<Vec<_>>();
-    exec_git_allow_nonzero(&args_owned)
-}
-
-fn run_git_str_allow_nonzero(args: &[&str]) -> Result<String, GitAiError> {
-    let output = run_git_allow_nonzero(args)?;
-    if !output.status.success() {
-        return Err(git_error_for(args, &output));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git_error_for(args: &[&str], output: &std::process::Output) -> GitAiError {
-    GitAiError::GitCliError {
-        code: output.status.code(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        args: args.iter().map(|s| s.to_string()).collect(),
-    }
+    // Migrated from: git rev-parse --verify HEAD
+    // Backend: git2
+    let repo = git2::Repository::open(worktree).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let head = repo.head().map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let commit = head
+        .peel_to_commit()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    Ok(commit.id().to_string())
 }
 
 fn reflog_offsets(common_dir: &Path) -> Result<HashMap<String, u64>, GitAiError> {

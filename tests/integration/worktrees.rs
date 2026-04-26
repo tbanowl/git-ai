@@ -6,6 +6,7 @@ use git_ai::authorship::authorship_log::PromptRecord;
 use git_ai::authorship::stats::CommitStats;
 use git_ai::authorship::transcript::Message;
 use git_ai::authorship::working_log::{AgentId, CheckpointKind};
+use git_ai::daemon::git_backend::{GitBackend, SystemGitBackend};
 use git_ai::git::repository as GitAiRepository;
 use insta::assert_debug_snapshot;
 use rand::RngExt;
@@ -199,6 +200,80 @@ crate::worktree_test_wrappers! {
             "working logs should live under common-dir isolated storage: {}",
             gitai_repo.storage.working_logs.display()
         );
+    }
+}
+
+crate::worktree_test_wrappers! {
+    fn daemon_repo_context_reports_attached_branch_and_head_in_linked_worktree_fixture() {
+        let repo = TestRepo::new();
+        let backend = SystemGitBackend::new();
+
+        let context = backend
+            .repo_context(repo.path())
+            .expect("repo_context should succeed");
+        let expected_branch = run_git_stdout(
+            repo.path(),
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        );
+        let expected_head = run_git_stdout(repo.path(), &["rev-parse", "--verify", "HEAD"]);
+
+        assert_eq!(context.branch.as_deref(), Some(expected_branch.as_str()));
+        assert_eq!(context.head.as_deref(), Some(expected_head.as_str()));
+        assert!(!context.detached, "attached branch should not be reported as detached");
+    }
+}
+
+crate::worktree_test_wrappers! {
+    fn daemon_repo_context_reports_detached_head_without_branch_name_in_linked_worktree_fixture() {
+        let repo = TestRepo::new();
+        let head = run_git_stdout(repo.path(), &["rev-parse", "--verify", "HEAD"]);
+        run_git(repo.path(), &["checkout", "--detach", &head]);
+        let backend = SystemGitBackend::new();
+
+        let context = backend
+            .repo_context(repo.path())
+            .expect("repo_context should succeed");
+
+        assert_eq!(context.head.as_deref(), Some(head.as_str()));
+        assert_eq!(context.branch, None, "detached HEAD should not report a branch name");
+        assert!(context.detached, "detached HEAD should be reported as detached");
+    }
+}
+
+crate::worktree_test_wrappers! {
+    fn daemon_repo_context_preserves_branch_and_head_metadata_in_linked_worktree_fixture() {
+        let repo = TestRepo::new();
+        let backend = SystemGitBackend::new();
+
+        let context = backend
+            .repo_context(repo.path())
+            .expect("repo_context should succeed for linked worktree");
+        let expected_branch = run_git_stdout(
+            repo.path(),
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        );
+        let expected_head = run_git_stdout(repo.path(), &["rev-parse", "--verify", "HEAD"]);
+
+        assert_eq!(context.branch.as_deref(), Some(expected_branch.as_str()));
+        assert_eq!(context.head.as_deref(), Some(expected_head.as_str()));
+        assert!(
+            !context.detached,
+            "linked worktree on a branch should preserve attached-HEAD semantics"
+        );
+    }
+}
+
+crate::worktree_test_wrappers! {
+    fn daemon_repo_context_head_matches_git_rev_parse_in_linked_worktree_fixture() {
+        let repo = TestRepo::new();
+        let backend = SystemGitBackend::new();
+
+        let context = backend
+            .repo_context(repo.path())
+            .expect("repo_context should succeed");
+        let expected = run_git_stdout(repo.path(), &["rev-parse", "--verify", "HEAD"]);
+
+        assert_eq!(context.head.as_deref(), Some(expected.as_str()));
     }
 }
 
