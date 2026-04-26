@@ -2894,12 +2894,23 @@ fn processed_rebase_new_heads(repository: &Repository) -> Result<HashSet<String>
 /// Check whether `ancestor` is an ancestor of `descendant` using
 /// `git merge-base --is-ancestor`.
 fn is_ancestor_commit(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    crate::git::repository::exec_git(&args).is_ok()
+    // Migrated from: git merge-base --is-ancestor <ancestor> <descendant>
+    // Backend: git2
+    let Ok(g2repo) = git2::Repository::open(repository.path()) else {
+        return false;
+    };
+    let Ok(ancestor_oid) = git2::Oid::from_str(ancestor) else {
+        return false;
+    };
+    let Ok(descendant_oid) = git2::Oid::from_str(descendant) else {
+        return false;
+    };
+    if ancestor_oid == descendant_oid {
+        return true;
+    }
+    g2repo
+        .graph_descendant_of(descendant_oid, ancestor_oid)
+        .unwrap_or(false)
 }
 
 fn maybe_rebase_mappings_from_repository(

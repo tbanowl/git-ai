@@ -4,6 +4,7 @@ use crate::commands::hooks::commit_hooks::get_commit_default_author;
 use crate::git::cli_parser::{ParsedGitInvocation, RebaseArgsSummary, is_dry_run};
 use crate::git::repository::Repository;
 use crate::git::rewrite_log::RewriteLogEvent;
+use git2::{Oid, Repository as Git2Repository};
 
 pub fn pre_rebase_hook(
     parsed_args: &ParsedGitInvocation,
@@ -447,31 +448,42 @@ pub fn build_rebase_commit_mappings(
 /// branch.  By following only first parents and capping at the number of source
 /// commits we avoid sweeping in unrelated target-branch history (including merge
 /// commits) when the walk base is too far back.
+///
+/// For this specific rebase mapping use case, that linear first-parent walk is
+/// equivalent to `git rev-list --first-parent --topo-order --max-count=<n>
+/// <base>..<head>` because the rebased segment we need is already restricted to
+/// the tip-most chain ending at `head`: there are no side branches to topo-sort
+/// within that segment, and stopping after `max_count` commits matches the
+/// source-commit cardinality bound used by the surrounding mapping logic.
 fn walk_first_parent_commits(
     repository: &Repository,
     head: &str,
     base: &str,
     max_count: usize,
 ) -> Result<Vec<String>, crate::error::GitAiError> {
+    // Migrated from: git rev-list --first-parent --topo-order --max-count=<n> <base>..<head>
+    // Backend: git2
     if head == base || max_count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut args = repository.global_args_for_exec();
-    args.push("rev-list".to_string());
-    args.push("--first-parent".to_string());
-    args.push("--topo-order".to_string());
-    args.push(format!("--max-count={}", max_count));
-    args.push(format!("{}..{}", base, head));
+    let g2repo = Git2Repository::open(repository.path())
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let mut current_oid = Oid::from_str(head)
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let base_oid = Oid::from_str(base).map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let mut commits = Vec::new();
 
-    let output = crate::git::repository::exec_git(&args)?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let commits = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
+    while current_oid != base_oid && commits.len() < max_count {
+        let commit = g2repo
+            .find_commit(current_oid)
+            .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+        commits.push(commit.id().to_string());
+        match commit.parent_id(0) {
+            Ok(parent_oid) => current_oid = parent_oid,
+            Err(_) => break,
+        }
+    }
 
     Ok(commits)
 }
@@ -528,12 +540,23 @@ fn resolve_commitish(repository: &Repository, spec: &str) -> Option<String> {
 }
 
 fn is_ancestor(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    crate::git::repository::exec_git(&args).is_ok()
+    // Migrated from: git merge-base --is-ancestor <ancestor> <descendant>
+    // Backend: git2
+    let Ok(g2repo) = Git2Repository::open(repository.path()) else {
+        return false;
+    };
+    let Ok(ancestor_oid) = Oid::from_str(ancestor) else {
+        return false;
+    };
+    let Ok(descendant_oid) = Oid::from_str(descendant) else {
+        return false;
+    };
+    if ancestor_oid == descendant_oid {
+        return true;
+    }
+    g2repo
+        .graph_descendant_of(descendant_oid, ancestor_oid)
+        .unwrap_or(false)
 }
 
 fn summarize_rebase_args(parsed_args: &ParsedGitInvocation) -> RebaseArgsSummary {
