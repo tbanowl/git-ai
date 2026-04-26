@@ -13,7 +13,7 @@
 ## Source Documents
 
 - `docs/superpowers/specs/2026-04-20-repository-git2-migration-requirements.md`
-- `docs/git2-对照表.md`
+- `docs/git2-gix-对照表.md`
 - `docs/superpowers/plans/2026-04-20-repository-git2-migration-checklist.md`
 - `docs/superpowers/plans/2026-04-21-p1p2-git2-migration.md`
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace remaining CLI subprocess calls in `src/git/repository.rs` with in-process `git2` / `gix` API calls for the P1/P2 functions identified in `docs/git2-对照表.md`.
+**Goal:** Replace remaining CLI subprocess calls in `src/git/repository.rs` with in-process `git2` / `gix` API calls for the P1/P2 functions identified in `docs/git2-gix-对照表.md`.
 
 **Architecture:** Each task is a surgical replacement of one function's body. The public API signatures stay identical — callers are unaffected. All changes are inside `src/git/repository.rs` unless noted. The `git2::Repository` handle is obtained via the existing `self.open_git2()` helper.
 

@@ -153,8 +153,9 @@ pub fn handle_git(args: &[String]) {
         };
 
         if is_read_only {
-            let exit_status = proxy_to_git(args, false, None, None);
-            exit_with_status(exit_status);
+            let orig_args: Vec<String> = std::env::args().skip(1).collect();
+            proxy_to_git(&orig_args, true, None, None);
+            return;
         }
 
         // Repo-creating commands (clone, init) have no meaningful pre/post
@@ -170,8 +171,9 @@ pub fn handle_git(args: &[String]) {
             .is_some_and(|cmd| matches!(cmd, "clone" | "init"));
 
         if is_repo_creating {
-            let exit_status = proxy_to_git(args, false, None, None);
-            exit_with_status(exit_status);
+            let orig_args: Vec<String> = std::env::args().skip(1).collect();
+            proxy_to_git(&orig_args, true, None, None);
+            return;
         }
 
         // Initialize the daemon telemetry handle so we can send wrapper state
@@ -973,6 +975,14 @@ fn proxy_to_git(
                     cmd.creation_flags(CREATE_NO_WINDOW);
                 }
             }
+            if exit_on_completion {
+                let status = cmd.stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .status()
+                    .unwrap();
+                exit_with_status(status);
+            }
 
             cmd.spawn()
         }
@@ -1217,10 +1227,6 @@ fn spawn_git_child_windows(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     if is_debug_enabled() {
-        cmd.env("GIT_TRACE", "1");
-        cmd.env("GIT_TRACE2", "1");
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        cmd.env("GCM_INTERACTIVE", "Never");
         eprintln!(
             "[proxy_to_git] git executable = {:?},  git args = {:?}",
             config::Config::get().git_cmd(),

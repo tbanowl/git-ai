@@ -1,6 +1,6 @@
 # status.rs gix migration design（2026-04-24）
 
-> 前置阅读：`docs/git2-对照表.md`（`src/git/status.rs` 段落与 “哪些条目更适合 gix 而非 git2” 小节）
+> 前置阅读：`docs/git2-gix-对照表.md`（`src/git/status.rs` 段落与 “哪些条目更适合 gix 而非 git2” 小节）
 
 ## 1. 目标
 

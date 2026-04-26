@@ -27,7 +27,7 @@
 ### Files to inspect while implementing
 
 - `docs/superpowers/specs/2026-04-24-status-gix-migration-design.md`
-- `docs/git2-对照表.md`
+- `docs/git2-gix-对照表.md`
 - `src/git/status.rs`
 - `src/git/repo_state.rs` (reference only; do not fold into this change)
 

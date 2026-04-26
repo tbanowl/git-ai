@@ -357,7 +357,7 @@ enough that we should record the current routing decision in one place:
   side effects.
 
 This appendix is a supplement to the detailed matrix in
-`docs/git2-对照表.md`. It exists to answer “which backend should own this next?”
+`docs/git2-gix-对照表.md`. It exists to answer “which backend should own this next?”
 before new migration work begins.
 
 ### Prefer `git2` Next
