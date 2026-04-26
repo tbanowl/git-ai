@@ -6,6 +6,7 @@ use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
 use crate::git::refs::{get_authorship, show_authorship_note};
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
+use git2::Oid;
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -412,23 +413,15 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
 // ============================================================================
 
 fn resolve_commit(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("rev-parse".to_string());
-    args.push(rev.to_string());
-
-    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
-    let sha = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Failed to parse rev-parse output: {}", e)))?
-        .trim()
-        .to_string();
-
+    // Migrated from: git rev-parse <rev>
+    // Backend: git2
+    let obj = repo.revparse_single(rev)?;
+    let commit = obj.peel_to_commit()?;
+    let sha = commit.id().to_string();
+    let _oid = Oid::from_str(&sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
     if sha.is_empty() {
-        return Err(GitAiError::Generic(format!(
-            "Could not resolve commit: {}",
-            rev
-        )));
+        return Err(GitAiError::Generic(format!("Could not resolve commit: {}", rev)));
     }
-
     Ok(sha)
 }
 

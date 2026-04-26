@@ -10,6 +10,7 @@ use crate::error::GitAiError;
 use crate::git::find_repository_in_path;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
 use chrono::{Local, TimeZone};
+use git2::{ObjectType, Oid, Sort};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -604,20 +605,33 @@ fn get_current_git_user_name() -> Option<String> {
 /// used to drop notes whose target commit has been orphaned (squash/rebase) without
 /// per-commit forks.
 fn reachable_commits(repo: &Repository) -> HashSet<String> {
-    let mut args = repo.global_args_for_exec();
-    args.push("rev-list".to_string());
-    args.push("--all".to_string());
-
-    let output = match exec_git(&args) {
-        Ok(o) => o,
+    // Migrated from: git rev-list --all
+    // Backend: git2
+    let g2repo = match git2::Repository::open(repo.path()) {
+        Ok(repo) => repo,
         Err(_) => return HashSet::new(),
     };
+    let mut walk = match g2repo.revwalk() {
+        Ok(walk) => walk,
+        Err(_) => return HashSet::new(),
+    };
+    let _ = walk.set_sorting(Sort::TOPOLOGICAL);
 
-    String::from_utf8(output.stdout)
-        .unwrap_or_default()
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    // Match `git rev-list --all` by seeding the walk from every reference we can
+    // resolve to a commit, including namespaced refs such as notes, stash, replace,
+    // and custom refs under `refs/*`. We peel tags to commits and skip refs that
+    // do not ultimately point at a commit.
+    let refs = match g2repo.references() {
+        Ok(refs) => refs,
+        Err(_) => return HashSet::new(),
+    };
+    for reference in refs.flatten() {
+        let Ok(peeled) = reference.peel(ObjectType::Commit) else {
+            continue;
+        };
+        let _ = walk.push(peeled.id());
+    }
+    walk.filter_map(|oid| oid.ok().map(|oid| oid.to_string()))
         .collect()
 }
 
@@ -633,28 +647,23 @@ fn commit_dates_for(repo: &Repository, commit_shas: &[String]) -> HashMap<String
         return HashMap::new();
     }
 
-    let mut args = repo.global_args_for_exec();
-    args.push("show".to_string());
-    args.push("-s".to_string());
-    args.push("--format=%H %ct".to_string());
-    for sha in commit_shas {
-        args.push(sha.clone());
-    }
-
-    let output = match exec_git(&args) {
-        Ok(o) => o,
+    // Migrated from: git show -s --format=%H %ct <sha>...
+    // Backend: git2
+    let g2repo = match git2::Repository::open(repo.path()) {
+        Ok(repo) => repo,
         Err(_) => return HashMap::new(),
     };
-
-    let stdout = String::from_utf8(output.stdout).unwrap_or_default();
     let mut map = HashMap::with_capacity(commit_shas.len());
-    for line in stdout.lines() {
-        let mut parts = line.splitn(2, ' ');
-        if let (Some(sha), Some(ts)) = (parts.next(), parts.next())
-            && let Ok(ts_i) = ts.trim().parse::<i64>()
-        {
-            map.insert(sha.to_string(), ts_i);
-        }
+    for sha in commit_shas {
+        let Ok(oid) = Oid::from_str(sha) else {
+            continue;
+        };
+        let Ok(commit) = g2repo.find_commit(oid) else {
+            continue;
+        };
+        // `%ct` is the committer timestamp, which libgit2 exposes via `commit.time()`.
+        // This is intentionally NOT the author timestamp (`commit.author().when()`).
+        map.insert(sha.clone(), commit.time().seconds());
     }
     map
 }

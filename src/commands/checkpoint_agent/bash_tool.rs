@@ -513,24 +513,15 @@ pub fn normalize_path(p: &Path) -> PathBuf {
 
 /// Resolve the `.git` directory path for a repo (handles worktrees).
 fn get_git_dir(repo_root: &Path) -> Result<PathBuf, GitAiError> {
-    let args = vec![
-        "-C".to_string(),
-        repo_root.to_string_lossy().into_owned(),
-        "rev-parse".to_string(),
-        "--git-dir".to_string(),
-    ];
-    let output = crate::git::repository::exec_git_allow_nonzero(&args)?;
-    if !output.status.success() {
-        return Err(GitAiError::Generic(
-            "git rev-parse --git-dir failed".to_string(),
-        ));
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if Path::new(&s).is_absolute() {
-        Ok(PathBuf::from(s))
-    } else {
-        Ok(repo_root.join(s))
-    }
+    // Migrated from: git -C <repo> rev-parse --git-dir
+    // Backend: gix
+    let repo = gix::discover(repo_root).map_err(|e| GitAiError::GixError(e.to_string()))?;
+    // We intentionally use the discovered repository's worktree-specific git dir here,
+    // not the common dir. For a linked worktree, `git rev-parse --git-dir` points at
+    // `.git/worktrees/<name>`, and the matching index file for this worktree lives there.
+    // Callers of this helper need the current worktree's git dir so `.git/index` and
+    // `ai/bash_snapshots` resolve against the active worktree rather than the shared common dir.
+    Ok(repo.git_dir().to_path_buf())
 }
 
 /// Return the mtime of `.git/index` as nanoseconds since the UNIX epoch.
@@ -538,6 +529,9 @@ fn get_git_dir(repo_root: &Path) -> Result<PathBuf, GitAiError> {
 /// Used as a cold-start watermark proxy when the daemon has no worktree
 /// watermark yet.  Only called when `wm = Some(w)` with `w.worktree = None`,
 /// so passing `wm = None` (tests, non-daemon mode) always bypasses this.
+///
+/// For linked worktrees this intentionally reads the worktree-specific index under
+/// `.git/worktrees/<name>/index`, matching `git rev-parse --git-dir` semantics.
 pub fn git_index_mtime_ns(repo_root: &Path) -> Option<u128> {
     let git_dir = get_git_dir(repo_root).ok()?;
     let index_path = git_dir.join("index");
