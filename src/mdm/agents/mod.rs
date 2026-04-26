@@ -43,6 +43,6 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
         Box::new(DroidInstaller),
         Box::new(FirebenderInstaller),
         Box::new(JetBrainsInstaller),
-        Box::new(WindsurfInstaller),
+        // Box::new(WindsurfInstaller),
     ]
 }
