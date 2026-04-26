@@ -61,6 +61,53 @@ fn create_ai_commit_with_transcript(
     (commit.commit_sha, file_path)
 }
 
+fn create_ai_commit_with_transcript_and_message(
+    repo: &TestRepo,
+    transcript_fixture: &str,
+    final_content: &str,
+    commit_args: &[&str],
+) -> (String, std::path::PathBuf) {
+    let fixture_path_str = fixture_path(transcript_fixture)
+        .to_string_lossy()
+        .to_string();
+
+    let file_path = repo.path().join("test.ts");
+    let base_content = "const x = 1;\n";
+    fs::write(&file_path, base_content).unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    fs::write(&file_path, final_content).unwrap();
+
+    let hook_input = json!({
+        "session_id": "test-session-id-12345",
+        "cwd": repo.canonical_path().to_string_lossy().to_string(),
+        "hook_event_name": "PostToolUse",
+        "model": "claude-3.5-sonnet",
+        "tool_input": {
+            "file_path": file_path.to_string_lossy().to_string()
+        },
+        "transcript_path": fixture_path_str
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "continue-cli", "--hook-input", &hook_input])
+        .expect("checkpoint should succeed");
+    repo.git(&["add", "test.ts"]).expect("add should succeed");
+
+    let mut commit_command = vec!["commit"];
+    commit_command.extend_from_slice(commit_args);
+    repo.git(&commit_command)
+        .expect("custom commit should succeed");
+
+    let commit_sha = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+
+    (commit_sha, file_path)
+}
+
 fn create_external_diff_helper_script(repo: &TestRepo, marker: &str) -> std::path::PathBuf {
     let helper_path = repo.path().join(format!("continue-ext-helper-{marker}.sh"));
     fs::write(&helper_path, format!("#!/bin/sh\necho {marker}\nexit 0\n"))
@@ -238,6 +285,107 @@ fn test_continue_context_includes_source_info() {
     );
 }
 
+#[test]
+fn test_continue_context_includes_full_commit_message_body_when_present() {
+    let repo = TestRepo::new();
+    let (ai_commit_sha, _) = create_ai_commit_with_transcript_and_message(
+        &repo,
+        "continue-cli-session-simple.json",
+        "const x = 1;\nconst y = 2;\nconst z = 3;\nconst body = 4;\n",
+        &[
+            "-m",
+            "Subject line",
+            "-m",
+            "Extended body line 1\n\nExtended body line 2",
+        ],
+    );
+
+    let output = repo
+        .git_ai(&["continue", "--commit", &ai_commit_sha])
+        .expect("continue should succeed for AI-attributed commit with body");
+
+    assert!(
+        output.contains("Subject line"),
+        "output should include the commit subject somewhere in the restored context"
+    );
+    assert!(output.contains("Extended body line 1"), "output should include the first body line");
+    assert!(output.contains("Extended body line 2"), "output should include the second body line");
+}
+
+#[test]
+fn test_continue_context_git_status_matches_branch_and_recent_commits() {
+    let repo = TestRepo::new();
+    let branch = repo.current_branch();
+    let (ai_commit_sha, file_path) =
+        create_ai_commit_with_transcript(&repo, "continue-cli-session-simple.json");
+
+    for idx in 0..5 {
+        fs::write(
+            &file_path,
+            format!("const x = 1;\nconst y = 2;\nconst z = 3;\nconst extra = {};\n", idx),
+        )
+        .expect("should update tracked file");
+        repo.stage_all_and_commit(&format!("extra commit {idx}"))
+            .expect("extra commit should succeed");
+    }
+    let expected_recent = repo
+        .git(&["log", "--oneline", "-5"])
+        .expect("git log --oneline -5 should succeed")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let output = repo
+        .git_ai(&["continue", "--commit", &ai_commit_sha])
+        .expect("continue should succeed for AI commit while repo state has advanced");
+
+    assert!(output.contains(&format!("Current branch: {}", branch)), "git status block should report the current branch");
+    assert!(
+        output.contains("Recent commits") || expected_recent.is_empty(),
+        "git status block should still surface recent commit information when available"
+    );
+    for commit_line in &expected_recent {
+        assert!(
+            output.contains(commit_line),
+            "git status block should include recent commit line `{}`",
+            commit_line
+        );
+    }
+}
+
+#[test]
+fn test_continue_context_git_status_uses_detached_head_current_state() {
+    let repo = TestRepo::new();
+    let (ai_commit_sha, _) =
+        create_ai_commit_with_transcript(&repo, "continue-cli-session-simple.json");
+
+    repo.git(&["checkout", "--detach", &ai_commit_sha])
+        .expect("detach checkout should succeed");
+    let expected_branch = repo
+        .git(&[
+            "branch",
+            "--show-current",
+        ])
+        .expect("branch --show-current should succeed")
+        .trim()
+        .to_string();
+
+    let output = repo
+        .git_ai(&["continue", "--commit", &ai_commit_sha])
+        .expect("continue should succeed while detached");
+
+    assert!(
+        output.contains("Current branch:"),
+        "detached HEAD output should still expose current-branch status"
+    );
+    assert!(
+        output.contains(&expected_branch),
+        "detached HEAD output should match git branch --show-current behavior"
+    );
+}
+
 // ============================================================================
 // Message Filtering Tests (Subtask 12.2)
 // ============================================================================
@@ -331,8 +479,8 @@ fn test_continue_ignores_git_external_diff_env_for_internal_show() {
         output
     );
     assert!(
-        output.contains("diff --git"),
-        "git-ai continue should still include normal patch output, got:\n{}",
+        output.contains("test.ts") && output.contains("const y = 2;") && output.contains("const z = 3;"),
+        "git-ai continue should still include the internal commit diff content even when GIT_EXTERNAL_DIFF is set, got:\n{}",
         output
     );
 }
