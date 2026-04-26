@@ -9,11 +9,19 @@
 //! - Transaction management
 
 use crate::repos::test_repo::TestRepo;
+use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::transcript::{AiTranscript, Message};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+
+fn git_rev_parse(repo: &TestRepo, rev: &str) -> String {
+    repo.git(&["rev-parse", rev])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string()
+}
 
 /// Helper to create a test checkpoint with a transcript
 fn checkpoint_with_message(
@@ -42,6 +50,36 @@ fn checkpoint_with_message(
     let hook_input_str = serde_json::to_string(&hook_input).unwrap();
 
     repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &hook_input_str])
+        .expect("checkpoint should succeed");
+}
+
+fn checkpoint_with_message_and_env(
+    repo: &TestRepo,
+    message: &str,
+    edited_files: Vec<String>,
+    conversation_id: &str,
+    envs: &[(&str, &str)],
+) {
+    let mut transcript = AiTranscript::new();
+    transcript.add_message(Message::user(message.to_string(), None));
+    transcript.add_message(Message::assistant(
+        "I'll help you with that.".to_string(),
+        None,
+    ));
+
+    let hook_input = serde_json::json!({
+        "type": "ai_agent",
+        "repo_working_dir": repo.path().to_str().unwrap(),
+        "edited_filepaths": edited_files,
+        "transcript": transcript,
+        "agent_name": "test-agent",
+        "model": "test-model",
+        "conversation_id": conversation_id,
+    });
+
+    let hook_input_str = serde_json::to_string(&hook_input).unwrap();
+
+    repo.git_ai_with_env(&["checkpoint", "agent-v1", "--hook-input", &hook_input_str], envs)
         .expect("checkpoint should succeed");
 }
 
@@ -119,6 +157,26 @@ fn verify_schema(conn: &Connection) {
             expected_idx
         );
     }
+}
+
+fn single_prompt_id_for_commit(repo: &TestRepo, commit_sha: &str) -> String {
+    let note = repo
+        .read_authorship_note(commit_sha)
+        .expect("commit should have an authorship note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("note should deserialize");
+    let mut prompt_ids: Vec<String> = log.metadata.prompts.keys().cloned().collect();
+    prompt_ids.sort();
+    assert_eq!(
+        prompt_ids.len(),
+        1,
+        "expected exactly one prompt id for commit {commit_sha}, got {prompt_ids:?}"
+    );
+    prompt_ids[0].clone()
+}
+
+fn iso8601_time_from_now(offset_seconds: i64) -> String {
+    let now = chrono::Utc::now() + chrono::Duration::seconds(offset_seconds);
+    now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[test]
@@ -913,6 +971,235 @@ fn test_populate_aggregates_from_git_notes() {
 }
 
 #[test]
+fn test_populate_skips_prompts_for_orphaned_commits() {
+    let mut repo = TestRepo::new_dedicated_daemon();
+
+    repo.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+        patch.prompt_storage = Some("notes".to_string());
+    });
+
+    let readme_path = repo.path().join("README.md");
+    fs::write(&readme_path, "# Test\n").unwrap();
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-m", "initial"]).unwrap();
+    let initial = git_rev_parse(&repo, "HEAD");
+
+    let file_path = repo.path().join("orphan.txt");
+    fs::write(&file_path, "AI content\n").unwrap();
+    checkpoint_with_message(
+        &repo,
+        "Create orphaned prompt",
+        vec!["orphan.txt".to_string()],
+        "conv-orphan",
+    );
+
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-m", "orphaned prompt commit"]).unwrap();
+    let orphaned_commit = git_rev_parse(&repo, "HEAD");
+
+    repo.git(&["reset", "--hard", &initial]).unwrap();
+
+    let reachable_after_reset = repo.git(&["rev-list", "--all"]).unwrap();
+    assert!(
+        !reachable_after_reset.lines().any(|line| line.trim() == orphaned_commit),
+        "orphaned commit should no longer be reachable after reset"
+    );
+
+    repo.git_ai(&["prompts"]).unwrap();
+
+    let prompts_db_path = repo.path().join("prompts.db");
+    let conn = Connection::open(&prompts_db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prompts", [], |row| row.get(0))
+        .unwrap();
+
+    assert_eq!(count, 0, "orphaned prompt notes should be filtered out at populate time");
+}
+
+#[test]
+fn test_populate_keeps_prompts_for_reachable_commits_with_matching_commit_sha() {
+    let mut repo = TestRepo::new_dedicated_daemon();
+
+    repo.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+        patch.prompt_storage = Some("notes".to_string());
+    });
+
+    let readme_path = repo.path().join("README.md");
+    fs::write(&readme_path, "# Test\n").unwrap();
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-m", "initial"]).unwrap();
+
+    let file_path = repo.path().join("reachable.txt");
+    fs::write(&file_path, "AI content\n").unwrap();
+    checkpoint_with_message(
+        &repo,
+        "Create reachable prompt",
+        vec!["reachable.txt".to_string()],
+        "conv-reachable",
+    );
+
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-m", "reachable prompt commit"]).unwrap();
+    let expected_commit = git_rev_parse(&repo, "HEAD");
+
+    repo.git_ai(&["prompts"]).unwrap();
+
+    let prompts_db_path = repo.path().join("prompts.db");
+    let conn = Connection::open(&prompts_db_path).unwrap();
+    let rows: Vec<String> = conn
+        .prepare("SELECT commit_sha FROM prompts ORDER BY seq_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(rows, vec![expected_commit], "reachable prompt rows should retain the reachable commit SHA");
+}
+
+#[test]
+fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_multiple_reachable_notes() {
+    let mut repo = TestRepo::new_dedicated_daemon();
+
+    repo.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+        patch.prompt_storage = Some("notes".to_string());
+    });
+
+    let first_commit_time = iso8601_time_from_now(-10);
+    let second_commit_time = iso8601_time_from_now(-5);
+
+    let readme_path = repo.path().join("README.md");
+    fs::write(&readme_path, "# Test\n").unwrap();
+    repo.git_with_env(
+        &["add", "-A"],
+        &[("GIT_CONFIG_NOSYSTEM", "1")],
+        None,
+    )
+    .unwrap();
+    repo.git_with_env(
+        &["commit", "-m", "initial"],
+        &[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_AUTHOR_DATE", &first_commit_time),
+            ("GIT_COMMITTER_DATE", &first_commit_time),
+        ],
+        None,
+    )
+    .unwrap();
+
+    let prompt_message = "Stable duplicate prompt body";
+
+    let first_path = repo.path().join("first.txt");
+    fs::write(&first_path, "AI content 1\n").unwrap();
+    checkpoint_with_message_and_env(
+        &repo,
+        prompt_message,
+        vec!["first.txt".to_string()],
+        "shared-conv",
+        &[("GIT_CONFIG_NOSYSTEM", "1")],
+    );
+    repo.git_with_env(
+        &["add", "-A"],
+        &[("GIT_CONFIG_NOSYSTEM", "1")],
+        None,
+    )
+    .unwrap();
+    repo.git_with_env(
+        &["commit", "-m", "first prompt commit"],
+        &[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_AUTHOR_DATE", &first_commit_time),
+            ("GIT_COMMITTER_DATE", &first_commit_time),
+        ],
+        None,
+    )
+    .unwrap();
+    let first_commit = git_rev_parse(&repo, "HEAD");
+    let first_id = single_prompt_id_for_commit(&repo, &first_commit);
+
+    let second_path = repo.path().join("second.txt");
+    fs::write(&second_path, "AI content 2\n").unwrap();
+    checkpoint_with_message_and_env(
+        &repo,
+        prompt_message,
+        vec!["second.txt".to_string()],
+        "shared-conv",
+        &[("GIT_CONFIG_NOSYSTEM", "1")],
+    );
+    repo.git_with_env(
+        &["add", "-A"],
+        &[("GIT_CONFIG_NOSYSTEM", "1")],
+        None,
+    )
+    .unwrap();
+    repo.git_with_env(
+        &["commit", "-m", "later plain commit"],
+        &[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_AUTHOR_DATE", &second_commit_time),
+            ("GIT_COMMITTER_DATE", &second_commit_time),
+        ],
+        None,
+    )
+    .unwrap();
+    let second_commit = git_rev_parse(&repo, "HEAD");
+    let second_id = single_prompt_id_for_commit(&repo, &second_commit);
+
+    assert_eq!(
+        second_id, first_id,
+        "test setup must create the same prompt hash on both reachable notes to exercise commit_dates_for selection"
+    );
+
+    repo.git_ai(&["prompts"]).unwrap();
+
+    let prompts_db_path = repo.path().join("prompts.db");
+    let conn = Connection::open(&prompts_db_path).unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, commit_sha FROM prompts ORDER BY seq_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let matching_rows: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|(id, _)| id == &first_id)
+        .collect();
+
+    let expected_latest = repo
+        .git(&[
+            "show",
+            "-s",
+            "--format=%H %ct",
+            &first_commit,
+            &second_commit,
+        ])
+        .expect("git show should succeed")
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            Some((
+                parts.next()?.to_string(),
+                parts.next()?.trim().parse::<i64>().ok()?,
+            ))
+        })
+        .max_by_key(|(_, ts)| *ts)
+        .map(|(sha, _)| sha)
+        .expect("should have latest commit from git show timestamps");
+
+    assert_eq!(matching_rows.len(), 1, "duplicate prompt hash should collapse to a single row in the production prompts path");
+    assert_eq!(
+        matching_rows[0].1,
+        expected_latest,
+        "duplicate prompt hash should keep the newer reachable commit selected using the production commit_dates_for path"
+    );
+}
+
+#[test]
 fn test_prompt_messages_field_contains_transcript() {
     let mut repo = TestRepo::new_dedicated_daemon();
 
@@ -1293,6 +1580,9 @@ crate::reuse_tests_in_worktree!(
     test_database_not_found_error,
     test_upsert_deduplicates_prompts,
     test_populate_aggregates_from_git_notes,
+    test_populate_skips_prompts_for_orphaned_commits,
+    test_populate_keeps_prompts_for_reachable_commits_with_matching_commit_sha,
+    test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_multiple_reachable_notes,
     test_prompt_messages_field_contains_transcript,
     test_accepted_rate_calculation,
     test_timestamp_fields_populated,

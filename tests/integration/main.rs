@@ -56,6 +56,7 @@ mod github_copilot_create_file;
 mod github_copilot_integration;
 mod github_copilot_tools;
 mod github_integration;
+mod low_difficulty_git2_gix_task1;
 mod gix_diff_tree_prototype;
 mod gix_config_tests;
 mod gix_status_index_comprehensive;

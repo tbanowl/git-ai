@@ -8,8 +8,9 @@
 use crate::repos::test_repo::TestRepo;
 use git_ai::commands::checkpoint_agent::bash_tool::{
     Agent, BashCheckpointAction, HookEvent, StatDiffResult, StatEntry, StatFileType, StatSnapshot,
-    ToolClass, build_gitignore, classify_tool, cleanup_stale_snapshots, diff, git_status_fallback,
-    handle_bash_tool, load_and_consume_snapshot, normalize_path, save_snapshot, snapshot,
+    ToolClass, build_gitignore, classify_tool, cleanup_stale_snapshots, diff, git_index_mtime_ns,
+    git_status_fallback, handle_bash_tool, load_and_consume_snapshot, normalize_path,
+    save_snapshot, snapshot,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +44,22 @@ fn add_and_commit(repo: &TestRepo, rel_path: &str, contents: &str, message: &str
 /// Canonical repo root path (resolves /tmp -> /private/tmp on macOS).
 fn repo_root(repo: &TestRepo) -> std::path::PathBuf {
     repo.canonical_path()
+}
+
+fn run_git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {:?} failed:\nstdout: {}\nstderr: {}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 // ===========================================================================
@@ -237,6 +254,98 @@ fn test_bash_tool_empty_repo_no_changes() {
     let result = diff(&pre, &post);
 
     assert!(result.is_empty(), "empty repo diff should be empty");
+}
+
+#[test]
+fn test_git_index_mtime_uses_rev_parse_git_dir_in_regular_repo() {
+    let repo = TestRepo::new();
+    let root = repo_root(&repo);
+
+    add_and_commit(&repo, "mtime.txt", "tracked", "initial");
+
+    let git_dir_raw = run_git_stdout(&root, &["rev-parse", "--git-dir"]);
+    let git_dir = if Path::new(&git_dir_raw).is_absolute() {
+        PathBuf::from(&git_dir_raw)
+    } else {
+        root.join(&git_dir_raw)
+    };
+
+    let mtime = git_index_mtime_ns(&root);
+
+    assert!(mtime.is_some(), "git index mtime should resolve via the regular repo git dir");
+    assert!(git_dir.join("index").exists(), "resolved git dir should contain an index file");
+
+    let snapshot = snapshot(&root, "sess", "regular-git-dir", None).expect("snapshot should succeed");
+    save_snapshot(&snapshot).expect("save_snapshot should succeed");
+    let cache_dir = git_dir.join("ai").join("bash_snapshots");
+    let saved_entries: Vec<_> = fs::read_dir(&cache_dir)
+        .expect("snapshot cache dir should exist")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert!(
+        !saved_entries.is_empty(),
+        "snapshot cache should be created beneath the resolved regular git dir"
+    );
+    let consumed = load_and_consume_snapshot(&root, &snapshot.invocation_key)
+        .expect("load_and_consume_snapshot should succeed");
+    assert!(consumed.is_some(), "saved snapshot should be readable from the resolved regular git dir");
+}
+
+#[test]
+fn test_git_index_mtime_and_snapshot_cache_follow_linked_worktree_git_dir() {
+    let repo = TestRepo::new();
+    add_and_commit(&repo, "worktree-base.txt", "tracked", "initial");
+
+    let worktree_dir = tempfile::tempdir().expect("worktree tempdir should exist");
+    let worktree_path = worktree_dir.path().join("linked");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_str().unwrap(),
+            "HEAD",
+        ])
+        .output()
+        .expect("git worktree add should run");
+    assert!(
+        output.status.success(),
+        "git worktree add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let git_dir_raw = run_git_stdout(&worktree_path, &["rev-parse", "--git-dir"]);
+    let git_dir = if Path::new(&git_dir_raw).is_absolute() {
+        PathBuf::from(&git_dir_raw)
+    } else {
+        worktree_path.join(&git_dir_raw)
+    };
+
+    let mtime = git_index_mtime_ns(&worktree_path);
+
+    assert!(mtime.is_some(), "git index mtime should resolve through linked worktree git-dir indirection");
+    assert!(git_dir.join("index").exists(), "linked worktree git dir should expose a usable index path");
+
+    let snapshot = snapshot(&worktree_path, "sess", "linked-worktree-git-dir", None)
+        .expect("snapshot should succeed in linked worktree");
+    save_snapshot(&snapshot).expect("save_snapshot should succeed in linked worktree");
+    let cache_dir = git_dir.join("ai").join("bash_snapshots");
+    let saved_entries: Vec<_> = fs::read_dir(&cache_dir)
+        .expect("snapshot cache dir should exist")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert!(
+        !saved_entries.is_empty(),
+        "snapshot cache should be created beneath the linked worktree git dir"
+    );
+    let consumed = load_and_consume_snapshot(&worktree_path, &snapshot.invocation_key)
+        .expect("load_and_consume_snapshot should succeed in linked worktree");
+    assert!(consumed.is_some(), "saved snapshot should be readable from the linked worktree git dir");
 }
 
 // ===========================================================================

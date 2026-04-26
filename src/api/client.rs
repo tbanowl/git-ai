@@ -1,9 +1,11 @@
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::GitAiError;
-use crate::git::repository::{exec_git, parse_git_var_identity};
+use crate::git::repository::config_get_str_for_path_no_git_exec;
 use crate::http;
 use once_cell::sync::Lazy;
+use std::env;
+use std::path::Path;
 use std::sync::Mutex;
 use url::Url;
 
@@ -63,20 +65,72 @@ fn try_load_auth_token() -> Option<String> {
 
 /// Resolve the git author identity without requiring a Repository instance.
 ///
-/// Runs `git var GIT_COMMITTER_IDENT` to get the current user's identity,
-/// respecting the full git precedence chain (env vars > config > system defaults).
+/// Produces a formatted committer identity using an in-process approximation of the
+/// config precedence needed by this code path: explicit `GIT_COMMITTER_*` env vars
+/// first, then repo/worktree-aware `user.name` / `user.email` config when inside a
+/// repository, then global config plus environment overrides as a fallback.
+///
+/// This intentionally does not claim to reproduce every `git var GIT_COMMITTER_IDENT`
+/// fallback or synthesized default. It only covers the env/config behavior relied on by
+/// the API client and the Batch 1 behavior tests.
 /// Returns `None` if the identity cannot be determined.
-fn resolve_git_identity() -> Option<String> {
-    let args = vec!["var".to_string(), "GIT_COMMITTER_IDENT".to_string()];
-    if let Ok(output) = exec_git(&args)
-        && let Ok(stdout) = String::from_utf8(output.stdout)
-    {
-        let identity = parse_git_var_identity(&stdout);
-        if let Some(formatted) = identity.formatted() {
-            return Some(formatted);
-        }
+fn format_identity(name: Option<String>, email: Option<String>) -> Option<String> {
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{} <{}>", name.trim(), email.trim())),
+        (Some(name), None) => Some(name.trim().to_string()),
+        (None, Some(email)) => Some(format!("<{}>", email.trim())),
+        (None, None) => None,
     }
-    None
+}
+
+fn resolve_git_identity() -> Option<String> {
+    // Migrated from: git var GIT_COMMITTER_IDENT
+    // Backend: gix
+    let env_name = env::var("GIT_COMMITTER_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let env_email = env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match (env_name, env_email) {
+        (Some(name), Some(email)) => return Some(format!("{} <{}>", name, email)),
+        (Some(name), None) => return Some(name),
+        (None, Some(email)) => return Some(format!("<{}>", email)),
+        (None, None) => {}
+    }
+
+    let repo_name = config_get_str_for_path_no_git_exec(Path::new("."), "user.name")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let repo_email = config_get_str_for_path_no_git_exec(Path::new("."), "user.email")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(formatted) = format_identity(repo_name, repo_email) {
+        return Some(formatted);
+    }
+
+    let config = gix_config::File::from_globals().ok().map(|mut config| {
+        let _ = config.resolve_includes(gix_config::file::init::Options::default());
+        if let Ok(env_overrides) = gix_config::File::from_environment_overrides() {
+            config.append(env_overrides);
+        }
+        config
+    })?;
+    let name = config
+        .string_by("user", None, "name")
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+    let email = config
+        .string_by("user", None, "email")
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+
+    format_identity(name, email)
 }
 
 /// API client context with optional authentication

@@ -3116,6 +3116,203 @@ fn daemon_pure_trace_socket_rebase_with_short_sha_emits_complete_event() {
 
 #[test]
 #[serial]
+fn daemon_ref_update_ancestor_family_distinguishes_equal_ancestor_non_ancestor_and_missing_heads() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(repo.path().join("daemon-ancestor.txt"), "base\n")
+        .expect("failed to write base content");
+    traced_git_with_env(
+        &repo,
+        &["add", "daemon-ancestor.txt"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+    let base = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("resolve base sha")
+        .trim()
+        .to_string();
+
+    fs::write(repo.path().join("daemon-ancestor.txt"), "base\nchild\n")
+        .expect("failed to write child content");
+    traced_git_with_env(
+        &repo,
+        &["add", "daemon-ancestor.txt"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("child add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "child"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("child commit should succeed");
+    let child = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("resolve child sha")
+        .trim()
+        .to_string();
+
+    traced_git_with_env(
+        &repo,
+        &["branch", "side", &base],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("side branch should succeed");
+    traced_git_with_env(
+        &repo,
+        &["branch", "equal-case", &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("equal-case branch should succeed");
+    traced_git_with_env(
+        &repo,
+        &["branch", "ancestor-case", &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ancestor-case branch should succeed");
+    traced_git_with_env(
+        &repo,
+        &["branch", "non-ancestor-case", &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("non-ancestor-case branch should succeed");
+    traced_git_with_env(
+        &repo,
+        &["branch", "missing-case", &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("missing-case branch should succeed");
+    traced_git_with_env(
+        &repo,
+        &["checkout", "side"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("checkout side should succeed");
+    fs::write(repo.path().join("side.txt"), "side\n").expect("failed to write side content");
+    traced_git_with_env(
+        &repo,
+        &["add", "side.txt"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("side add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "side"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("side commit should succeed");
+    let side = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("resolve side sha")
+        .trim()
+        .to_string();
+
+    traced_git_with_env(
+        &repo,
+        &["checkout", "main"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .or_else(|_| {
+        traced_git_with_env(
+            &repo,
+            &["checkout", "master"],
+            &env_refs,
+            &mut expected_top_level_completions,
+        )
+    })
+    .expect("checkout default branch should succeed");
+
+    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_top_level_completions);
+    let baseline_rebase_events = rewrite_event_count(&repo, "\"rebase_complete\"");
+
+    traced_git_with_env(
+        &repo,
+        &["update-ref", "refs/heads/equal-case", &child, &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("equal update-ref should succeed");
+    traced_git_with_env(
+        &repo,
+        &["update-ref", "refs/heads/ancestor-case", &base, &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ancestor update-ref should succeed");
+    traced_git_with_env(
+        &repo,
+        &["update-ref", "refs/heads/non-ancestor-case", &side, &child],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("non-ancestor update-ref should succeed");
+    let missing_update = traced_git_with_env(
+        &repo,
+        &[
+            "update-ref",
+            "refs/heads/missing-case",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            &child,
+        ],
+        &env_refs,
+        &mut expected_top_level_completions,
+    );
+    assert!(
+        missing_update.is_err(),
+        "missing-object update-ref should fail before daemon rewrite synthesis"
+    );
+
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline.saturating_add(expected_top_level_completions - 4),
+        4,
+    );
+    wait_for_rewrite_event_count(&repo, "\"rebase_complete\"", baseline_rebase_events + 1);
+
+    let after_rebase_events = rewrite_event_count(&repo, "\"rebase_complete\"");
+    assert_eq!(
+        after_rebase_events,
+        baseline_rebase_events + 1,
+        "daemon should emit rebase_complete only for the explicit non-ancestor ref update case"
+    );
+
+    let rewrite_log = fs::read_to_string(&rewrite_log_path(&repo))
+        .expect("rewrite log should exist after ancestor family trace frames");
+    assert!(
+        rewrite_log.lines().filter(|line| line.contains("\"rebase_complete\"")).count() == 1,
+        "ancestor family daemon path should synthesize exactly one rebase_complete across equal / ancestor / non-ancestor / missing-object cases, rewrite_log: {}",
+        rewrite_log
+    );
+}
+
+#[test]
+#[serial]
 fn daemon_pure_trace_socket_cherry_pick_with_short_sha_emits_complete_event() {
     let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
     let _daemon = DaemonGuard::start(&repo);

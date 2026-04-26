@@ -4,6 +4,7 @@ use crate::{
     commands::hooks::plumbing_rewrite_hooks::apply_wrapper_plumbing_rewrite_if_possible,
     git::{cli_parser::ParsedGitInvocation, repository::Repository, rewrite_log::ResetKind},
 };
+use git2::{Oid, Repository as Git2Repository};
 
 pub fn pre_reset_hook(parsed_args: &ParsedGitInvocation, repository: &mut Repository) {
     // Get the human author for the checkpoint
@@ -383,13 +384,23 @@ fn resolve_tree_ish_to_commit(
 
 /// Check if 'ancestor' is an ancestor of 'descendant'
 fn is_ancestor(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-
-    crate::git::repository::exec_git(&args).is_ok()
+    // Migrated from: git merge-base --is-ancestor <ancestor> <descendant>
+    // Backend: git2
+    let Ok(g2repo) = Git2Repository::open(repository.path()) else {
+        return false;
+    };
+    let Ok(ancestor_oid) = Oid::from_str(ancestor) else {
+        return false;
+    };
+    let Ok(descendant_oid) = Oid::from_str(descendant) else {
+        return false;
+    };
+    if ancestor_oid == descendant_oid {
+        return true;
+    }
+    g2repo
+        .graph_descendant_of(descendant_oid, ancestor_oid)
+        .unwrap_or(false)
 }
 
 /// Extract the tree-ish argument from git reset command

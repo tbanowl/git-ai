@@ -3,10 +3,12 @@ use crate::commands::hooks::commit_hooks::get_commit_default_author;
 use crate::commands::hooks::plumbing_rewrite_hooks::apply_wrapper_plumbing_rewrite_if_possible;
 use crate::git::cli_parser::ParsedGitInvocation;
 use crate::git::repository::Repository;
+use git2::{Oid, Repository as Git2Repository};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedUpdateRefCommand {
     ref_name: String,
+    no_deref: bool,
 }
 
 pub fn pre_update_ref_hook(
@@ -19,6 +21,12 @@ pub fn pre_update_ref_hook(
     let Some(command) = parse_simple_update_ref(parsed_args) else {
         return;
     };
+    if command.no_deref && command.ref_name == "HEAD" {
+        tracing::debug!(
+            "Skipping update-ref tracking for --no-deref HEAD: symbolic-HEAD-only updates are intentionally left unhandled"
+        );
+        return;
+    }
     if !should_track_ref_update(&command.ref_name) {
         return;
     }
@@ -115,6 +123,7 @@ fn parse_simple_update_ref(parsed_args: &ParsedGitInvocation) -> Option<ParsedUp
 
     let args = &parsed_args.command_args;
     let mut positionals = Vec::new();
+    let mut no_deref = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = &args[i];
@@ -127,7 +136,12 @@ fn parse_simple_update_ref(parsed_args: &ParsedGitInvocation) -> Option<ParsedUp
                 i += 2;
                 continue;
             }
-            "--create-reflog" | "--no-deref" => {
+            "--create-reflog" => {
+                i += 1;
+                continue;
+            }
+            "--no-deref" => {
+                no_deref = true;
                 i += 1;
                 continue;
             }
@@ -146,9 +160,11 @@ fn parse_simple_update_ref(parsed_args: &ParsedGitInvocation) -> Option<ParsedUp
     match positionals.as_slice() {
         [ref_name, _new_oid] => Some(ParsedUpdateRefCommand {
             ref_name: ref_name.clone(),
+            no_deref,
         }),
         [ref_name, _new_oid, _old_oid] => Some(ParsedUpdateRefCommand {
             ref_name: ref_name.clone(),
+            no_deref,
         }),
         _ => None,
     }
@@ -167,12 +183,23 @@ fn resolve_ref_target(repository: &Repository, ref_name: &str) -> Option<String>
 }
 
 fn is_ancestor(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    crate::git::repository::exec_git(&args).is_ok()
+    // Migrated from: git merge-base --is-ancestor <ancestor> <descendant>
+    // Backend: git2
+    let Ok(g2repo) = Git2Repository::open(repository.path()) else {
+        return false;
+    };
+    let Ok(ancestor_oid) = Oid::from_str(ancestor) else {
+        return false;
+    };
+    let Ok(descendant_oid) = Oid::from_str(descendant) else {
+        return false;
+    };
+    if ancestor_oid == descendant_oid {
+        return true;
+    }
+    g2repo
+        .graph_descendant_of(descendant_oid, ancestor_oid)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -189,11 +216,25 @@ mod tests {
         ]);
         let command = parse_simple_update_ref(&parsed).expect("should parse");
         assert_eq!(command.ref_name, "refs/heads/topic");
+        assert!(!command.no_deref);
     }
 
     #[test]
     fn rejects_update_ref_stdin_mode() {
         let parsed = parse_git_cli_args(&["update-ref".to_string(), "--stdin".to_string()]);
         assert!(parse_simple_update_ref(&parsed).is_none());
+    }
+
+    #[test]
+    fn rejects_update_ref_no_deref_head_mode() {
+        let parsed = parse_git_cli_args(&[
+            "update-ref".to_string(),
+            "--no-deref".to_string(),
+            "HEAD".to_string(),
+            "abc123".to_string(),
+        ]);
+        let command = parse_simple_update_ref(&parsed).expect("parser should still recognize simple no-deref form");
+        assert_eq!(command.ref_name, "HEAD");
+        assert!(command.no_deref, "parser should preserve --no-deref so the hook can safely decline handling symbolic HEAD updates");
     }
 }

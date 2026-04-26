@@ -4,6 +4,7 @@ use crate::commands::hooks::commit_hooks::get_commit_default_author;
 use crate::git::cli_parser::{ParsedGitInvocation, is_dry_run};
 use crate::git::repository::Repository;
 use crate::git::rewrite_log::RewriteLogEvent;
+use git2::{ObjectType, Repository as Git2Repository, Sort};
 
 pub fn pre_cherry_pick_hook(
     parsed_args: &ParsedGitInvocation,
@@ -242,7 +243,7 @@ fn parse_cherry_pick_commits(repository: &Repository, args: &[String]) -> Vec<St
         // Skip flags and their values
         if arg.starts_with('-') {
             // Skip option values for flags that take arguments
-            if arg == "-m" || arg == "--mainline" || arg == "-s" || arg == "--strategy" {
+            if arg == "-m" || arg == "--mainline" || arg == "--strategy" {
                 i += 2; // Skip flag and its value
                 continue;
             }
@@ -283,18 +284,23 @@ fn expand_commit_range(
     repository: &Repository,
     range: &str,
 ) -> Result<Vec<String>, crate::error::GitAiError> {
-    // Use git rev-list to expand the range
-    let mut args = repository.global_args_for_exec();
-    args.push("rev-list".to_string());
-    args.push("--reverse".to_string()); // Oldest first
-    args.push(range.to_string());
-
-    let output = crate::git::repository::exec_git(&args)?;
-    let commits = String::from_utf8(output.stdout)?
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Migrated from: git rev-list --reverse <range>
+    // Backend: git2
+    let g2repo = Git2Repository::open(repository.path())
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let mut walk = g2repo
+        .revwalk()
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    walk.set_sorting(Sort::REVERSE)
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    walk.push_range(range)
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let commits = walk
+        .map(|oid| {
+            oid.map(|oid| oid.to_string())
+                .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(commits)
 }
@@ -304,14 +310,17 @@ fn resolve_commit_sha(
     repository: &Repository,
     commit_ref: &str,
 ) -> Result<String, crate::error::GitAiError> {
-    let mut args = repository.global_args_for_exec();
-    args.push("rev-parse".to_string());
-    args.push(commit_ref.to_string());
-
-    let output = crate::git::repository::exec_git(&args)?;
-    let sha = String::from_utf8(output.stdout)?.trim().to_string();
-
-    Ok(sha)
+    // Migrated from: git rev-parse <commit-ref>
+    // Backend: git2
+    let g2repo = Git2Repository::open(repository.path())
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let object = g2repo
+        .revparse_single(commit_ref)
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let commit = object
+        .peel(ObjectType::Commit)
+        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    Ok(commit.id().to_string())
 }
 
 /// Fix #951: Handle cherry-pick --skip by removing the skipped commit from source_commits.
