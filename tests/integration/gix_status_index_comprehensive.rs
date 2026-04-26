@@ -200,6 +200,7 @@ fn gix_status_index_comprehensive_status_post_filter_handles_non_ascii_and_space
     );
 }
 
+#[test]
 fn gix_status_index_comprehensive_status_without_pathspecs_still_reports_pure_unstaged_changes() {
     let repo = TestRepo::new();
 
