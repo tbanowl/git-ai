@@ -1461,10 +1461,8 @@ impl<'a> Iterator for References<'a> {
 
 /// The effective git author identity (name + email) for the current repository.
 ///
-/// Resolved via `git var GIT_COMMITTER_IDENT` which respects the full git precedence
-/// chain (env vars > config > system defaults), unlike a raw `git config user.name`
-/// lookup which can miss identities configured via environment variables or system-level
-/// defaults.
+/// Resolved from `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` (or `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`)
+/// env vars with fallback to `user.name`/`user.email` repo config.
 #[derive(Debug, Clone, Default)]
 pub struct GitAuthorIdentity {
     pub name: Option<String>,
@@ -1545,7 +1543,7 @@ pub struct Repository {
     /// Canonical (absolute, resolved) version of workdir for reliable path comparisons
     /// On Windows, this uses the \\?\ UNC prefix format
     canonical_workdir: PathBuf,
-    /// Cached git author identity resolved via `git var GIT_COMMITTER_IDENT`.
+    /// Cached git author identity resolved from committer env vars with repo config fallback.
     cached_author_identity: std::sync::OnceLock<GitAuthorIdentity>,
     /// Whether this repository is bare (cached from git2 discovery).
     is_bare: bool,
@@ -1821,11 +1819,9 @@ impl Repository {
 
     /// Get the effective git user identity for this repository.
     ///
-    /// Uses `git var GIT_COMMITTER_IDENT` which respects the full git identity precedence:
-    /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars > `user.name`/`user.email` config >
-    /// system defaults.
+    /// Checks `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars first,
+    /// then falls back to `user.name`/`user.email` repo config.
     ///
-    /// Falls back to `git config user.name` / `user.email` if `git var` fails.
     /// The result is cached per Repository instance for performance.
     ///
     /// Use this for "who is the current user" lookups (blame, status, prompts, etc.).
@@ -1837,11 +1833,8 @@ impl Repository {
 
     /// Get the effective git commit author identity for this repository.
     ///
-    /// Uses `git var GIT_AUTHOR_IDENT` which respects:
-    /// `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` env vars > `user.name`/`user.email` config >
-    /// system defaults.
-    ///
-    /// Falls back to `git config user.name` / `user.email` if `git var` fails.
+    /// Checks `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` env vars first,
+    /// then falls back to `user.name`/`user.email` repo config.
     ///
     /// This is the correct method to use when resolving the commit **author** identity
     /// (as opposed to committer), e.g. in commit hooks.
@@ -1849,34 +1842,40 @@ impl Repository {
         self.resolve_git_var_identity("GIT_AUTHOR_IDENT")
     }
 
-    /// Internal: resolve git identity via the specified `git var` variable.
+    /// Internal: resolve git identity from environment variables and config.
+    ///
+    /// Migration note: previously used `git var GIT_COMMITTER_IDENT` /
+    /// `git var GIT_AUTHOR_IDENT` subprocess calls. Replaced with in-process
+    /// env + config resolution to eliminate subprocess overhead.
     fn resolve_git_var_identity(&self, git_var: &str) -> GitAuthorIdentity {
-        let mut args = self.global_args_for_exec();
-        args.push("var".to_string());
-        args.push(git_var.to_string());
+        let (name_env, email_env) = match git_var {
+            "GIT_AUTHOR_IDENT" => ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"),
+            "GIT_COMMITTER_IDENT" => ("GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"),
+            _ => return GitAuthorIdentity::default(),
+        };
 
-        if let Ok(output) = exec_git(&args)
-            && let Ok(stdout) = String::from_utf8(output.stdout)
-        {
-            let identity = parse_git_var_identity(&stdout);
-            if identity.name.is_some() || identity.email.is_some() {
-                return identity;
-            }
-        }
-
-        // Fall back to git config user.name / user.email
-        let name = self
-            .config_get_str("user.name")
+        let name = std::env::var(name_env)
             .ok()
-            .flatten()
             .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
-        let email = self
-            .config_get_str("user.email")
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                self.config_get_str("user.name")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+            });
+        let email = std::env::var(email_env)
             .ok()
-            .flatten()
             .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                self.config_get_str("user.email")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+            });
 
         GitAuthorIdentity { name, email }
     }
@@ -4273,6 +4272,27 @@ mod tests {
         assert_eq!(parse_git_version("not a version"), None);
         assert_eq!(parse_git_version("git version"), None);
         assert_eq!(parse_git_version("git version x.y.z"), None);
+    }
+
+    #[test]
+    fn test_parse_git_var_identity_standard_format() {
+        let parsed = parse_git_var_identity("Taylor Dev <taylor@example.com> 1714118400 +0800\n");
+        assert_eq!(parsed.name.as_deref(), Some("Taylor Dev"));
+        assert_eq!(parsed.email.as_deref(), Some("taylor@example.com"));
+    }
+
+    #[test]
+    fn test_parse_git_var_identity_name_only() {
+        let parsed = parse_git_var_identity("Taylor Dev\n");
+        assert_eq!(parsed.name.as_deref(), Some("Taylor Dev"));
+        assert_eq!(parsed.email, None);
+    }
+
+    #[test]
+    fn test_parse_git_var_identity_empty() {
+        let parsed = parse_git_var_identity("   \n");
+        assert_eq!(parsed.name, None);
+        assert_eq!(parsed.email, None);
     }
 
     #[test]

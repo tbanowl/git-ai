@@ -106,9 +106,8 @@ pub fn get_commit_default_author(repo: &Repository, args: &[String]) -> String {
         return resolved_author.trim().to_string();
     }
 
-    // Use git_commit_author_identity() which resolves via `git var GIT_AUTHOR_IDENT`
-    // (respects full author precedence: GIT_AUTHOR_NAME/EMAIL env > user.name/email config > system defaults)
-    // then falls back to git config user.name/user.email.
+    // Use git_commit_author_identity() which checks `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`
+    // first, then falls back to repo config `user.name`/`user.email`.
     let identity = repo.git_commit_author_identity();
     let mut author_name = identity.name;
     let mut author_email = identity.email;
