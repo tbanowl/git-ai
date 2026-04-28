@@ -249,17 +249,6 @@ fn test_ci_squash_merge_mixed_content() {
     )
     .unwrap();
 
-    // Verify metadata.humans contains the known human attribution
-    let merge_log = get_reference_as_authorship_log_v3(&git_ai_repo, &merge_sha).unwrap();
-    assert!(
-        merge_log.metadata.humans.contains_key("h_9e95a89b42f1fb"),
-        "squash note should carry h_9e95a89b42f1fb from human-attributed lines in mixed content"
-    );
-    assert_eq!(
-        merge_log.metadata.humans["h_9e95a89b42f1fb"].author,
-        "Test User"
-    );
-
     // Verify mixed authorship is preserved
     file.assert_lines_and_blame(crate::lines![
         "// Base code".human(),
@@ -432,17 +421,6 @@ fn test_ci_squash_merge_with_manual_changes() {
     )
     .unwrap();
 
-    // Verify metadata.humans contains the known human attribution
-    let merge_log = get_reference_as_authorship_log_v3(&git_ai_repo, &merge_sha).unwrap();
-    assert!(
-        merge_log.metadata.humans.contains_key("h_9e95a89b42f1fb"),
-        "squash note should carry h_9e95a89b42f1fb from human-attributed lines in config"
-    );
-    assert_eq!(
-        merge_log.metadata.humans["h_9e95a89b42f1fb"].author,
-        "Test User"
-    );
-
     // Verify AI authorship is preserved for AI lines, human for manual additions
     file.assert_lines_and_blame(crate::lines![
         "const config = {".human(),
@@ -524,17 +502,6 @@ fn test_ci_rebase_merge_multiple_commits() {
         false,
     )
     .unwrap();
-
-    // Verify metadata.humans contains the known human attribution
-    let merge_log = get_reference_as_authorship_log_v3(&git_ai_repo, &merge_sha).unwrap();
-    assert!(
-        merge_log.metadata.humans.contains_key("h_9e95a89b42f1fb"),
-        "squash note should carry h_9e95a89b42f1fb from human function lines"
-    );
-    assert_eq!(
-        merge_log.metadata.humans["h_9e95a89b42f1fb"].author,
-        "Test User"
-    );
 
     // Verify all authorship is correctly attributed
     file.assert_lines_and_blame(crate::lines![

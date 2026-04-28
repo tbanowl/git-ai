@@ -1,5 +1,5 @@
 use crate::authorship::attribution_tracker::LineAttribution;
-use crate::authorship::authorship_log::{HumanRecord, PromptRecord};
+use crate::authorship::authorship_log::{PromptRecord};
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::working_log::{CHECKPOINT_API_VERSION, Checkpoint, CheckpointKind};
 use crate::error::GitAiError;
@@ -22,9 +22,6 @@ pub struct InitialAttributions {
     /// Optional blob snapshot of the file content represented by INITIAL.
     #[serde(default)]
     pub file_blobs: HashMap<String, String>,
-    /// Known human records: `h_<hash>` -> HumanRecord
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub humans: std::collections::BTreeMap<String, HumanRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -619,7 +616,7 @@ impl PersistedWorkingLog {
                         touched_files.insert(entry.file);
                     }
                 }
-                CheckpointKind::Human | CheckpointKind::KnownHuman => {
+                CheckpointKind::Human => {
                     // Skip human checkpoints
                 }
             }
@@ -641,7 +638,6 @@ impl PersistedWorkingLog {
             files: attributions,
             prompts,
             file_blobs: HashMap::new(),
-            humans: std::collections::BTreeMap::new(),
         })
     }
 
@@ -650,7 +646,6 @@ impl PersistedWorkingLog {
         &self,
         attributions: HashMap<String, Vec<LineAttribution>>,
         prompts: HashMap<String, PromptRecord>,
-        humans: std::collections::BTreeMap<String, HumanRecord>,
         file_contents: HashMap<String, String>,
     ) -> Result<(), GitAiError> {
         let filtered: HashMap<String, Vec<LineAttribution>> = attributions
@@ -669,7 +664,6 @@ impl PersistedWorkingLog {
             files: filtered,
             prompts,
             file_blobs,
-            humans,
         })
     }
 
@@ -695,7 +689,6 @@ impl PersistedWorkingLog {
             files: filtered_files,
             prompts: initial.prompts,
             file_blobs,
-            humans: initial.humans,
         };
 
         let json = serde_json::to_string_pretty(&initial_data)?;
@@ -1154,7 +1147,6 @@ mod tests {
             .write_initial_attributions_with_contents(
                 attributions,
                 HashMap::new(),
-                std::collections::BTreeMap::new(),
                 contents,
             )
             .expect("write INITIAL with contents");

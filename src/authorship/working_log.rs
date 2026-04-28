@@ -51,7 +51,6 @@ pub enum CheckpointKind {
     Human,
     AiAgent,
     AiTab,
-    KnownHuman,
 }
 
 impl fmt::Display for CheckpointKind {
@@ -68,7 +67,6 @@ impl CheckpointKind {
             "human" => CheckpointKind::Human,
             "ai_agent" => CheckpointKind::AiAgent,
             "ai_tab" => CheckpointKind::AiTab,
-            "known_human" => CheckpointKind::KnownHuman,
             _ => panic!("Invalid checkpoint kind: {}", s),
         }
     }
@@ -79,7 +77,6 @@ impl CheckpointKind {
             CheckpointKind::Human => "human".to_string(),
             CheckpointKind::AiAgent => "ai_agent".to_string(),
             CheckpointKind::AiTab => "ai_tab".to_string(),
-            CheckpointKind::KnownHuman => "known_human".to_string(),
         }
     }
 
@@ -92,14 +89,6 @@ impl CheckpointKind {
     pub fn serde_default() -> Self {
         CheckpointKind::Human
     }
-}
-
-/// Metadata stored for KnownHuman checkpoints, identifying the IDE that fired the save event
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KnownHumanMetadata {
-    pub editor: String,            // e.g. "vscode"
-    pub editor_version: String,    // e.g. "1.85.0"
-    pub extension_version: String, // e.g. "0.4.1"
 }
 
 /// Line-level statistics tracked per checkpoint kind
@@ -134,8 +123,6 @@ pub struct Checkpoint {
     pub api_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ai_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub known_human_metadata: Option<KnownHumanMetadata>,
 }
 
 impl Checkpoint {
@@ -162,7 +149,6 @@ impl Checkpoint {
             line_stats: CheckpointLineStats::default(),
             api_version: CHECKPOINT_API_VERSION.to_string(),
             git_ai_version: Some(GIT_AI_VERSION.to_string()),
-            known_human_metadata: None,
         }
     }
 }
@@ -326,52 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_kind_known_human_roundtrip() {
-        let kind = CheckpointKind::KnownHuman;
-        assert_eq!(kind.to_str(), "known_human");
-        assert_eq!(
-            CheckpointKind::from_str("known_human"),
-            CheckpointKind::KnownHuman
-        );
-        // Serde round-trip
-        let json = serde_json::to_string(&kind).unwrap();
-        let back: CheckpointKind = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, CheckpointKind::KnownHuman);
-    }
-
-    #[test]
-    fn test_is_ai_returns_false_for_human_kinds() {
-        assert!(!CheckpointKind::Human.is_ai());
-        assert!(!CheckpointKind::KnownHuman.is_ai());
-    }
-
-    #[test]
     fn test_is_ai_returns_true_for_ai_kinds() {
         assert!(CheckpointKind::AiAgent.is_ai());
         assert!(CheckpointKind::AiTab.is_ai());
-    }
-
-    #[test]
-    fn test_checkpoint_with_known_human_metadata_roundtrip() {
-        use crate::authorship::working_log::{Checkpoint, KnownHumanMetadata};
-        let mut checkpoint = Checkpoint::new(
-            CheckpointKind::KnownHuman,
-            "diff".to_string(),
-            "Alice <alice@example.com>".to_string(),
-            vec![],
-        );
-        checkpoint.known_human_metadata = Some(KnownHumanMetadata {
-            editor: "vscode".to_string(),
-            editor_version: "1.85.0".to_string(),
-            extension_version: "0.4.1".to_string(),
-        });
-        // Serde round-trip
-        let json = serde_json::to_string(&checkpoint).unwrap();
-        let back: Checkpoint = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind, CheckpointKind::KnownHuman);
-        let meta = back.known_human_metadata.unwrap();
-        assert_eq!(meta.editor, "vscode");
-        assert_eq!(meta.editor_version, "1.85.0");
-        assert_eq!(meta.extension_version, "0.4.1");
     }
 }
