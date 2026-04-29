@@ -291,7 +291,6 @@ pub fn post_commit_with_final_state(
         new_working_log.write_initial_attributions_with_contents(
             initial_attributions.files,
             initial_attributions.prompts,
-            initial_attributions.humans,
             initial_file_contents,
         )?;
     }

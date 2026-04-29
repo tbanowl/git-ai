@@ -27,6 +27,5 @@ AuthorshipLogV3 {
                 custom_attributes: None,
             },
         },
-        humans: {},
     },
 }
