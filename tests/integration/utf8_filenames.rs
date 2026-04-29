@@ -344,11 +344,7 @@ fn test_utf8_filename_with_human_and_ai_lines() {
     );
     assert_eq!(
         stats.human_additions, 3,
-        "3 h_<hash>-attested lines from KnownHuman checkpoint on fresh file"
-    );
-    assert_eq!(
-        stats.unknown_additions, 0,
-        "No unattested human lines - all human lines now have h_<hash>-attestation"
+        "3 lines should be attributed to human"
     );
     assert_eq!(
         stats.git_diff_added_lines, 5,

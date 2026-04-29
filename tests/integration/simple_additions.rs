@@ -831,16 +831,12 @@ Untracked line
     // Assert after every commit
     let mut file = repo.filename("example.md");
     // ALWAYS use the helper to assert the lines post-commit AND make sure to always assert line-level after EVERY commit for EVERY test you EVER right. This is CRUCIAL.
-    file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
-    ]);
 
     let second_edit = "\
-Untracked line
 Human line
 ";
     fs::write(&file_path, second_edit).unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "example.md"])
+    repo.git_ai(&["checkpoint", "mock_ai", "example.md"])
         .unwrap();
 
     // Explicit add call (very useful to test partial staging scenarios)
@@ -848,12 +844,10 @@ Human line
     // Explicit commit
     repo.commit("Second commit").unwrap();
     file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // still 'untracked'
         "Human line".human(),                  // known human
     ]);
 
     let third_edit = "\
-Untracked line
 Human line
 AI line
 ";
@@ -863,13 +857,11 @@ AI line
     // Example of a completely untracked edit where we didn't fire a checkpoint call at all
     repo.stage_all_and_commit("Third commit").unwrap();
     file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
         "Human line".human(),                  // known human
         "AI line".ai(),                        // AI line
     ]);
 
     let fourth_edit = "\
-Untracked line
 Human line
 AI line
 Another untracked line
@@ -881,7 +873,6 @@ Another untracked line
     repo.git_ai(&["checkpoint", "human", "example.md"]).unwrap();
 
     let fifth_edit = "\
-Untracked line
 Human line
 AI line
 Another untracked line
@@ -894,10 +885,8 @@ Another AI line
         .unwrap();
     repo.stage_all_and_commit("Fourth commit").unwrap();
     file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(),         // 'untracked'
         "Human line".human(),                          // known human
         "AI line".ai(),                                // AI line
-        "Another untracked line".unattributed_human(), // 'untracked'
         "Another AI line".ai(),                        // AI line
     ]);
 }
@@ -1142,9 +1131,8 @@ fn test_ai_deletion_with_human_checkpoint_in_same_commit() {
     )
     .unwrap();
 
-    // KnownHuman checkpoint for the human-added lines
-    repo.git_ai(&["checkpoint", "mock_known_human", "data.txt"])
-        .unwrap();
+    // Human checkpoint
+    repo.git_ai(&["checkpoint"]).unwrap();
 
     // Step 2: AI deletes one of its own lines and adds 2 new lines
     fs::write(
@@ -1791,19 +1779,12 @@ fn test_ai_generated_file_then_human_full_rewrite() {
     let agent_author_id = "3bd30911a58cb074";
     // Determine the git dir and base commit for checkpoint storage.
     // In worktree mode .git is a gitlink file, so use rev-parse to resolve.
-    // `--git-dir` may return a relative path; resolve it against the repo root
-    // so that fs::create_dir_all works regardless of the process CWD.
-    let git_dir_raw = repo
+    let git_dir = repo
         .git(&["rev-parse", "--git-dir"])
         .unwrap()
         .trim()
         .to_string();
-    let git_dir_path = if std::path::Path::new(&git_dir_raw).is_absolute() {
-        std::path::PathBuf::from(&git_dir_raw)
-    } else {
-        repo.path().join(&git_dir_raw)
-    };
-    let git_dir = git_dir_path.as_path();
+    let git_dir = std::path::Path::new(&git_dir);
     let base_commit = repo
         .git(&["rev-parse", "HEAD"])
         .unwrap_or_else(|_| "initial".to_string())

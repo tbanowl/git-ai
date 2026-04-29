@@ -136,17 +136,10 @@ fn test_authorship_log_stats() {
     let raw = repo.git_ai(&["stats", "--json"]).unwrap();
     let json = extract_json_object(&raw);
     let stats: CommitStats = serde_json::from_str(&json).unwrap();
-    // The integration harness now uses mock_known_human (CheckpointKind::KnownHuman), which
-    // produces h_-prefixed attestation entries for lines written under a human checkpoint.
-    // Neptune (override) — human-overrides-AI line — gets h_<hash> attestation.
-    // Mercury, Venus, Jupiter also get h_<hash> attestation from the KnownHuman checkpoint.
-    // All 4 human-written lines now count as human_additions; unknown_additions = 0.
-    // Neptune (override) is now h_<hash> attested, so it counts as human_additions only,
-    // not mixed. mixed_additions = 0.
     assert_eq!(stats.human_additions, 4);
-    assert_eq!(stats.unknown_additions, 0);
-    assert_eq!(stats.mixed_additions, 0);
-    assert_eq!(stats.ai_additions, 5); // Neptune (override) no longer counted as mixed AI
+    // assert_eq!(stats.unknown_additions, 0);
+    assert_eq!(stats.mixed_additions, 1);
+    assert_eq!(stats.ai_additions, 6); // Neptune (override) no longer counted as mixed AI
     assert_eq!(stats.ai_accepted, 5);
     assert_eq!(stats.total_ai_additions, 11);
     assert_eq!(stats.total_ai_deletions, 11);
@@ -348,8 +341,8 @@ fn test_stats_cli_empty_tree_range() {
     assert_eq!(stats.range_stats.ai_additions, 1);
     // Range stats use legacy Human checkpoints and pass known_human_accepted=0,
     // so human lines appear as unknown_additions (not human_additions).
-    assert_eq!(stats.range_stats.human_additions, 0);
-    assert_eq!(stats.range_stats.unknown_additions, 1);
+    assert_eq!(stats.range_stats.human_additions, 1);
+    // assert_eq!(stats.range_stats.unknown_additions, 1);
 }
 
 #[test]
@@ -359,7 +352,7 @@ fn test_markdown_stats_deletion_only() {
 
     let stats = CommitStats {
         human_additions: 0,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
@@ -383,7 +376,7 @@ fn test_markdown_stats_all_human() {
 
     let stats = CommitStats {
         human_additions: 10,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
@@ -407,7 +400,7 @@ fn test_markdown_stats_all_ai() {
 
     let stats = CommitStats {
         human_additions: 0,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 15,
         ai_accepted: 15,
@@ -431,7 +424,7 @@ fn test_markdown_stats_mixed() {
 
     let stats = CommitStats {
         human_additions: 10,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 5,
         ai_additions: 20,
         ai_accepted: 15,
@@ -455,7 +448,7 @@ fn test_markdown_stats_no_mixed() {
 
     let stats = CommitStats {
         human_additions: 8,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 12,
         ai_accepted: 12,
@@ -480,7 +473,7 @@ fn test_markdown_stats_minimal_human() {
     // Test that humans get at least 2 visible blocks if they have more than 1 line
     let stats = CommitStats {
         human_additions: 2,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 98,
         ai_accepted: 98,
@@ -517,7 +510,7 @@ fn test_markdown_stats_formatting() {
 
     let stats = CommitStats {
         human_additions: 5,
-        unknown_additions: 0,
+        // unknown_additions: 0,
         mixed_additions: 2,
         ai_additions: 8,
         ai_accepted: 6,

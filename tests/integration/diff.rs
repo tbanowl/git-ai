@@ -357,11 +357,6 @@ fn checkpoint_human(repo: &TestRepo) {
         .expect("human checkpoint should succeed");
 }
 
-fn checkpoint_known_human(repo: &TestRepo, file_path: &str) {
-    repo.git_ai(&["checkpoint", "mock_known_human", file_path])
-        .expect("known human checkpoint should succeed");
-}
-
 fn commit_after_staging_all(repo: &TestRepo, message: &str) -> NewCommit {
     repo.git(&["add", "-A"]).expect("git add should succeed");
     repo.commit(message).expect("commit should succeed")
@@ -1352,8 +1347,7 @@ fn test_diff_json_include_stats_exact_multi_model_with_non_landing_prompt() {
             "codex-b2",
         ],
     );
-    checkpoint_known_human(&repo, "multi_model_stats.txt");
-
+    checkpoint_human(&repo);
     let commit = commit_after_staging_all(&repo, "multi model stats target");
     let diff = diff_json(
         &repo,
@@ -1433,7 +1427,7 @@ fn test_diff_json_include_stats_exact_human_landed_with_ai_generated() {
         "human_landed_stats.txt",
         &["base", "human-final-1", "human-final-2"],
     );
-    checkpoint_known_human(&repo, "human_landed_stats.txt");
+    checkpoint_human(&repo);
 
     let commit = commit_after_staging_all(&repo, "human landed target");
     let diff = diff_json(
@@ -2782,7 +2776,7 @@ fn test_diff_visual_output_shows_human_author_name_not_id() {
         "human_author.txt",
         &["line1", "line2", "line3", "line4"],
     );
-    checkpoint_known_human(&repo, "human_author.txt");
+    checkpoint_human(&repo);
     let commit = commit_after_staging_all(&repo, "human changes");
 
     // Get visual diff output (not JSON)
@@ -2846,7 +2840,7 @@ fn test_diff_json_output_includes_human_id_in_hunks() {
         "human_json.txt",
         &["base1", "base2", "human1", "human2"],
     );
-    checkpoint_known_human(&repo, "human_json.txt");
+    checkpoint_human(&repo);
     let commit = commit_after_staging_all(&repo, "human additions");
 
     // Get JSON diff output
@@ -2930,7 +2924,7 @@ fn test_diff_json_humans_map_complete_across_multiple_commits() {
         "multi_human.txt",
         &["line1", "human_a_1", "human_a_2"],
     );
-    checkpoint_known_human(&repo, "multi_human.txt");
+    checkpoint_human(&repo);
     let _commit1 = commit_after_staging_all(&repo, "first human");
 
     // Commit 2: Second human author (creates a different h_ ID)
@@ -2939,7 +2933,7 @@ fn test_diff_json_humans_map_complete_across_multiple_commits() {
         "multi_human.txt",
         &["line1", "human_a_1", "human_a_2", "human_b_1", "human_b_2"],
     );
-    checkpoint_known_human(&repo, "multi_human.txt");
+    checkpoint_human(&repo);
     let commit2 = commit_after_staging_all(&repo, "second human");
 
     // Get JSON diff for commit2 (which includes lines from both human checkpoints)

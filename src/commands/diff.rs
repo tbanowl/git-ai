@@ -2245,7 +2245,7 @@ mod tests {
         assert_eq!(format_attribution(&attr), "👤alice");
 
         let attr = Attribution::Human("bob@example.com".to_string());
-        assert_eq!(format_attribution(&attr), "👤bob@example.com");;
+        assert_eq!(format_attribution(&attr), "👤bob@example.com");
     }
 
     #[test]
