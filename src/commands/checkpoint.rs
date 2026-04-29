@@ -2,7 +2,7 @@ use crate::authorship::attribution_tracker::{
     Attribution, AttributionTracker, INITIAL_ATTRIBUTION_TS, LineAttribution,
 };
 use crate::authorship::authorship_log::PromptRecord;
-use crate::authorship::authorship_log_serialization::generate_short_hash;
+use crate::authorship::authorship_log_serialization::{AuthorshipLog, generate_short_hash};
 use crate::authorship::ignore::{
     IgnoreMatcher, build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
@@ -1585,6 +1585,44 @@ fn content_eq_normalized(a: &str, b: &str) -> bool {
     normalize_line_endings(a) == normalize_line_endings(b)
 }
 
+fn line_ranges_to_line_attributions(
+    authorship_log: &AuthorshipLog,
+    file_path: &str,
+) -> Vec<LineAttribution> {
+    let Some(file_attestation) = authorship_log
+        .attestations
+        .iter()
+        .find(|attestation| attestation.file_path == file_path)
+    else {
+        return Vec::new();
+    };
+
+    let mut line_attributions = Vec::new();
+    for entry in &file_attestation.entries {
+        for range in &entry.line_ranges {
+            match range {
+                crate::authorship::authorship_log::LineRange::Single(line) => {
+                    line_attributions.push(LineAttribution {
+                        start_line: *line,
+                        end_line: *line,
+                        author_id: entry.hash.clone(),
+                        overrode: None,
+                    });
+                }
+                crate::authorship::authorship_log::LineRange::Range(start, end) => {
+                    line_attributions.push(LineAttribution {
+                        start_line: *start,
+                        end_line: *end,
+                        author_id: entry.hash.clone(),
+                        overrode: None,
+                    });
+                }
+            }
+        }
+    }
+    line_attributions
+}
+
 fn working_log_entry_has_non_human_attribution(entry: &WorkingLogEntry) -> bool {
     entry
         .line_attributions
@@ -1635,6 +1673,7 @@ fn get_checkpoint_entry_for_file(
     file_content_hash: String,
     author_id: Arc<String>,
     head_commit_sha: Arc<Option<String>>,
+    head_authorship_log: Arc<Option<AuthorshipLog>>,
     head_tree_id: Arc<Option<String>>,
     initial_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     initial_snapshot_contents: Arc<HashMap<String, String>>,
@@ -1652,10 +1691,23 @@ fn get_checkpoint_entry_for_file(
     let previous_state = previous_file_state_by_file.get(&file_path).cloned();
     let has_prior_ai_edits = ai_touched_files.contains(&file_path);
 
+    let head_line_attributions = head_authorship_log
+        .as_ref()
+        .as_ref()
+        .map(|log| line_ranges_to_line_attributions(log, &file_path))
+        .unwrap_or_default();
+    let has_head_ai_attribution =
+        kind == CheckpointKind::Human && !head_line_attributions.is_empty();
+
     // Pre-commit fast path:
     // If this file has no prior AI attribution and no INITIAL attribution,
     // we can skip it entirely. Human-only files do not affect AI authorship.
-    if is_pre_commit && !kind.is_ai() && !has_prior_ai_edits && initial_attrs_for_file.is_empty() {
+    if is_pre_commit
+        && !kind.is_ai()
+        && !has_prior_ai_edits
+        && initial_attrs_for_file.is_empty()
+        && !has_head_ai_attribution
+    {
         return Ok(None);
     }
 
@@ -1666,7 +1718,11 @@ fn get_checkpoint_entry_for_file(
     // Non-pre-commit fast path:
     // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
     // attribution-empty entry while still capturing line stats.
-    if kind == CheckpointKind::Human && !has_prior_ai_edits && initial_attrs_for_file.is_empty() {
+    if kind == CheckpointKind::Human
+        && !has_prior_ai_edits
+        && initial_attrs_for_file.is_empty()
+        && !has_head_ai_attribution
+    {
         let previous_content = if let Some(state) = previous_state.as_ref() {
             working_log
                 .get_file_version(&state.blob_sha)
@@ -1720,6 +1776,9 @@ fn get_checkpoint_entry_for_file(
 
         // Start with INITIAL attributions (they win)
         let mut prev_line_attributions = initial_attrs_for_file.clone();
+        if initial_attrs_for_file.is_empty() {
+            prev_line_attributions.extend(head_line_attributions.clone());
+        }
         let mut blamed_lines: HashSet<u32> = HashSet::new();
 
         // Get blame for lines not in INITIAL
@@ -1941,6 +2000,13 @@ async fn get_checkpoint_entries(
                 .and_then(|oid| repo.find_commit(oid).ok())
         });
     let head_commit_sha = head_commit.as_ref().map(|c| c.id().to_string());
+    let head_authorship_log = if kind == CheckpointKind::Human {
+        head_commit_sha
+            .as_deref()
+            .and_then(|commit_sha| crate::git::refs::get_authorship(repo, commit_sha))
+    } else {
+        None
+    };
     let head_tree_id = head_commit
         .as_ref()
         .and_then(|c| c.tree().ok())
@@ -1956,6 +2022,7 @@ async fn get_checkpoint_entries(
     let ai_touched_files = Arc::new(ai_touched_files);
     let author_id = Arc::new(author_id);
     let head_commit_sha = Arc::new(head_commit_sha);
+    let head_authorship_log = Arc::new(head_authorship_log);
     let head_tree_id = Arc::new(head_tree_id);
     let initial_attributions = Arc::new(initial_attributions);
     let initial_snapshot_contents = Arc::new(initial_snapshot_contents);
@@ -1972,6 +2039,7 @@ async fn get_checkpoint_entries(
         let ai_touched_files = Arc::clone(&ai_touched_files);
         let author_id = Arc::clone(&author_id);
         let head_commit_sha = Arc::clone(&head_commit_sha);
+        let head_authorship_log = Arc::clone(&head_authorship_log);
         let head_tree_id = Arc::clone(&head_tree_id);
         let blob_sha = file_content_hashes
             .get(&file_path)
@@ -1998,6 +2066,7 @@ async fn get_checkpoint_entries(
                     blob_sha,
                     author_id.clone(),
                     head_commit_sha.clone(),
+                    head_authorship_log.clone(),
                     head_tree_id.clone(),
                     initial_attributions.clone(),
                     initial_snapshot_contents.clone(),

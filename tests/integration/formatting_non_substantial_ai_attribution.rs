@@ -437,6 +437,66 @@ fn test_ai_edits_around_large_human_section_preserves_human_attribution() {
     ]);
 }
 
+#[test]
+fn test_human_trailing_space_on_uncommitted_ai_line_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_uncommitted.rs");
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_uncommitted.rs"])
+        .unwrap();
+
+    std::fs::write(&file_path, "let value = compute();   \n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "edge_uncommitted.rs"])
+        .unwrap();
+
+    repo.stage_all_and_commit("Commit AI line with human trailing whitespace")
+        .unwrap();
+
+    let mut file = repo.filename("edge_uncommitted.rs");
+    file.assert_lines_and_blame(crate::lines!["let value = compute();   ".ai()]);
+}
+
+#[test]
+fn test_human_edge_spaces_on_committed_ai_line_keeps_ai_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_committed.rs");
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_committed.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "\tlet value = compute();   \n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "edge_committed.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Human adds edge whitespace")
+        .unwrap();
+
+    let mut file = repo.filename("edge_committed.rs");
+    file.assert_lines_and_blame(crate::lines!["\tlet value = compute();   ".ai()]);
+}
+
+#[test]
+fn test_human_token_change_on_ai_line_reclaims_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("token_change.rs");
+
+    std::fs::write(&file_path, "let x = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "token_change.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "token_change.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Human changes token content")
+        .unwrap();
+
+    let mut file = repo.filename("token_change.rs");
+    file.assert_lines_and_blame(crate::lines!["let value = compute();".human()]);
+}
+
 crate::reuse_tests_in_worktree!(
     test_ai_reflow_human_single_line_call_is_fully_ai,
     test_ai_indentation_only_change_on_human_block_attributes_touched_line_to_ai,
@@ -452,4 +512,7 @@ crate::reuse_tests_in_worktree!(
     test_ai_rewrites_table_reformatted_lines_all_attributed_to_ai,
     test_ai_rewrite_with_byte_identical_line_in_gap,
     test_ai_edits_around_large_human_section_preserves_human_attribution,
+    test_human_trailing_space_on_uncommitted_ai_line_keeps_ai_attribution,
+    test_human_edge_spaces_on_committed_ai_line_keeps_ai_attribution,
+    test_human_token_change_on_ai_line_reclaims_attribution,
 );
