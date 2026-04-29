@@ -1,3 +1,4 @@
+use crate::api::types::AuthorshipNotesListItem;
 use crate::git::refs::{
     AI_AUTHORSHIP_PUSH_REFSPEC, CommitAuthorship, copy_ref, fallback_merge_notes_ours,
     get_commits_with_notes_from_list, merge_notes_from_ref, note_blob_oids_for_commits,
@@ -10,9 +11,230 @@ use crate::{
     git::{cli_parser::ParsedGitInvocation, repository::exec_git},
     repo_url::normalize_repo_url,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::repository::Repository;
+
+const REST_NOTES_SYNC_STATE_SCHEMA_VERSION: u32 = 1;
+const REST_NOTES_SYNC_LIST_LIMIT: usize = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestNotesSyncState {
+    pub schema_version: u32,
+    pub repo_url: String,
+    pub last_change_seq: i64,
+    pub updated_at: i64,
+}
+
+pub fn sha256_note_content(content: &str) -> String {
+    sha256_bytes(content.as_bytes())
+}
+
+fn sha256_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn normalize_content_hash(hash: &str) -> Result<String, GitAiError> {
+    let hex = match hash.find(':') {
+        Some(colon_pos) => {
+            let prefix = &hash[..colon_pos];
+            let body = &hash[colon_pos + 1..];
+            if prefix.eq_ignore_ascii_case("sha256") {
+                body
+            } else {
+                return Err(GitAiError::Generic(format!(
+                    "Unsupported hash algorithm in '{}', expected sha256",
+                    hash
+                )));
+            }
+        }
+        None => hash,
+    };
+
+    let lowered = hex.to_ascii_lowercase();
+    if lowered.len() == 64 && lowered.chars().all(|c: char| c.is_ascii_hexdigit()) {
+        Ok(lowered)
+    } else {
+        Err(GitAiError::Generic(format!(
+            "Invalid content hash (expected 64-char hex, got '{}')",
+            hash
+        )))
+    }
+}
+
+pub fn rest_notes_repo_key(repo_url: &str) -> Result<String, GitAiError> {
+    let normalized = normalize_repo_url(repo_url).map_err(|e| {
+        GitAiError::Generic(format!("Cannot normalize repo URL '{}': {}", repo_url, e))
+    })?;
+    Ok(sha256_note_content(&normalized))
+}
+
+pub fn rest_notes_sync_state_path(git_dir: &Path, repo_url: &str) -> Result<PathBuf, GitAiError> {
+    let key = rest_notes_repo_key(repo_url)?;
+    Ok(git_dir
+        .join("ai")
+        .join("rest_notes_sync_state")
+        .join(format!("{}.json", key.replace(['/', ':'], "_"))))
+}
+
+pub fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+pub fn default_rest_notes_sync_state(repo_url: &str) -> RestNotesSyncState {
+    RestNotesSyncState {
+        schema_version: REST_NOTES_SYNC_STATE_SCHEMA_VERSION,
+        repo_url: repo_url.to_string(),
+        last_change_seq: 0,
+        updated_at: 0,
+    }
+}
+
+pub fn read_rest_notes_sync_state(
+    git_dir: &Path,
+    repo_url: &str,
+) -> Result<RestNotesSyncState, GitAiError> {
+    let normalized = normalize_repo_url(repo_url).map_err(|e| {
+        GitAiError::Generic(format!("Cannot normalize repo URL '{}': {}", repo_url, e))
+    })?;
+    let path = rest_notes_sync_state_path(git_dir, repo_url)?;
+
+    if !path.exists() {
+        return Ok(default_rest_notes_sync_state(&normalized));
+    }
+
+    let data = std::fs::read_to_string(&path)?;
+    let state: RestNotesSyncState = serde_json::from_str(&data)?;
+
+    if state.repo_url != normalized || state.schema_version != REST_NOTES_SYNC_STATE_SCHEMA_VERSION
+    {
+        return Ok(default_rest_notes_sync_state(&normalized));
+    }
+
+    Ok(state)
+}
+
+pub fn write_rest_notes_sync_state(
+    git_dir: &Path,
+    repo_url: &str,
+    new_last_change_seq: i64,
+) -> Result<(), GitAiError> {
+    let normalized = normalize_repo_url(repo_url).map_err(|e| {
+        GitAiError::Generic(format!("Cannot normalize repo URL '{}': {}", repo_url, e))
+    })?;
+    let path = rest_notes_sync_state_path(git_dir, repo_url)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let _lock = StateFileLock::acquire(&path)?;
+
+    let effective_watermark = compute_watermark(&path, &normalized, new_last_change_seq)?;
+
+    let tmp_path = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        current_time_millis()
+    ));
+
+    let state = RestNotesSyncState {
+        schema_version: REST_NOTES_SYNC_STATE_SCHEMA_VERSION,
+        repo_url: normalized,
+        last_change_seq: effective_watermark,
+        updated_at: current_time_millis(),
+    };
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        let json = serde_json::to_string_pretty(&state)?;
+        file.write_all(json.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, &path)?;
+
+    Ok(())
+}
+
+fn compute_watermark(
+    path: &Path,
+    normalized_url: &str,
+    requested_seq: i64,
+) -> Result<i64, GitAiError> {
+    if !path.exists() {
+        return Ok(requested_seq);
+    }
+    let data = std::fs::read_to_string(path)?;
+    let state: RestNotesSyncState = serde_json::from_str(&data)?;
+    if state.repo_url == normalized_url
+        && state.schema_version == REST_NOTES_SYNC_STATE_SCHEMA_VERSION
+    {
+        Ok(state.last_change_seq.max(requested_seq))
+    } else {
+        Ok(requested_seq)
+    }
+}
+
+struct StateFileLock {
+    lock_path: PathBuf,
+}
+
+impl StateFileLock {
+    fn acquire(state_path: &Path) -> Result<Self, GitAiError> {
+        let lock_path = state_path.with_extension("json.lock");
+        let parent = lock_path.parent().ok_or_else(|| {
+            GitAiError::Generic("State file path has no parent directory".to_string())
+        })?;
+        std::fs::create_dir_all(parent)?;
+
+        let max_attempts = 50;
+        let sleep_duration = Duration::from_millis(20);
+        let mut last_err = None;
+
+        for _ in 0..max_attempts {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_file) => return Ok(Self { lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    std::thread::sleep(sleep_duration);
+                }
+                Err(e) => {
+                    return Err(GitAiError::IoError(e));
+                }
+            }
+        }
+
+        Err(GitAiError::Generic(format!(
+            "Timed out acquiring lock on {} (held by another process): {}",
+            lock_path.display(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+}
+
+impl Drop for StateFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
 
 #[cfg(windows)]
 fn disabled_hooks_config() -> &'static str {
@@ -556,11 +778,214 @@ fn rest_fetch_authorship_notes(
     api: &ApiClient,
     repo_url: &str,
 ) -> Result<NotesExistence, GitAiError> {
+    let state = read_rest_notes_sync_state(repository.common_dir(), repo_url)?;
+    let mut since_change_seq = state.last_change_seq;
+    let mut final_change_seq;
+    let mut saw_remote_note = false;
+
+    loop {
+        let list_response =
+            api.authorship_notes_list(&crate::api::types::AuthorshipNotesListRequest {
+                repo_url: repo_url.to_string(),
+                since_commit_time: None,
+                since_change_seq: Some(since_change_seq),
+                limit: Some(REST_NOTES_SYNC_LIST_LIMIT),
+            })?;
+
+        let Some(items) = list_response.data.items else {
+            return rest_fetch_authorship_notes_legacy(repository, api, repo_url);
+        };
+
+        if !items.is_empty() {
+            saw_remote_note = true;
+        }
+
+        let page_next_change_seq = validate_next_change_seq(
+            &items,
+            list_response.data.next_change_seq,
+            since_change_seq,
+            list_response.data.has_more == Some(true),
+        )?;
+        let mut expected_hashes = HashMap::<String, String>::new();
+        let mut needs_batch = Vec::<String>::new();
+
+        for item in &items {
+            let expected_hash = normalize_content_hash(&item.content_hash)?;
+            expected_hashes.insert(item.commit_sha.clone(), expected_hash.clone());
+
+            let local_hash_matches = show_authorship_note(repository, &item.commit_sha)
+                .map(|content| sha256_note_content(&content) == expected_hash)
+                .unwrap_or(false);
+            if !local_hash_matches {
+                needs_batch.push(item.commit_sha.clone());
+            }
+        }
+
+        if !needs_batch.is_empty() {
+            let batch_response: crate::api::AuthorshipBatchResponse = api
+                .authorship_notes_batch_get(&crate::api::types::AuthorshipNotesBatchRequest {
+                    repo_url: repo_url.to_string(),
+                    commit_shas: needs_batch.clone(),
+                })?;
+
+            let requested_set: HashSet<String> = needs_batch.iter().cloned().collect();
+            let missing_from_batch: Vec<String> = batch_response
+                .data
+                .missing
+                .iter()
+                .filter(|commit_sha| requested_set.contains(*commit_sha))
+                .cloned()
+                .collect();
+            if !missing_from_batch.is_empty() {
+                return Err(GitAiError::Generic(format!(
+                    "REST notes batch missing commits from current page: {}",
+                    missing_from_batch.join(", ")
+                )));
+            }
+
+            let mut returned_notes = HashMap::<String, String>::new();
+            for note in batch_response.data.notes {
+                if !requested_set.contains(&note.commit_sha) {
+                    continue;
+                }
+                let expected_hash = expected_hashes.get(&note.commit_sha).ok_or_else(|| {
+                    GitAiError::Generic(format!(
+                        "REST notes batch returned unexpected commit {}",
+                        note.commit_sha
+                    ))
+                })?;
+                if let Some(returned_hash) = note.content_hash.as_deref() {
+                    let returned_hash = normalize_content_hash(returned_hash)?;
+                    if &returned_hash != expected_hash {
+                        return Err(GitAiError::Generic(format!(
+                            "REST notes batch content hash mismatch for {}: expected {}, got {}",
+                            note.commit_sha, expected_hash, returned_hash
+                        )));
+                    }
+                }
+                let actual_hash = sha256_note_content(&note.content);
+                if &actual_hash != expected_hash {
+                    return Err(GitAiError::Generic(format!(
+                        "REST notes batch content hash mismatch for {}: expected {}, got {}",
+                        note.commit_sha, expected_hash, actual_hash
+                    )));
+                }
+                returned_notes.insert(note.commit_sha, note.content);
+            }
+
+            let mut entries = Vec::<(String, String)>::new();
+            for commit_sha in &needs_batch {
+                let content = returned_notes.remove(commit_sha).ok_or_else(|| {
+                    GitAiError::Generic(format!(
+                        "REST notes batch omitted commit from current page: {}",
+                        commit_sha
+                    ))
+                })?;
+                entries.push((commit_sha.clone(), content));
+            }
+
+            notes_add_batch(repository, &entries)?;
+        }
+
+        final_change_seq = page_next_change_seq;
+        if list_response.data.has_more != Some(true) {
+            break;
+        }
+        since_change_seq = page_next_change_seq;
+    }
+
+    write_rest_notes_sync_state(repository.common_dir(), repo_url, final_change_seq)?;
+
+    if saw_remote_note {
+        Ok(NotesExistence::Found)
+    } else {
+        Ok(NotesExistence::NotFound)
+    }
+}
+
+fn validate_next_change_seq(
+    items: &[AuthorshipNotesListItem],
+    next_change_seq: Option<i64>,
+    since_change_seq: i64,
+    has_more: bool,
+) -> Result<i64, GitAiError> {
+    let max_item_change_seq = items.iter().map(|item| item.change_seq).max().unwrap_or(0);
+    let next_change_seq = next_change_seq.unwrap_or(max_item_change_seq);
+    if next_change_seq < max_item_change_seq {
+        return Err(GitAiError::Generic(format!(
+            "Invalid next_change_seq {} below max item change_seq {}",
+            next_change_seq, max_item_change_seq
+        )));
+    }
+    if has_more && next_change_seq <= since_change_seq {
+        return Err(GitAiError::Generic(format!(
+            "Invalid REST notes pagination: has_more=true but next_change_seq {} does not advance beyond since_change_seq {}",
+            next_change_seq, since_change_seq
+        )));
+    }
+    Ok(next_change_seq)
+}
+
+fn fetch_remote_note_hashes(
+    api: &ApiClient,
+    repo_url: &str,
+) -> Result<HashMap<String, Option<String>>, GitAiError> {
+    let mut since_change_seq = 0;
+    let mut remote_hashes = HashMap::<String, Option<String>>::new();
+
+    loop {
+        let list_response =
+            api.authorship_notes_list(&crate::api::types::AuthorshipNotesListRequest {
+                repo_url: repo_url.to_string(),
+                since_commit_time: None,
+                since_change_seq: Some(since_change_seq),
+                limit: Some(REST_NOTES_SYNC_LIST_LIMIT),
+            })?;
+
+        let Some(items) = list_response.data.items else {
+            return Ok(list_response
+                .data
+                .commit_shas
+                .into_iter()
+                .map(|commit_sha| (commit_sha, None))
+                .collect());
+        };
+
+        let page_next_change_seq = validate_next_change_seq(
+            &items,
+            list_response.data.next_change_seq,
+            since_change_seq,
+            list_response.data.has_more == Some(true),
+        )?;
+
+        for item in items {
+            remote_hashes.insert(
+                item.commit_sha,
+                Some(normalize_content_hash(&item.content_hash)?),
+            );
+        }
+
+        if list_response.data.has_more != Some(true) {
+            break;
+        }
+        since_change_seq = page_next_change_seq;
+    }
+
+    Ok(remote_hashes)
+}
+
+fn rest_fetch_authorship_notes_legacy(
+    repository: &Repository,
+    api: &ApiClient,
+    repo_url: &str,
+) -> Result<NotesExistence, GitAiError> {
     // let since_commit_time = derive_since_commit_time(repository);
     let list_response =
         api.authorship_notes_list(&crate::api::types::AuthorshipNotesListRequest {
             repo_url: repo_url.to_string(),
             since_commit_time: None,
+            since_change_seq: None,
+            limit: None,
         })?;
 
     if list_response.data.commit_shas.is_empty() {
@@ -616,22 +1041,21 @@ fn rest_push_notes(
         return Ok(());
     }
 
-    // Get remote commit_shas (list only returns commit_shas, not note_blob_oid)
-    let remote_commit_shas = api
-        .authorship_notes_list(&crate::api::types::AuthorshipNotesListRequest {
-            repo_url: repo_url.to_string(),
-            since_commit_time: None,
-        })?
-        .data
-        .commit_shas;
+    let remote_note_hashes = fetch_remote_note_hashes(api, repo_url)?;
 
-    let remote_commit_set: HashSet<String> = remote_commit_shas.into_iter().collect();
-
-    // Find commits that exist locally but not remotely
-    let local_notes_to_push: Vec<(String, String)> = local_notes
-        .into_iter()
-        .filter(|(sha, _)| !remote_commit_set.contains(sha))
-        .collect();
+    let mut local_notes_to_push = Vec::<(String, String)>::new();
+    for (sha, note_blob_oid) in local_notes {
+        let should_push = match remote_note_hashes.get(&sha) {
+            None => true,
+            Some(None) => false,
+            Some(Some(remote_hash)) => show_authorship_note(repository, &sha)
+                .map(|content| sha256_note_content(&content) != *remote_hash)
+                .unwrap_or(false),
+        };
+        if should_push {
+            local_notes_to_push.push((sha, note_blob_oid));
+        }
+    }
 
     if local_notes_to_push.is_empty() {
         return Ok(());
@@ -851,5 +1275,355 @@ mod tests {
             .expect_err("detached HEAD should produce an error")
             .to_string();
         assert!(err.contains("Not on a branch"), "unexpected error: {err}");
+    }
+
+    // ---- Incremental sync helper tests ----
+
+    #[test]
+    fn sha256_note_content_known_value() {
+        assert_eq!(
+            sha256_note_content("hello\n"),
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+    }
+
+    #[test]
+    fn sha256_note_content_empty() {
+        assert_eq!(
+            sha256_note_content(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn normalize_content_hash_plain_lowercase() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_content_hash(hex).unwrap(), hex);
+    }
+
+    #[test]
+    fn normalize_content_hash_prefixed_uppercase() {
+        let hex = "SHA256:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        let result = normalize_content_hash(hex).unwrap();
+        assert_eq!(
+            result,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn normalize_content_hash_prefixed_lowercase() {
+        let hex = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let result = normalize_content_hash(hex).unwrap();
+        assert_eq!(
+            result,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn normalize_content_hash_prefixed_mixed_case() {
+        let hex = "ShA256:ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
+        let result = normalize_content_hash(hex).unwrap();
+        assert_eq!(
+            result,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn normalize_content_hash_rejects_wrong_algorithm() {
+        assert!(
+            normalize_content_hash(
+                "md5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_content_hash_rejects_invalid() {
+        assert!(normalize_content_hash("not-a-hash").is_err());
+        assert!(
+            normalize_content_hash(
+                "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+            )
+            .is_err()
+        );
+        assert!(normalize_content_hash("0123456789abcdef").is_err()); // too short
+        assert!(normalize_content_hash("sha256").is_err()); // bare prefix, no colon body
+        assert!(normalize_content_hash("SHA256").is_err());
+        assert!(normalize_content_hash("sha256:").is_err()); // empty body
+        assert!(normalize_content_hash("sha256:abc").is_err()); // body too short
+    }
+
+    #[test]
+    fn rest_notes_sync_state_path_under_git_dir() {
+        let git_dir = Path::new("/tmp/repo/.git");
+        let url = "https://github.com/example/repo";
+        let path = rest_notes_sync_state_path(git_dir, url).unwrap();
+        assert!(path.starts_with("/tmp/repo/.git/ai/rest_notes_sync_state/"));
+        assert!(path.extension().unwrap() == "json");
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(':'));
+
+        let expected_key = rest_notes_repo_key(url).unwrap();
+        let expected_path = git_dir
+            .join("ai")
+            .join("rest_notes_sync_state")
+            .join(format!("{}.json", expected_key));
+        assert_eq!(path, expected_path);
+    }
+
+    #[test]
+    fn rest_notes_sync_state_path_equivalent_urls() {
+        let git_dir = Path::new("/tmp/repo/.git");
+        let path_git_suffix =
+            rest_notes_sync_state_path(git_dir, "https://github.com/example/repo.git").unwrap();
+        let path_trailing_slash =
+            rest_notes_sync_state_path(git_dir, "https://github.com/example/repo/").unwrap();
+        let path_ssh =
+            rest_notes_sync_state_path(git_dir, "git@github.com:example/repo.git").unwrap();
+        let path_bare =
+            rest_notes_sync_state_path(git_dir, "https://github.com/example/repo").unwrap();
+
+        assert_eq!(path_git_suffix, path_bare);
+        assert_eq!(path_trailing_slash, path_bare);
+        assert_eq!(path_ssh, path_bare);
+    }
+
+    #[test]
+    fn rest_notes_repo_key_deterministic() {
+        let url = "https://github.com/example/repo";
+        let key1 = rest_notes_repo_key(url).unwrap();
+        let key2 = rest_notes_repo_key(url).unwrap();
+        assert_eq!(key1, key2);
+        assert_eq!(key1.len(), 64);
+        assert!(key1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn rest_notes_repo_key_different_urls() {
+        let key1 = rest_notes_repo_key("https://github.com/example/repo1").unwrap();
+        let key2 = rest_notes_repo_key("https://github.com/example/repo2").unwrap();
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn current_time_millis_reasonable() {
+        let ts = current_time_millis();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(ts > 1_700_000_000_000); // after 2023
+        assert!((ts - now_secs).unsigned_abs() < 5000); // within 5s
+    }
+
+    #[test]
+    fn default_rest_notes_sync_state_fields() {
+        let state = default_rest_notes_sync_state("https://github.com/example/repo");
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.repo_url, "https://github.com/example/repo");
+        assert_eq!(state.last_change_seq, 0);
+        assert_eq!(state.updated_at, 0);
+    }
+
+    #[test]
+    fn read_rest_notes_sync_state_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        let state = read_rest_notes_sync_state(git_dir, "https://example.com/repo").unwrap();
+        assert_eq!(state.last_change_seq, 0);
+        assert_eq!(state.repo_url, "https://example.com/repo");
+    }
+
+    #[test]
+    fn read_rest_notes_sync_state_repo_url_mismatch_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        write_rest_notes_sync_state(git_dir, "https://example.com/repoA", 10).unwrap();
+        let state = read_rest_notes_sync_state(git_dir, "https://example.com/repoB").unwrap();
+        assert_eq!(state.last_change_seq, 0);
+        assert_eq!(state.repo_url, "https://example.com/repoB");
+    }
+
+    #[test]
+    fn read_rest_notes_sync_state_schema_mismatch_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        write_rest_notes_sync_state(git_dir, "https://example.com/repo", 10).unwrap();
+
+        let path = rest_notes_sync_state_path(git_dir, "https://example.com/repo").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let tampered = raw.replace("\"schema_version\": 1", "\"schema_version\": 99");
+        std::fs::write(&path, tampered).unwrap();
+
+        let state = read_rest_notes_sync_state(git_dir, "https://example.com/repo").unwrap();
+        assert_eq!(state.last_change_seq, 0);
+    }
+
+    #[test]
+    fn write_rest_notes_sync_state_creates_dirs_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        write_rest_notes_sync_state(git_dir, "https://example.com/repo", 42).unwrap();
+
+        let path = rest_notes_sync_state_path(git_dir, "https://example.com/repo").unwrap();
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with('{'));
+        assert!(content.ends_with("}\n"));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["last_change_seq"], 42);
+        assert!(parsed["updated_at"].is_number());
+        assert!(parsed["updated_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn write_rest_notes_sync_state_monotonic_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        let url = "https://example.com/repo";
+
+        write_rest_notes_sync_state(git_dir, url, 100).unwrap();
+        write_rest_notes_sync_state(git_dir, url, 50).unwrap();
+
+        let state = read_rest_notes_sync_state(git_dir, url).unwrap();
+        assert_eq!(state.last_change_seq, 100); // did not move backwards
+    }
+
+    #[test]
+    fn write_rest_notes_sync_state_advances_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        let url = "https://example.com/repo";
+
+        write_rest_notes_sync_state(git_dir, url, 50).unwrap();
+        write_rest_notes_sync_state(git_dir, url, 200).unwrap();
+
+        let state = read_rest_notes_sync_state(git_dir, url).unwrap();
+        assert_eq!(state.last_change_seq, 200);
+    }
+
+    #[test]
+    fn write_and_read_equivalent_urls_share_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+
+        write_rest_notes_sync_state(git_dir, "https://github.com/example/repo.git", 42).unwrap();
+
+        let state = read_rest_notes_sync_state(git_dir, "git@github.com:example/repo.git").unwrap();
+        assert_eq!(state.last_change_seq, 42);
+        assert_eq!(state.repo_url, "https://github.com/example/repo");
+
+        write_rest_notes_sync_state(git_dir, "https://github.com/example/repo/", 100).unwrap();
+        let state2 =
+            read_rest_notes_sync_state(git_dir, "https://github.com/example/repo").unwrap();
+        assert_eq!(state2.last_change_seq, 100);
+    }
+
+    #[test]
+    fn validate_next_change_seq_accepts_next_at_or_above_max_item_change_seq() {
+        let items = vec![
+            crate::api::types::AuthorshipNotesListItem {
+                commit_sha: "a".repeat(40),
+                content_hash: "0".repeat(64),
+                change_seq: 10,
+                updated_at: 100,
+            },
+            crate::api::types::AuthorshipNotesListItem {
+                commit_sha: "b".repeat(40),
+                content_hash: "1".repeat(64),
+                change_seq: 20,
+                updated_at: 200,
+            },
+        ];
+
+        assert_eq!(
+            validate_next_change_seq(&items, Some(20), 0, false).unwrap(),
+            20
+        );
+        assert_eq!(
+            validate_next_change_seq(&items, Some(25), 0, true).unwrap(),
+            25
+        );
+    }
+
+    #[test]
+    fn validate_next_change_seq_rejects_next_below_max_item_change_seq() {
+        let items = vec![crate::api::types::AuthorshipNotesListItem {
+            commit_sha: "a".repeat(40),
+            content_hash: "0".repeat(64),
+            change_seq: 20,
+            updated_at: 100,
+        }];
+
+        let err = validate_next_change_seq(&items, Some(19), 0, false).unwrap_err();
+        assert!(
+            err.to_string().contains("next_change_seq"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_next_change_seq_accepts_empty_final_page_without_progress() {
+        assert_eq!(
+            validate_next_change_seq(&[], Some(20), 20, false).unwrap(),
+            20
+        );
+        assert_eq!(validate_next_change_seq(&[], None, 20, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn validate_next_change_seq_rejects_empty_has_more_page_without_progress() {
+        let err = validate_next_change_seq(&[], Some(20), 20, true).unwrap_err();
+        assert!(
+            err.to_string().contains("does not advance"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = validate_next_change_seq(&[], None, 20, true).unwrap_err();
+        assert!(
+            err.to_string().contains("does not advance"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_cannot_move_watermark_backwards() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let git_dir = dir.path().to_path_buf();
+        let url = "https://github.com/example/repo";
+
+        let max_seq = 200i64;
+        let num_writers = 8;
+
+        let handles: Vec<_> = (0..num_writers)
+            .map(|i| {
+                let git_dir = git_dir.clone();
+                let url = url.to_string();
+                thread::spawn(move || {
+                    let seq = if i == 0 { max_seq } else { (i as i64) * 10 };
+                    write_rest_notes_sync_state(&git_dir, &url, seq)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+
+        let state = read_rest_notes_sync_state(&git_dir, url).unwrap();
+        assert_eq!(state.last_change_seq, max_seq);
     }
 }
