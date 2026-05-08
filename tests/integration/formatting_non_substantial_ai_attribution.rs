@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use git_ai::git::find_repository_in_path;
 
 #[test]
 fn test_ai_reflow_human_single_line_call_is_fully_ai() {
@@ -478,6 +479,180 @@ fn test_human_edge_spaces_on_committed_ai_line_keeps_ai_attribution() {
 }
 
 #[test]
+fn test_human_edge_spaces_in_mixed_hunk_keep_ai_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_mixed_hunk.rs");
+
+    std::fs::write(
+        &file_path,
+        "let first = compute();\nlet second = compute();\nlet third = compute();\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_mixed_hunk.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI lines").unwrap();
+
+    std::fs::write(
+        &file_path,
+        "\tlet first = compute();\nlet second = recompute();\nlet third = compute();   \n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "edge_mixed_hunk.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Human changes token and edge whitespace")
+        .unwrap();
+
+    let mut file = repo.filename("edge_mixed_hunk.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "\tlet first = compute();".ai(),
+        "let second = recompute();".human(),
+        "let third = compute();   ".ai(),
+    ]);
+}
+
+#[test]
+fn test_legacy_human_edge_spaces_on_committed_ai_line_keep_ai_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_legacy_human.rs");
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_legacy_human.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "\tlet value = compute();   \n").unwrap();
+    repo.git_ai(&["checkpoint", "human", "edge_legacy_human.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Human adds edge whitespace")
+        .unwrap();
+
+    let mut file = repo.filename("edge_legacy_human.rs");
+    file.assert_lines_and_blame(crate::lines!["\tlet value = compute();   ".ai()]);
+}
+
+#[test]
+fn test_uncheckpointed_human_edge_spaces_on_committed_ai_line_keep_ai_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_uncheckpointed.rs");
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_uncheckpointed.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "\tlet value = compute();   \n").unwrap();
+    repo.stage_all_and_commit("Human adds edge whitespace without checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("edge_uncheckpointed.rs");
+    file.assert_lines_and_blame(crate::lines!["\tlet value = compute();   ".ai()]);
+}
+
+#[test]
+fn test_uncheckpointed_edge_spaces_commit_writes_ai_note_and_clears_parent_working_log() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("edge_note.rs");
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "edge_note.rs"])
+        .unwrap();
+    let first_commit = repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "\tlet value = compute();   \n").unwrap();
+    let second_commit = repo
+        .stage_all_and_commit("Human adds edge whitespace without checkpoint")
+        .unwrap();
+
+    let prompt_ids: std::collections::HashSet<&String> = second_commit
+        .authorship_log
+        .metadata
+        .prompts
+        .keys()
+        .collect();
+    assert!(
+        second_commit
+            .authorship_log
+            .attestations
+            .iter()
+            .any(|file| {
+                file.file_path == "edge_note.rs"
+                    && file.entries.iter().any(|entry| {
+                        prompt_ids.contains(&entry.hash)
+                            && entry.line_ranges.iter().any(|range| range.contains(1))
+                    })
+            }),
+        "expected whitespace-only change to write an AI attestation for the changed line"
+    );
+
+    let git_ai_repo = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
+    assert!(
+        !git_ai_repo
+            .storage
+            .has_working_log(&first_commit.commit_sha),
+        "expected parent working log to be cleared after commit"
+    );
+}
+
+#[test]
+fn test_mixed_checkpointed_ai_and_uncheckpointed_edge_spaces_write_both_ai_notes() {
+    let repo = TestRepo::new();
+    let edge_path = repo.path().join("mixed_edge.rs");
+    let ai_path = repo.path().join("mixed_ai.rs");
+
+    std::fs::write(&edge_path, "let value = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "mixed_edge.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit initial AI edge file")
+        .unwrap();
+
+    std::fs::write(&edge_path, "\tlet value = compute();   \n").unwrap();
+    std::fs::write(&ai_path, "let generated = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "mixed_ai.rs"])
+        .unwrap();
+    let mixed_commit = repo
+        .stage_all_and_commit("Commit checkpointed AI and uncheckpointed edge whitespace")
+        .unwrap();
+
+    let prompt_ids: std::collections::HashSet<&String> = mixed_commit
+        .authorship_log
+        .metadata
+        .prompts
+        .keys()
+        .collect();
+    for expected_file in ["mixed_edge.rs", "mixed_ai.rs"] {
+        let note = mixed_commit.authorship_log.serialize_to_string().unwrap();
+        assert!(
+            mixed_commit.authorship_log.attestations.iter().any(|file| {
+                file.file_path == expected_file
+                    && file.entries.iter().any(|entry| {
+                        prompt_ids.contains(&entry.hash)
+                            && entry.line_ranges.iter().any(|range| range.contains(1))
+                    })
+            }),
+            "expected {expected_file} to have an AI prompt-backed note entry:\n{note}"
+        );
+    }
+}
+
+#[test]
+fn test_uncheckpointed_human_token_change_on_ai_line_reclaims_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("token_uncheckpointed.rs");
+
+    std::fs::write(&file_path, "let x = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "token_uncheckpointed.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.stage_all_and_commit("Human changes token without checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("token_uncheckpointed.rs");
+    file.assert_lines_and_blame(crate::lines!["let value = compute();".human()]);
+}
+
+#[test]
 fn test_human_token_change_on_ai_line_reclaims_attribution() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("token_change.rs");
@@ -514,5 +689,11 @@ crate::reuse_tests_in_worktree!(
     test_ai_edits_around_large_human_section_preserves_human_attribution,
     test_human_trailing_space_on_uncommitted_ai_line_keeps_ai_attribution,
     test_human_edge_spaces_on_committed_ai_line_keeps_ai_attribution,
+    test_human_edge_spaces_in_mixed_hunk_keep_ai_attribution,
+    test_legacy_human_edge_spaces_on_committed_ai_line_keep_ai_attribution,
+    test_uncheckpointed_human_edge_spaces_on_committed_ai_line_keep_ai_attribution,
+    test_uncheckpointed_edge_spaces_commit_writes_ai_note_and_clears_parent_working_log,
+    test_mixed_checkpointed_ai_and_uncheckpointed_edge_spaces_write_both_ai_notes,
+    test_uncheckpointed_human_token_change_on_ai_line_reclaims_attribution,
     test_human_token_change_on_ai_line_reclaims_attribution,
 );

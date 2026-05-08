@@ -3,7 +3,9 @@ use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::{
     build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::prompt_utils::{PromptUpdateResult, update_prompt_from_tool};
+use crate::authorship::prompt_utils::{
+    PromptUpdateResult, find_prompt_with_db_fallback, update_prompt_from_tool,
+};
 use crate::authorship::secrets::{redact_secrets_from_prompts, strip_prompt_messages};
 use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
@@ -109,24 +111,6 @@ pub fn post_commit_with_final_state(
         );
     }
 
-    // Create VirtualAttributions from working log (fast path - no blame)
-    // We don't need to run blame because we only care about the working log data
-    // that was accumulated since the parent commit
-    let working_va = if let Some(snapshot) = final_state_override {
-        VirtualAttributions::from_working_log_snapshot(
-            repo.clone(),
-            parent_sha.clone(),
-            Some(human_author.clone()),
-            snapshot,
-        )?
-    } else {
-        VirtualAttributions::from_just_working_log(
-            repo.clone(),
-            parent_sha.clone(),
-            Some(human_author.clone()),
-        )?
-    };
-
     // Build pathspecs from AI-relevant checkpoint entries only.
     // Human-only entries with no AI attribution do not affect authorship output and should not
     // trigger expensive post-commit diff work across large commits.
@@ -147,6 +131,79 @@ pub fn post_commit_with_final_state(
         pathspecs.insert(file_path.clone());
     }
 
+    let working_log_pathspecs = pathspecs.clone();
+
+    // Files changed without an explicit checkpoint still need post-processing: a
+    // human can make a non-substantive formatting edit to previously committed AI
+    // lines, and the base-commit blame is the only source that can preserve that
+    // attribution through the new commit.
+    let mut whitespace_only_uncheckpointed_pathspecs: HashSet<String> = HashSet::new();
+    if let Ok(changed_files) = repo.diff_changed_files(&parent_sha, &commit_sha) {
+        for file_path in changed_files {
+            if !working_log_pathspecs.contains(&file_path) {
+                match repo.diff_has_changes_ignoring_whitespace(
+                    &parent_sha,
+                    &commit_sha,
+                    &file_path,
+                ) {
+                    Ok(false) => {
+                        whitespace_only_uncheckpointed_pathspecs.insert(file_path.clone());
+                    }
+                    Ok(true) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to check whitespace-only diff for {}: {}",
+                            file_path,
+                            e
+                        );
+                    }
+                }
+            }
+            pathspecs.insert(file_path);
+        }
+    }
+
+    let working_va = if whitespace_only_uncheckpointed_pathspecs.is_empty() {
+        if let Some(snapshot) = final_state_override {
+            VirtualAttributions::from_working_log_snapshot(
+                repo.clone(),
+                parent_sha.clone(),
+                Some(human_author.clone()),
+                snapshot,
+            )?
+        } else {
+            VirtualAttributions::from_just_working_log(
+                repo.clone(),
+                parent_sha.clone(),
+                Some(human_author.clone()),
+            )?
+        }
+    } else {
+        let mut blame_backed_pathspecs = working_log_pathspecs.clone();
+        blame_backed_pathspecs.extend(whitespace_only_uncheckpointed_pathspecs);
+        let mut pathspec_vec: Vec<String> = blame_backed_pathspecs.into_iter().collect();
+        pathspec_vec.sort();
+
+        if let Some(snapshot) = final_state_override {
+            smol::block_on(VirtualAttributions::from_working_log_for_commit_snapshot(
+                repo.clone(),
+                parent_sha.clone(),
+                &pathspec_vec,
+                Some(human_author.clone()),
+                None,
+                snapshot,
+            ))?
+        } else {
+            smol::block_on(VirtualAttributions::from_working_log_for_commit(
+                repo.clone(),
+                parent_sha.clone(),
+                &pathspec_vec,
+                Some(human_author.clone()),
+                None,
+            ))?
+        }
+    };
+
     let (mut authorship_log, initial_attributions) = working_va
         .to_authorship_log_and_initial_working_log(
             repo,
@@ -157,6 +214,7 @@ pub fn post_commit_with_final_state(
         )?;
 
     authorship_log.metadata.base_commit_sha = commit_sha.clone();
+    hydrate_missing_prompt_metadata(repo, &mut authorship_log);
 
     // Long-lived daemon processes should read a fresh config snapshot.
     // Always use Config::fresh() to support runtime config updates
@@ -327,6 +385,36 @@ pub fn post_commit_with_final_state(
         }
     }
     Ok((commit_sha.to_string(), authorship_log))
+}
+
+fn hydrate_missing_prompt_metadata(repo: &Repository, authorship_log: &mut AuthorshipLog) {
+    let missing_prompt_ids: Vec<String> = authorship_log
+        .attestations
+        .iter()
+        .flat_map(|file| file.entries.iter())
+        .map(|entry| entry.hash.clone())
+        .filter(|hash| {
+            !hash.starts_with("h_") && !authorship_log.metadata.prompts.contains_key(hash)
+        })
+        .collect();
+
+    for prompt_id in missing_prompt_ids {
+        match find_prompt_with_db_fallback(&prompt_id, Some(repo)) {
+            Ok((_commit_sha, prompt_record)) => {
+                authorship_log
+                    .metadata
+                    .prompts
+                    .insert(prompt_id, prompt_record);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to hydrate prompt metadata for committed attestation {}: {}",
+                    prompt_id,
+                    error
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

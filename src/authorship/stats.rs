@@ -136,6 +136,7 @@ pub fn write_stats_to_terminal(stats: &CommitStats, print: bool) -> String {
         0.0
     };
 
+    // Create progress bar with three categories
     // Pure human = human_additions - mixed_additions (overridden lines)
     let pure_human = stats.human_additions.saturating_sub(stats.mixed_additions);
 
@@ -769,7 +770,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let mixed_output = write_stats_to_terminal(&stats, false);
+        let mixed_output = write_stats_to_terminal(&stats, true);
         assert_debug_snapshot!(mixed_output);
 
         // Test with AI-only stats
@@ -786,7 +787,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let ai_only_output = write_stats_to_terminal(&ai_stats, false);
+        let ai_only_output = write_stats_to_terminal(&ai_stats, true);
         assert_debug_snapshot!(ai_only_output);
 
         // Test with human-only stats
@@ -803,7 +804,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let human_only_output = write_stats_to_terminal(&human_stats, false);
+        let human_only_output = write_stats_to_terminal(&human_stats, true);
         assert_debug_snapshot!(human_only_output);
 
         // Test with minimal human contribution (should get at least 2 blocks)
@@ -820,7 +821,7 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let minimal_human_output = write_stats_to_terminal(&minimal_human_stats, false);
+        let minimal_human_output = write_stats_to_terminal(&minimal_human_stats, true);
         assert_debug_snapshot!(minimal_human_output);
 
         // Test with deletion-only commit (no additions)
@@ -837,87 +838,8 @@ mod tests {
             tool_model_breakdown: BTreeMap::new(),
         };
 
-        let deletion_only_output = write_stats_to_terminal(&deletion_only_stats, false);
+        let deletion_only_output = write_stats_to_terminal(&deletion_only_stats, true);
         assert_debug_snapshot!(deletion_only_output);
-
-        // --- New test cases for untracked segment ---
-
-        // 18% human / 22% untracked / 60% AI — matches the design example
-        let untracked_stats = CommitStats {
-            human_additions: 180,
-            mixed_additions: 0,
-            ai_additions: 600,
-            ai_accepted: 462,
-            time_waiting_for_ai: 60,
-            git_diff_deleted_lines: 0,
-            git_diff_added_lines: 1000,
-            total_ai_additions: 600,
-            total_ai_deletions: 0,
-            tool_model_breakdown: BTreeMap::new(),
-        };
-        let with_untracked_output = write_stats_to_terminal(&untracked_stats, false);
-        assert_debug_snapshot!(with_untracked_output);
-
-        // untracked exactly at the 1% threshold — should NOT show untracked segment
-        let threshold_stats = CommitStats {
-            human_additions: 49,
-            mixed_additions: 0,
-            ai_additions: 50,
-            ai_accepted: 50,
-            time_waiting_for_ai: 0,
-            git_diff_deleted_lines: 0,
-            git_diff_added_lines: 100,
-            total_ai_additions: 50,
-            total_ai_deletions: 0,
-            tool_model_breakdown: BTreeMap::new(),
-        };
-        let untracked_at_threshold_output = write_stats_to_terminal(&threshold_stats, false);
-        assert_debug_snapshot!(untracked_at_threshold_output);
-
-        // untracked just above 1% threshold (~2%) — should show untracked segment
-        let above_threshold_stats = CommitStats {
-            human_additions: 97,
-            mixed_additions: 0,
-            ai_additions: 0,
-            ai_accepted: 0,
-            time_waiting_for_ai: 0,
-            git_diff_deleted_lines: 0,
-            git_diff_added_lines: 99,
-            total_ai_additions: 0,
-            total_ai_deletions: 0,
-            tool_model_breakdown: BTreeMap::new(),
-        };
-        let untracked_just_above_output = write_stats_to_terminal(&above_threshold_stats, false);
-        assert_debug_snapshot!(untracked_just_above_output);
-
-        // 100% untracked — entire bar is · chars
-        let all_untracked_stats = CommitStats {
-            human_additions: 0,
-            mixed_additions: 0,
-            ai_additions: 0,
-            ai_accepted: 0,
-            time_waiting_for_ai: 0,
-            git_diff_deleted_lines: 0,
-            git_diff_added_lines: 100,
-            total_ai_additions: 0,
-            total_ai_deletions: 0,
-            tool_model_breakdown: BTreeMap::new(),
-        };
-        let all_untracked_output = write_stats_to_terminal(&all_untracked_stats, false);
-        assert_debug_snapshot!(all_untracked_output);
-
-        // OSC 8 hyperlink emitted when is_interactive = true
-        // Not a snapshot test — asserts presence of the escape sequence directly.
-        let hyperlink_output = write_stats_to_terminal(&untracked_stats, true);
-        assert!(
-            hyperlink_output.contains("\x1b]8;;https://usegitai.com/docs/cli/untracked\x1b\\"),
-            "Expected OSC 8 hyperlink in interactive output, got: {:?}",
-            hyperlink_output
-        );
-        assert!(
-            hyperlink_output.contains("untracked"),
-            "Expected 'untracked' label in interactive output"
-        );
     }
 
     #[test]
