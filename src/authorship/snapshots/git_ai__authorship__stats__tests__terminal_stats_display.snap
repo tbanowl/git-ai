@@ -1,5 +1,6 @@
 ---
 source: src/authorship/stats.rs
+assertion_line: 774
 expression: mixed_output
 ---
-"you  █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     33%                                  67%\n     \u{1b}[90m25% AI code accepted | waited 1200m for ai\u{1b}[0m\n"
+"you  ██▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai\n     7%             mixed  27%             67%\n     \u{1b}[90m25% AI code accepted | waited 1200m for ai\u{1b}[0m\n"
