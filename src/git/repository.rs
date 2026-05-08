@@ -429,7 +429,11 @@ fn write_stdin_in_background(
         use std::io::Write;
         let mut stdin = stdin;
         if is_debug_enabled() {
-            let preview = String::from_utf8_lossy(&data).lines().take(10).collect::<Vec<_>>().join("\n");
+            let preview = String::from_utf8_lossy(&data)
+                .lines()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("\n");
             tracing::debug!(
                 "[exec_git] writing {} bytes to stdin, preview:\n{}",
                 data.len(),
@@ -2729,6 +2733,30 @@ impl Repository {
             .collect();
 
         Ok(files)
+    }
+
+    /// Returns true when `git diff -w --quiet` still detects changes for a path.
+    /// A false result means the path differs only by whitespace according to Git.
+    pub fn diff_has_changes_ignoring_whitespace(
+        &self,
+        from_ref: &str,
+        to_ref: &str,
+        path: &str,
+    ) -> Result<bool, GitAiError> {
+        let mut args = self.global_args_for_exec();
+        args.push("diff".to_string());
+        args.push("-w".to_string());
+        args.push("--quiet".to_string());
+        args.push(from_ref.to_string());
+        args.push(to_ref.to_string());
+        args.push("--".to_string());
+        args.push(path.to_string());
+
+        match exec_git_with_profile(&args, InternalGitProfile::General) {
+            Ok(_) => Ok(false),
+            Err(GitAiError::GitCliError { code: Some(1), .. }) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// Get added line ranges from git diff between a commit and the working directory
