@@ -292,12 +292,17 @@ fn push_notes(repo: &TestRepo, api_base_url: &str) -> Result<String, String> {
     )
 }
 
-fn list_response(commit_sha: &str, note_content: &str, change_seq: i64) -> Value {
+fn list_response_with_note_blob_oid(
+    commit_sha: &str,
+    note_content: &str,
+    change_seq: i64,
+    note_blob_oid: Option<&str>,
+) -> Value {
     json!({
         "ok": true,
         "data": {
             "commit_shas": [commit_sha],
-            "note_blob_oids": null,
+            "note_blob_oids": note_blob_oid.map(|oid| vec![oid.to_string()]),
             "items": [{
                 "commit_sha": commit_sha,
                 "content_hash": format!("sha256:{}", sha256_note_content(note_content)),
@@ -308,6 +313,10 @@ fn list_response(commit_sha: &str, note_content: &str, change_seq: i64) -> Value
             "has_more": false
         }
     })
+}
+
+fn list_response(commit_sha: &str, note_content: &str, change_seq: i64) -> Value {
+    list_response_with_note_blob_oid(commit_sha, note_content, change_seq, None)
 }
 
 fn paged_list_response(
@@ -340,6 +349,19 @@ fn legacy_list_response(commit_sha: &str) -> Value {
         "data": {
             "commit_shas": [commit_sha],
             "note_blob_oids": null
+        }
+    })
+}
+
+fn empty_items_with_legacy_commit_shas_response(commit_sha: &str) -> Value {
+    json!({
+        "ok": true,
+        "data": {
+            "commit_shas": [commit_sha],
+            "note_blob_oids": null,
+            "items": [],
+            "next_change_seq": 0,
+            "has_more": false
         }
     })
 }
@@ -542,6 +564,45 @@ fn rest_fetch_legacy_list_fallback_restores_note_without_writing_watermark() {
 
 #[test]
 #[serial]
+fn rest_fetch_empty_items_with_commit_shas_uses_legacy_fallback() {
+    let repo = test_repo();
+    let commit_sha = create_commit_without_note(
+        &repo,
+        "empty-items-legacy.txt",
+        "empty items legacy target\n",
+    );
+    let remote_note = "empty items legacy remote note\n";
+    let server = RestNotesMockServer::start(vec![
+        empty_items_with_legacy_commit_shas_response(&commit_sha),
+        legacy_list_response(&commit_sha),
+        batch_response(&commit_sha, remote_note, remote_note),
+    ]);
+
+    fetch_notes(&repo, server.base_url()).expect("empty items fallback fetch should succeed");
+
+    let incremental_list = server.recv_request();
+    assert_eq!(incremental_list.path, "/worker/authorship_notes/list");
+    assert_eq!(incremental_list.body["since_change_seq"], 0);
+    assert_eq!(incremental_list.body["limit"], 1000);
+    let legacy_list = server.recv_request();
+    assert_eq!(legacy_list.path, "/worker/authorship_notes/list");
+    assert!(legacy_list.body.get("since_change_seq").is_none());
+    assert!(legacy_list.body.get("limit").is_none());
+    let batch = server.recv_request();
+    assert_eq!(batch.path, "/worker/authorship_notes/batch");
+    assert_eq!(batch.body["commit_shas"], json!([commit_sha.clone()]));
+    assert_eq!(
+        repo.read_authorship_note(&commit_sha)
+            .as_deref()
+            .map(str::trim_end),
+        Some(remote_note.trim_end())
+    );
+    let state = read_rest_notes_sync_state(&git_common_dir(&repo), REPO_URL).unwrap();
+    assert_eq!(state.last_change_seq, 0);
+}
+
+#[test]
+#[serial]
 fn rest_fetch_remote_hash_mismatch_overwrites_existing_local_note() {
     let repo = test_repo();
     let commit_sha = create_commit_without_note(&repo, "overwrite.txt", "overwrite target\n");
@@ -629,6 +690,35 @@ fn rest_fetch_skips_batch_when_local_hash_matches() {
 
 #[test]
 #[serial]
+fn rest_fetch_same_content_different_blob_oid_skips_batch() {
+    let repo = test_repo();
+    let commit_sha = create_commit_without_note(&repo, "blob-oid.txt", "blob oid target\n");
+    let local_note = "identical content for blob oid test";
+    add_local_note(&repo, &commit_sha, local_note);
+    let server = RestNotesMockServer::start(vec![list_response_with_note_blob_oid(
+        &commit_sha,
+        local_note,
+        20,
+        Some("remote-different-blob-oid"),
+    )]);
+
+    fetch_notes(&repo, server.base_url()).expect("REST fetch should succeed");
+
+    let list = server.recv_request();
+    assert_eq!(list.path, "/worker/authorship_notes/list");
+    server.assert_no_request();
+    assert_eq!(
+        repo.read_authorship_note(&commit_sha)
+            .as_deref()
+            .map(str::trim_end),
+        Some(local_note)
+    );
+    let state = read_rest_notes_sync_state(&git_common_dir(&repo), REPO_URL).unwrap();
+    assert_eq!(state.last_change_seq, 20);
+}
+
+#[test]
+#[serial]
 fn rest_fetch_batch_hash_mismatch_errors_without_writing_note_or_advancing_state() {
     let repo = test_repo();
     let commit_sha = create_commit_without_note(&repo, "mismatch.txt", "hash mismatch target\n");
@@ -663,6 +753,32 @@ fn rest_push_skips_push_when_remote_hash_matches() {
     let local_note = "local authorship note";
     add_local_note(&repo, &commit_sha, local_note);
     let server = RestNotesMockServer::start(vec![list_response(&commit_sha, local_note, 13)]);
+
+    push_notes(&repo, server.base_url()).expect("REST push should succeed");
+
+    let list = server.recv_request();
+    assert_eq!(list.path, "/worker/authorship_notes/list");
+    assert_eq!(list.body["repo_url"], REPO_URL);
+    assert_eq!(list.body["since_change_seq"], 0);
+    assert_eq!(list.body["limit"], 1000);
+    server.assert_no_request();
+    let state = read_rest_notes_sync_state(&git_common_dir(&repo), REPO_URL).unwrap();
+    assert_eq!(state.last_change_seq, 0);
+}
+
+#[test]
+#[serial]
+fn rest_push_same_content_different_blob_oid_skips_push() {
+    let repo = test_repo();
+    let commit_sha = create_commit_without_note(&repo, "push-blob.txt", "push blob target\n");
+    let local_note = "same content different blob oid push test";
+    add_local_note(&repo, &commit_sha, local_note);
+    let server = RestNotesMockServer::start(vec![list_response_with_note_blob_oid(
+        &commit_sha,
+        local_note,
+        21,
+        Some("remote-different-blob-oid"),
+    )]);
 
     push_notes(&repo, server.base_url()).expect("REST push should succeed");
 

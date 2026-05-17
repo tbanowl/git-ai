@@ -796,6 +796,10 @@ fn rest_fetch_authorship_notes(
             return rest_fetch_authorship_notes_legacy(repository, api, repo_url);
         };
 
+        if items.is_empty() && !list_response.data.commit_shas.is_empty() {
+            return rest_fetch_authorship_notes_legacy(repository, api, repo_url);
+        }
+
         if !items.is_empty() {
             saw_remote_note = true;
         }
