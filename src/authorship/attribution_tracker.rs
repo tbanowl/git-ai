@@ -2142,7 +2142,8 @@ fn find_dominant_author_for_line_candidates(
     let mut last_ai_edit: Option<&Attribution> = None;
     let mut last_human_edit: Option<&Attribution> = None;
     for attr in &candidate_attrs {
-        // Both legacy "human" and KnownHuman h_<hash> IDs are human edits.
+        // Legacy "human" is the canonical human checkpoint sentinel. Historical
+        // h_<hash> human attestation markers are preserved by compatibility reads.
         if attr.author_id == CheckpointKind::Human.to_str() {
             last_human_edit = Some(attr);
         } else {

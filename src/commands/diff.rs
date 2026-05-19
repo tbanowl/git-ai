@@ -961,7 +961,7 @@ fn apply_blame_for_side(
                     .push(*line);
                 Attribution::Ai(tool)
             } else if author_marker.starts_with("h_") {
-                // Known human attestation (h_-prefixed hash from KnownHuman checkpoint)
+                // Historical h_ human attestation marker.
                 Attribution::Human(author_marker.clone())
             } else {
                 // Legacy or unrecognized marker (e.g. "human") — treat as unattested

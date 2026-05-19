@@ -996,7 +996,7 @@ impl VirtualAttributions {
             let mut author_ranges: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
             for line_attr in line_attrs {
                 // Skip the legacy "human" sentinel (CheckpointKind::Human checkpoints that were
-                // never attested). KnownHuman lines use h_-prefixed author IDs and pass through.
+                // never attested). Historical h_ human attestation markers pass through.
                 if line_attr.author_id == CheckpointKind::Human.to_str() {
                     continue;
                 }

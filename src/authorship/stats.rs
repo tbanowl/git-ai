@@ -1010,8 +1010,8 @@ mod tests {
         let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
 
         // Verify the stats
-        // trigger_checkpoint_with_author produces KnownHuman checkpoints (post Task 9),
-        // so human-written lines have h_-prefixed attestation entries → human_additions.
+        // trigger_checkpoint_with_author produces canonical human checkpoints, so
+        // human-written lines count toward human_additions.
         assert_eq!(stats.human_additions, 2, "Human added 2 lines");
         assert_eq!(stats.ai_additions, 2, "AI added 2 lines");
         assert_eq!(stats.ai_accepted, 2, "AI lines were accepted");
