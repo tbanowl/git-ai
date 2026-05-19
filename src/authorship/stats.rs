@@ -311,7 +311,7 @@ pub fn write_stats_to_markdown(stats: &CommitStats) -> String {
     // Calculate total additions for the progress bar
     // Total = pure human + mixed (AI-edited-by-human) + pure AI (accepted)
     let total_additions = stats.git_diff_added_lines;
-    
+
     // Calculate AI acceptance percentage (capped at 100%)
     // It can go higher because AI can write on top of AI code. This feels reasonable for now
     let _ai_acceptance_percentage = if stats.ai_additions > 0 {
@@ -1275,8 +1275,7 @@ mod tests {
     #[test]
     fn test_accepted_lines_no_authorship_log() {
         let added_lines: HashMap<String, Vec<u32>> = HashMap::new();
-        let (accepted, per_tool) =
-            accepted_lines_from_attestations(None, &added_lines, false);
+        let (accepted, per_tool) = accepted_lines_from_attestations(None, &added_lines, false);
         assert_eq!(accepted, 0);
         assert!(per_tool.is_empty());
     }
@@ -1323,8 +1322,7 @@ mod tests {
         let mut added_lines: HashMap<String, Vec<u32>> = HashMap::new();
         added_lines.insert("foo.rs".to_string(), vec![1, 2, 3]);
 
-        let (accepted, per_tool) =
-            accepted_lines_from_attestations(Some(&log), &added_lines, true);
+        let (accepted, per_tool) = accepted_lines_from_attestations(Some(&log), &added_lines, true);
         assert_eq!(accepted, 0);
         assert!(per_tool.is_empty());
     }

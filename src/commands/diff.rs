@@ -414,7 +414,10 @@ fn resolve_commit(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
     let sha = commit.id().to_string();
     let _oid = Oid::from_str(&sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
     if sha.is_empty() {
-        return Err(GitAiError::Generic(format!("Could not resolve commit: {}", rev)));
+        return Err(GitAiError::Generic(format!(
+            "Could not resolve commit: {}",
+            rev
+        )));
     }
     Ok(sha)
 }
@@ -1632,24 +1635,14 @@ pub fn format_annotated_diff(
                 if line.starts_with("diff --git") {
                     in_hunk = false;
                 }
-                result.push_str(&format_line(
-                    line,
-                    LineType::DiffHeader,
-                    use_color,
-                    None,
-                ));
+                result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
             } else if line.starts_with("@@ ") {
                 in_hunk = true;
                 if let Some((old_start, new_start)) = parse_hunk_header_for_line_nums(line) {
                     old_line_num = old_start;
                     new_line_num = new_start;
                 }
-                result.push_str(&format_line(
-                    line,
-                    LineType::HunkHeader,
-                    use_color,
-                    None,
-                ));
+                result.push_str(&format_line(line, LineType::HunkHeader, use_color, None));
             } else if in_hunk && line.starts_with('-') {
                 let key = DiffLineKey {
                     file: file_path.clone(),
@@ -1679,28 +1672,13 @@ pub fn format_annotated_diff(
                 ));
                 new_line_num += 1;
             } else if in_hunk && line.starts_with(' ') {
-                result.push_str(&format_line(
-                    line,
-                    LineType::Context,
-                    use_color,
-                    None,
-                ));
+                result.push_str(&format_line(line, LineType::Context, use_color, None));
                 old_line_num += 1;
                 new_line_num += 1;
             } else if line.starts_with("Binary files") {
-                result.push_str(&format_line(
-                    line,
-                    LineType::Binary,
-                    use_color,
-                    None,
-                ));
+                result.push_str(&format_line(line, LineType::Binary, use_color, None));
             } else {
-                result.push_str(&format_line(
-                    line,
-                    LineType::Context,
-                    use_color,
-                    None,
-                ));
+                result.push_str(&format_line(line, LineType::Context, use_color, None));
             }
         }
     }
