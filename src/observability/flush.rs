@@ -205,7 +205,7 @@ pub fn handle_flush_logs(args: &[String]) {
             }
         }
 
-        crate::commands::flush_metrics_db::handle_flush_metrics_db(&args);
+        crate::commands::flush_metrics_db::handle_flush_metrics_db(args);
 
         std::process::exit(0);
     }
@@ -292,7 +292,7 @@ pub fn handle_flush_logs(args: &[String]) {
         }
     }
 
-    crate::commands::flush_metrics_db::handle_flush_metrics_db(&args);
+    crate::commands::flush_metrics_db::handle_flush_metrics_db(args);
 
     // Exit 0 - processing completed successfully even if no events were sent
     // (e.g., debug builds skip non-metrics events, which is expected behavior)

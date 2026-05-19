@@ -3382,7 +3382,6 @@ fn build_metadata_only_authorship_log_from_source_notes(
     source_commits: &[String],
     target_commit_sha: &str,
 ) -> Result<Option<AuthorshipLog>, GitAiError> {
-
     let mut merged_prompts = BTreeMap::new();
     let mut prompt_totals: HashMap<String, (u32, u32)> = HashMap::new();
     let mut saw_any_note = false;

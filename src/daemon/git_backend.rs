@@ -301,7 +301,9 @@ impl GitBackend for SystemGitBackend {
         // Backend: git2 + gix (performance-first)
         let repo = gix::discover(worktree).map_err(|e| GitAiError::GixError(e.to_string()))?;
         let head = rev_parse_head(worktree).ok();
-        let repo_head = repo.head().map_err(|e| GitAiError::GixError(e.to_string()))?;
+        let repo_head = repo
+            .head()
+            .map_err(|e| GitAiError::GixError(e.to_string()))?;
         let branch = repo_head
             .referent_name()
             .and_then(|name| name.shorten().to_str().ok().map(str::to_owned))
@@ -446,7 +448,9 @@ fn rev_parse_head(worktree: &Path) -> Result<String, GitAiError> {
     // Migrated from: git rev-parse --verify HEAD
     // Backend: git2
     let repo = git2::Repository::open(worktree).map_err(|e| GitAiError::Generic(e.to_string()))?;
-    let head = repo.head().map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let head = repo
+        .head()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
     let commit = head
         .peel_to_commit()
         .map_err(|e| GitAiError::Generic(e.to_string()))?;

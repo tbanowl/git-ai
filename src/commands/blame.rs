@@ -1,5 +1,5 @@
 use crate::auth::CredentialStore;
-use crate::authorship::authorship_log::{PromptRecord};
+use crate::authorship::authorship_log::PromptRecord;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::prompt_utils::enrich_prompt_messages;
 use crate::authorship::working_log::CheckpointKind;
@@ -404,13 +404,8 @@ impl Repository {
         let blame_hunks = self.blame_hunks_for_ranges(relative_file_path, line_ranges, options)?;
 
         // Step 2: Overlay AI authorship information.
-        let (
-            line_authors,
-            prompt_records,
-            authorship_logs,
-            prompt_commits,
-            commits_with_notes,
-        ) = overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
+        let (line_authors, prompt_records, authorship_logs, prompt_commits, commits_with_notes) =
+            overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
 
         Ok((
             BlameAnalysisResult {

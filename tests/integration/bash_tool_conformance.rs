@@ -272,10 +272,17 @@ fn test_git_index_mtime_uses_rev_parse_git_dir_in_regular_repo() {
 
     let mtime = git_index_mtime_ns(&root);
 
-    assert!(mtime.is_some(), "git index mtime should resolve via the regular repo git dir");
-    assert!(git_dir.join("index").exists(), "resolved git dir should contain an index file");
+    assert!(
+        mtime.is_some(),
+        "git index mtime should resolve via the regular repo git dir"
+    );
+    assert!(
+        git_dir.join("index").exists(),
+        "resolved git dir should contain an index file"
+    );
 
-    let snapshot = snapshot(&root, "sess", "regular-git-dir", None).expect("snapshot should succeed");
+    let snapshot =
+        snapshot(&root, "sess", "regular-git-dir", None).expect("snapshot should succeed");
     save_snapshot(&snapshot).expect("save_snapshot should succeed");
     let cache_dir = git_dir.join("ai").join("bash_snapshots");
     let saved_entries: Vec<_> = fs::read_dir(&cache_dir)
@@ -289,7 +296,10 @@ fn test_git_index_mtime_uses_rev_parse_git_dir_in_regular_repo() {
     );
     let consumed = load_and_consume_snapshot(&root, &snapshot.invocation_key)
         .expect("load_and_consume_snapshot should succeed");
-    assert!(consumed.is_some(), "saved snapshot should be readable from the resolved regular git dir");
+    assert!(
+        consumed.is_some(),
+        "saved snapshot should be readable from the resolved regular git dir"
+    );
 }
 
 #[test]
@@ -327,8 +337,14 @@ fn test_git_index_mtime_and_snapshot_cache_follow_linked_worktree_git_dir() {
 
     let mtime = git_index_mtime_ns(&worktree_path);
 
-    assert!(mtime.is_some(), "git index mtime should resolve through linked worktree git-dir indirection");
-    assert!(git_dir.join("index").exists(), "linked worktree git dir should expose a usable index path");
+    assert!(
+        mtime.is_some(),
+        "git index mtime should resolve through linked worktree git-dir indirection"
+    );
+    assert!(
+        git_dir.join("index").exists(),
+        "linked worktree git dir should expose a usable index path"
+    );
 
     let snapshot = snapshot(&worktree_path, "sess", "linked-worktree-git-dir", None)
         .expect("snapshot should succeed in linked worktree");
@@ -345,7 +361,10 @@ fn test_git_index_mtime_and_snapshot_cache_follow_linked_worktree_git_dir() {
     );
     let consumed = load_and_consume_snapshot(&worktree_path, &snapshot.invocation_key)
         .expect("load_and_consume_snapshot should succeed in linked worktree");
-    assert!(consumed.is_some(), "saved snapshot should be readable from the linked worktree git dir");
+    assert!(
+        consumed.is_some(),
+        "saved snapshot should be readable from the linked worktree git dir"
+    );
 }
 
 // ===========================================================================

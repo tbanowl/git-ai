@@ -79,8 +79,11 @@ fn checkpoint_with_message_and_env(
 
     let hook_input_str = serde_json::to_string(&hook_input).unwrap();
 
-    repo.git_ai_with_env(&["checkpoint", "agent-v1", "--hook-input", &hook_input_str], envs)
-        .expect("checkpoint should succeed");
+    repo.git_ai_with_env(
+        &["checkpoint", "agent-v1", "--hook-input", &hook_input_str],
+        envs,
+    )
+    .expect("checkpoint should succeed");
 }
 
 /// Helper to verify database schema exists and is valid
@@ -995,14 +998,17 @@ fn test_populate_skips_prompts_for_orphaned_commits() {
     );
 
     repo.git(&["add", "-A"]).unwrap();
-    repo.git(&["commit", "-m", "orphaned prompt commit"]).unwrap();
+    repo.git(&["commit", "-m", "orphaned prompt commit"])
+        .unwrap();
     let orphaned_commit = git_rev_parse(&repo, "HEAD");
 
     repo.git(&["reset", "--hard", &initial]).unwrap();
 
     let reachable_after_reset = repo.git(&["rev-list", "--all"]).unwrap();
     assert!(
-        !reachable_after_reset.lines().any(|line| line.trim() == orphaned_commit),
+        !reachable_after_reset
+            .lines()
+            .any(|line| line.trim() == orphaned_commit),
         "orphaned commit should no longer be reachable after reset"
     );
 
@@ -1014,7 +1020,10 @@ fn test_populate_skips_prompts_for_orphaned_commits() {
         .query_row("SELECT COUNT(*) FROM prompts", [], |row| row.get(0))
         .unwrap();
 
-    assert_eq!(count, 0, "orphaned prompt notes should be filtered out at populate time");
+    assert_eq!(
+        count, 0,
+        "orphaned prompt notes should be filtered out at populate time"
+    );
 }
 
 #[test]
@@ -1041,7 +1050,8 @@ fn test_populate_keeps_prompts_for_reachable_commits_with_matching_commit_sha() 
     );
 
     repo.git(&["add", "-A"]).unwrap();
-    repo.git(&["commit", "-m", "reachable prompt commit"]).unwrap();
+    repo.git(&["commit", "-m", "reachable prompt commit"])
+        .unwrap();
     let expected_commit = git_rev_parse(&repo, "HEAD");
 
     repo.git_ai(&["prompts"]).unwrap();
@@ -1056,11 +1066,16 @@ fn test_populate_keeps_prompts_for_reachable_commits_with_matching_commit_sha() 
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    assert_eq!(rows, vec![expected_commit], "reachable prompt rows should retain the reachable commit SHA");
+    assert_eq!(
+        rows,
+        vec![expected_commit],
+        "reachable prompt rows should retain the reachable commit SHA"
+    );
 }
 
 #[test]
-fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_multiple_reachable_notes() {
+fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_multiple_reachable_notes()
+ {
     let mut repo = TestRepo::new_dedicated_daemon();
 
     repo.patch_git_ai_config(|patch| {
@@ -1073,12 +1088,8 @@ fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_mult
 
     let readme_path = repo.path().join("README.md");
     fs::write(&readme_path, "# Test\n").unwrap();
-    repo.git_with_env(
-        &["add", "-A"],
-        &[("GIT_CONFIG_NOSYSTEM", "1")],
-        None,
-    )
-    .unwrap();
+    repo.git_with_env(&["add", "-A"], &[("GIT_CONFIG_NOSYSTEM", "1")], None)
+        .unwrap();
     repo.git_with_env(
         &["commit", "-m", "initial"],
         &[
@@ -1101,12 +1112,8 @@ fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_mult
         "shared-conv",
         &[("GIT_CONFIG_NOSYSTEM", "1")],
     );
-    repo.git_with_env(
-        &["add", "-A"],
-        &[("GIT_CONFIG_NOSYSTEM", "1")],
-        None,
-    )
-    .unwrap();
+    repo.git_with_env(&["add", "-A"], &[("GIT_CONFIG_NOSYSTEM", "1")], None)
+        .unwrap();
     repo.git_with_env(
         &["commit", "-m", "first prompt commit"],
         &[
@@ -1129,12 +1136,8 @@ fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_mult
         "shared-conv",
         &[("GIT_CONFIG_NOSYSTEM", "1")],
     );
-    repo.git_with_env(
-        &["add", "-A"],
-        &[("GIT_CONFIG_NOSYSTEM", "1")],
-        None,
-    )
-    .unwrap();
+    repo.git_with_env(&["add", "-A"], &[("GIT_CONFIG_NOSYSTEM", "1")], None)
+        .unwrap();
     repo.git_with_env(
         &["commit", "-m", "later plain commit"],
         &[
@@ -1165,10 +1168,8 @@ fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_mult
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    let matching_rows: Vec<(String, String)> = rows
-        .into_iter()
-        .filter(|(id, _)| id == &first_id)
-        .collect();
+    let matching_rows: Vec<(String, String)> =
+        rows.into_iter().filter(|(id, _)| id == &first_id).collect();
 
     let expected_latest = repo
         .git(&[
@@ -1191,10 +1192,13 @@ fn test_populate_prefers_newer_commit_when_duplicate_prompt_hash_appears_on_mult
         .map(|(sha, _)| sha)
         .expect("should have latest commit from git show timestamps");
 
-    assert_eq!(matching_rows.len(), 1, "duplicate prompt hash should collapse to a single row in the production prompts path");
     assert_eq!(
-        matching_rows[0].1,
-        expected_latest,
+        matching_rows.len(),
+        1,
+        "duplicate prompt hash should collapse to a single row in the production prompts path"
+    );
+    assert_eq!(
+        matching_rows[0].1, expected_latest,
         "duplicate prompt hash should keep the newer reachable commit selected using the production commit_dates_for path"
     );
 }

@@ -25,11 +25,11 @@ use crate::observability::wrapper_performance_targets::log_performance_target_if
 #[cfg(windows)]
 use crate::utils::CREATE_NO_WINDOW;
 #[cfg(windows)]
+use crate::utils::is_debug_enabled;
+#[cfg(windows)]
 use crate::utils::is_interactive_terminal;
 #[cfg(windows)]
 use crate::utils::kill_process_tree_windows;
-#[cfg(windows)]
-use crate::utils::is_debug_enabled;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -229,10 +229,10 @@ pub fn handle_git(args: &[String]) {
     let has_repo = repository_option.is_some();
 
     // Resolve aliases before is_command_skip_hooks() so "ci" → "commit" is recognized.
-    if let Some(repository) = repository_option.as_mut() {
-        if let Some(resolved) = resolve_alias_invocation(&parsed_args, repository) {
-            parsed_args = resolved;
-        }
+    if let Some(repository) = repository_option.as_mut()
+        && let Some(resolved) = resolve_alias_invocation(&parsed_args, repository)
+    {
+        parsed_args = resolved;
     }
 
     if is_command_skip_hooks(&parsed_args) {
@@ -976,7 +976,8 @@ fn proxy_to_git(
                 }
             }
             if exit_on_completion {
-                let status = cmd.stdin(std::process::Stdio::inherit())
+                let status = cmd
+                    .stdin(std::process::Stdio::inherit())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
                     .status()

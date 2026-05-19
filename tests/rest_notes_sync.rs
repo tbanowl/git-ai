@@ -151,9 +151,7 @@ fn handle_http_connection(
             write_http_response(&mut stream, code, "Error", &response_body)
         }
     };
-    if write_result.is_err() {
-        return;
-    }
+    if write_result.is_err() {}
 }
 
 fn read_http_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Option<(String, Vec<u8>)> {

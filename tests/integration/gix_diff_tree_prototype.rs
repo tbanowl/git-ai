@@ -62,8 +62,14 @@ fn gix_diff_tree_prototype_preserves_current_delta_order_status_letters_oids_and
         .map(|delta| {
             (
                 delta.status(),
-                delta.old_file().path().map(|p| p.to_string_lossy().to_string()),
-                delta.new_file().path().map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
                 delta.old_file().mode().to_string(),
                 delta.new_file().mode().to_string(),
                 delta.old_file().id().to_string(),
@@ -130,8 +136,14 @@ fn gix_diff_tree_prototype_preserves_current_rename_path_shape_and_metadata() {
         .map(|delta| {
             (
                 delta.status(),
-                delta.old_file().path().map(|p| p.to_string_lossy().to_string()),
-                delta.new_file().path().map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
                 delta.old_file().mode().to_string(),
                 delta.new_file().mode().to_string(),
                 delta.old_file().id().to_string(),
@@ -150,7 +162,10 @@ fn gix_diff_tree_prototype_preserves_current_rename_path_shape_and_metadata() {
             "100644".to_string(),
             "100644".to_string(),
             rev_parse(&repo, &format!("{}:before name.txt", base_commit)),
-            rev_parse(&repo, &format!("{}:renamed dir/after name.txt", head_commit)),
+            rev_parse(
+                &repo,
+                &format!("{}:renamed dir/after name.txt", head_commit)
+            ),
             100,
         )],
         "prototype should capture the current raw parser rename path orientation"
@@ -167,7 +182,10 @@ fn gix_diff_tree_prototype_keeps_copy_like_changes_as_added_entries() {
     repo.git_og(&["config", "diff.renames", "copies"])
         .expect("should enable copy-friendly config");
     write_file(&repo, "copy target.txt", "same blob\n");
-    let head_commit = repo.stage_all_and_commit("copy-like add").unwrap().commit_sha;
+    let head_commit = repo
+        .stage_all_and_commit("copy-like add")
+        .unwrap()
+        .commit_sha;
 
     let repository = open_repo(&repo);
     let base_tree = tree_for_rev(&repository, &base_commit);
@@ -180,8 +198,14 @@ fn gix_diff_tree_prototype_keeps_copy_like_changes_as_added_entries() {
         .map(|delta| {
             (
                 delta.status(),
-                delta.old_file().path().map(|p| p.to_string_lossy().to_string()),
-                delta.new_file().path().map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
+                delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string()),
             )
         })
         .collect();
@@ -226,7 +250,8 @@ fn gix_diff_tree_prototype_preserves_raw_paths_with_spaces_and_non_ascii() {
         .map(|delta| {
             (
                 delta.status(),
-                delta.new_file()
+                delta
+                    .new_file()
                     .path()
                     .map(|path| path.to_string_lossy().to_string())
                     .expect("path should be utf-8"),
@@ -237,7 +262,10 @@ fn gix_diff_tree_prototype_preserves_raw_paths_with_spaces_and_non_ascii() {
     assert_eq!(
         paths,
         vec![
-            (DiffStatus::Modified, "space dir/hello world.txt".to_string()),
+            (
+                DiffStatus::Modified,
+                "space dir/hello world.txt".to_string()
+            ),
             (DiffStatus::Modified, "unicodé/文件.txt".to_string()),
         ],
         "prototype should lock the current raw parser path strings for spaces and non-ASCII paths"

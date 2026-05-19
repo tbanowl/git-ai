@@ -1,5 +1,5 @@
 use crate::authorship::attribution_tracker::LineAttribution;
-use crate::authorship::authorship_log::{PromptRecord};
+use crate::authorship::authorship_log::PromptRecord;
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::working_log::{CHECKPOINT_API_VERSION, Checkpoint, CheckpointKind};
 use crate::error::GitAiError;
@@ -1144,11 +1144,7 @@ mod tests {
         contents.insert("src/test.rs".to_string(), "fn main() {}\n".to_string());
 
         working_log
-            .write_initial_attributions_with_contents(
-                attributions,
-                HashMap::new(),
-                contents,
-            )
+            .write_initial_attributions_with_contents(attributions, HashMap::new(), contents)
             .expect("write INITIAL with contents");
 
         let initial = working_log.read_initial_attributions();

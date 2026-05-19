@@ -233,8 +233,12 @@ mod tests {
             "HEAD".to_string(),
             "abc123".to_string(),
         ]);
-        let command = parse_simple_update_ref(&parsed).expect("parser should still recognize simple no-deref form");
+        let command = parse_simple_update_ref(&parsed)
+            .expect("parser should still recognize simple no-deref form");
         assert_eq!(command.ref_name, "HEAD");
-        assert!(command.no_deref, "parser should preserve --no-deref so the hook can safely decline handling symbolic HEAD updates");
+        assert!(
+            command.no_deref,
+            "parser should preserve --no-deref so the hook can safely decline handling symbolic HEAD updates"
+        );
     }
 }

@@ -844,7 +844,7 @@ Human line
     // Explicit commit
     repo.commit("Second commit").unwrap();
     file.assert_committed_lines(lines![
-        "Human line".human(),                  // known human
+        "Human line".human(), // known human
     ]);
 
     let third_edit = "\
@@ -857,8 +857,8 @@ AI line
     // Example of a completely untracked edit where we didn't fire a checkpoint call at all
     repo.stage_all_and_commit("Third commit").unwrap();
     file.assert_committed_lines(lines![
-        "Human line".human(),                  // known human
-        "AI line".ai(),                        // AI line
+        "Human line".human(), // known human
+        "AI line".ai(),       // AI line
     ]);
 
     let fourth_edit = "\
@@ -885,9 +885,9 @@ Another AI line
         .unwrap();
     repo.stage_all_and_commit("Fourth commit").unwrap();
     file.assert_committed_lines(lines![
-        "Human line".human(),                          // known human
-        "AI line".ai(),                                // AI line
-        "Another AI line".ai(),                        // AI line
+        "Human line".human(),   // known human
+        "AI line".ai(),         // AI line
+        "Another AI line".ai(), // AI line
     ]);
 }
 

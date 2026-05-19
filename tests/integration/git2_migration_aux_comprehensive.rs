@@ -131,7 +131,8 @@ fn extract_blame_hashes(output: &str) -> Vec<String> {
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_prompts_reachable_commit_rows_match_git_rev_list_all_for_noted_commits() {
+fn git2_migration_aux_comprehensive_prompts_reachable_commit_rows_match_git_rev_list_all_for_noted_commits()
+ {
     let mut repo = TestRepo::new_dedicated_daemon();
     repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
@@ -143,10 +144,20 @@ fn git2_migration_aux_comprehensive_prompts_reachable_commit_rows_match_git_rev_
 
     repo.git(&["checkout", "-b", "feature"])
         .expect("create feature branch");
-    let feature_prompt = create_ai_commit(&repo, "feature.ts", "const feature = 1;\n", "const feature = 2;\n");
+    let feature_prompt = create_ai_commit(
+        &repo,
+        "feature.ts",
+        "const feature = 1;\n",
+        "const feature = 2;\n",
+    );
 
     repo.git(&["checkout", &trunk]).expect("return to trunk");
-    let orphan_prompt = create_ai_commit(&repo, "orphan.ts", "const orphan = 1;\n", "const orphan = 2;\n");
+    let orphan_prompt = create_ai_commit(
+        &repo,
+        "orphan.ts",
+        "const orphan = 1;\n",
+        "const orphan = 2;\n",
+    );
     repo.git(&["reset", "--hard", "HEAD^"])
         .expect("drop orphan prompt commit from reachable history");
 
@@ -159,7 +170,8 @@ fn git2_migration_aux_comprehensive_prompts_reachable_commit_rows_match_git_rev_
         .map(str::to_string)
         .collect();
 
-    repo.git_ai(&["prompts"]).expect("prompts populate should succeed");
+    repo.git_ai(&["prompts"])
+        .expect("prompts populate should succeed");
 
     let conn = Connection::open(repo.path().join("prompts.db")).expect("open prompts db");
     let actual: std::collections::HashSet<String> = conn
@@ -170,20 +182,35 @@ fn git2_migration_aux_comprehensive_prompts_reachable_commit_rows_match_git_rev_
         .collect::<Result<_, _>>()
         .unwrap();
 
-    let expected: std::collections::HashSet<String> =
-        [main_prompt.clone(), feature_prompt.clone(), orphan_prompt.clone()]
-            .into_iter()
-            .filter(|sha| reachable_from_git.contains(sha))
-            .collect();
+    let expected: std::collections::HashSet<String> = [
+        main_prompt.clone(),
+        feature_prompt.clone(),
+        orphan_prompt.clone(),
+    ]
+    .into_iter()
+    .filter(|sha| reachable_from_git.contains(sha))
+    .collect();
 
-    assert_eq!(actual, expected, "prompt commit rows should match the git-reachable subset of noted commits");
-    assert!(!actual.contains(&orphan_prompt), "orphaned noted commit should be excluded by the production reachable_commits path");
+    assert_eq!(
+        actual, expected,
+        "prompt commit rows should match the git-reachable subset of noted commits"
+    );
+    assert!(
+        !actual.contains(&orphan_prompt),
+        "orphaned noted commit should be excluded by the production reachable_commits path"
+    );
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_diff_single_commit_resolution_matches_git_rev_parse_for_head_sha_and_branch() {
+fn git2_migration_aux_comprehensive_diff_single_commit_resolution_matches_git_rev_parse_for_head_sha_and_branch()
+ {
     let repo = TestRepo::new();
-    let commit = create_ai_commit(&repo, "resolve-commit.ts", "const a = 1;\n", "const a = 2;\n");
+    let commit = create_ai_commit(
+        &repo,
+        "resolve-commit.ts",
+        "const a = 1;\n",
+        "const a = 2;\n",
+    );
     let repository = open_repo(&repo);
     let branch = repo.current_branch();
 
@@ -192,19 +219,37 @@ fn git2_migration_aux_comprehensive_diff_single_commit_resolution_matches_git_re
         let diff_json = get_diff_json_filtered(&repository, rev, DiffOptions::default())
             .expect("single-commit diff should resolve");
 
-        let actual: std::collections::HashSet<&str> =
-            diff_json.hunks.iter().map(|hunk| hunk.commit_sha.as_str()).collect();
+        let actual: std::collections::HashSet<&str> = diff_json
+            .hunks
+            .iter()
+            .map(|hunk| hunk.commit_sha.as_str())
+            .collect();
 
-        assert_eq!(actual.len(), 1, "expected a single resolved commit for rev {rev}");
-        assert!(actual.contains(expected.as_str()), "resolved commit should match git rev-parse for rev {rev}");
-        assert!(diff_json.commits.contains_key(&expected), "commit metadata should be keyed by the git-resolved SHA for rev {rev}");
+        assert_eq!(
+            actual.len(),
+            1,
+            "expected a single resolved commit for rev {rev}"
+        );
+        assert!(
+            actual.contains(expected.as_str()),
+            "resolved commit should match git rev-parse for rev {rev}"
+        );
+        assert!(
+            diff_json.commits.contains_key(&expected),
+            "commit metadata should be keyed by the git-resolved SHA for rev {rev}"
+        );
     }
 }
 
 #[test]
 fn git2_migration_aux_comprehensive_diff_single_commit_resolution_rejects_invalid_revspec() {
     let repo = TestRepo::new();
-    let _commit = create_ai_commit(&repo, "resolve-invalid.ts", "const a = 1;\n", "const b = 2;\n");
+    let _commit = create_ai_commit(
+        &repo,
+        "resolve-invalid.ts",
+        "const a = 1;\n",
+        "const b = 2;\n",
+    );
     let repository = open_repo(&repo);
     let invalid_rev = "definitely-not-a-real-revision";
 
@@ -248,7 +293,10 @@ fn git2_migration_aux_comprehensive_walk_commits_to_base_matches_git_rev_list_fo
 
     let actual = walk_commits_to_base(&repository, &head, &base).expect("walk should succeed");
 
-    assert_eq!(actual, expected, "commit walk should preserve git CLI ordering and ancestry-path filtering");
+    assert_eq!(
+        actual, expected,
+        "commit walk should preserve git CLI ordering and ancestry-path filtering"
+    );
 }
 
 #[test]
@@ -260,7 +308,10 @@ fn git2_migration_aux_comprehensive_walk_commits_to_base_returns_empty_for_same_
 
     let actual = walk_commits_to_base(&repository, &commit, &commit).expect("walk should succeed");
 
-    assert!(actual.is_empty(), "same head/base should yield no intermediate commits");
+    assert!(
+        actual.is_empty(),
+        "same head/base should yield no intermediate commits"
+    );
 }
 
 #[test]
@@ -269,16 +320,26 @@ fn git2_migration_aux_comprehensive_walk_commits_to_base_rejects_missing_or_non_
     let (base, head, commits) = create_merge_heavy_history(&repo);
     let repository = open_repo(&repo);
 
-    let missing = walk_commits_to_base(&repository, &head, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let missing = walk_commits_to_base(
+        &repository,
+        &head,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
     assert!(missing.is_err(), "missing base commit should error");
 
     let non_ancestor = walk_commits_to_base(&repository, &commits[1], &commits[3]);
-    let message = non_ancestor.expect_err("non-ancestor base should error").to_string();
-    assert!(message.contains("not an ancestor") || message.contains(&base), "unexpected non-ancestor error: {message}");
+    let message = non_ancestor
+        .expect_err("non-ancestor base should error")
+        .to_string();
+    assert!(
+        message.contains("not an ancestor") || message.contains(&base),
+        "unexpected non-ancestor error: {message}"
+    );
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_rebase_ancestor_family_covers_equal_ancestor_non_ancestor_and_missing() {
+fn git2_migration_aux_comprehensive_rebase_ancestor_family_covers_equal_ancestor_non_ancestor_and_missing()
+ {
     let repo = TestRepo::new();
     write_file(&repo, "ancestor-family.txt", "base\n");
     let base = repo.stage_all_and_commit("base").unwrap().commit_sha;
@@ -295,18 +356,40 @@ fn git2_migration_aux_comprehensive_rebase_ancestor_family_covers_equal_ancestor
 
     let equal = build_rebase_commit_mappings(&repository, &child, &child, Some(&child))
         .expect("equal heads should produce an empty mapping instead of erroring");
-    assert!(equal.0.is_empty(), "equal case should have no original commits to rewrite");
-    assert!(equal.1.is_empty(), "equal case should have no new commits to rewrite");
+    assert!(
+        equal.0.is_empty(),
+        "equal case should have no original commits to rewrite"
+    );
+    assert!(
+        equal.1.is_empty(),
+        "equal case should have no new commits to rewrite"
+    );
 
     let ancestor = build_rebase_commit_mappings(&repository, &child, &side, Some(&base))
         .expect("valid ancestor lower bound should succeed");
-    assert_eq!(ancestor.0, vec![child.clone()], "ancestor case should keep the rewritten original commit");
-    assert_eq!(ancestor.1, vec![side.clone()], "ancestor case should map to the rewritten descendant commit");
+    assert_eq!(
+        ancestor.0,
+        vec![child.clone()],
+        "ancestor case should keep the rewritten original commit"
+    );
+    assert_eq!(
+        ancestor.1,
+        vec![side.clone()],
+        "ancestor case should map to the rewritten descendant commit"
+    );
 
     let non_ancestor = build_rebase_commit_mappings(&repository, &child, &side, Some(&child))
         .expect("non-ancestor onto should be ignored rather than erroring");
-    assert_eq!(non_ancestor.0, vec![child.clone()], "non-ancestor onto fallback should still keep the original commit lane");
-    assert_eq!(non_ancestor.1, vec![side.clone()], "non-ancestor onto fallback should use merge-base-derived rewritten commits");
+    assert_eq!(
+        non_ancestor.0,
+        vec![child.clone()],
+        "non-ancestor onto fallback should still keep the original commit lane"
+    );
+    assert_eq!(
+        non_ancestor.1,
+        vec![side.clone()],
+        "non-ancestor onto fallback should use merge-base-derived rewritten commits"
+    );
 
     let missing = build_rebase_commit_mappings(
         &repository,
@@ -338,14 +421,18 @@ fn git2_migration_aux_comprehensive_rebase_commit_mappings_match_first_parent_gi
     write_file(&repo, "feature-only.txt", "feature-1\n");
     repo.stage_all_and_commit("feature commit 1").unwrap();
     write_file(&repo, "feature-only.txt", "feature-1\nfeature-2\n");
-    let original_head = repo.stage_all_and_commit("feature commit 2").unwrap().commit_sha;
+    let original_head = repo
+        .stage_all_and_commit("feature commit 2")
+        .unwrap()
+        .commit_sha;
 
     repo.git(&["checkout", &trunk]).unwrap();
     write_file(&repo, "main-only.txt", "main\n");
     let onto_head = repo.stage_all_and_commit("main change").unwrap().commit_sha;
 
     repo.git(&["checkout", "feature"]).unwrap();
-    repo.git(&["rebase", &trunk]).expect("rebase should succeed");
+    repo.git(&["rebase", &trunk])
+        .expect("rebase should succeed");
     let new_head = git_rev_parse(&repo, "HEAD");
     let repository = open_repo(&repo);
 
@@ -371,13 +458,25 @@ fn git2_migration_aux_comprehensive_rebase_commit_mappings_match_first_parent_gi
         build_rebase_commit_mappings(&repository, &original_head, &new_head, Some(&onto_head))
             .expect("rebase mappings should succeed");
 
-    assert_eq!(new_commits, expected_new, "rebased commit mapping should follow git first-parent history in replay order (oldest to newest)");
-    assert_eq!(original_commits.len(), 2, "original feature lane should contain both feature commits");
-    assert_eq!(new_commits.len(), 2, "rebased lane should contain both rewritten commits");
+    assert_eq!(
+        new_commits, expected_new,
+        "rebased commit mapping should follow git first-parent history in replay order (oldest to newest)"
+    );
+    assert_eq!(
+        original_commits.len(),
+        2,
+        "original feature lane should contain both feature commits"
+    );
+    assert_eq!(
+        new_commits.len(),
+        2,
+        "rebased lane should contain both rewritten commits"
+    );
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_cherry_pick_range_rewrite_log_matches_git_rev_list_reverse_order() {
+fn git2_migration_aux_comprehensive_cherry_pick_range_rewrite_log_matches_git_rev_list_reverse_order()
+ {
     let repo = TestRepo::new();
     write_file(&repo, "range-base.txt", "base\n");
     repo.stage_all_and_commit("base").unwrap();
@@ -389,7 +488,10 @@ fn git2_migration_aux_comprehensive_cherry_pick_range_rewrite_log_matches_git_re
     write_file(&repo, "two.txt", "two\n");
     let second = repo.stage_all_and_commit("feature two").unwrap().commit_sha;
     write_file(&repo, "three.txt", "three\n");
-    let third = repo.stage_all_and_commit("feature three").unwrap().commit_sha;
+    let third = repo
+        .stage_all_and_commit("feature three")
+        .unwrap()
+        .commit_sha;
 
     let expected = repo
         .git(&["rev-list", "--reverse", &format!("{}..{}", first, third)])
@@ -399,7 +501,11 @@ fn git2_migration_aux_comprehensive_cherry_pick_range_rewrite_log_matches_git_re
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    assert_eq!(expected, vec![second.clone(), third.clone()], "sanity check expected git range ordering");
+    assert_eq!(
+        expected,
+        vec![second.clone(), third.clone()],
+        "sanity check expected git range ordering"
+    );
 
     repo.git(&["checkout", &trunk]).unwrap();
     repo.git(&["cherry-pick", &format!("{}..{}", first, third)])
@@ -413,7 +519,10 @@ fn git2_migration_aux_comprehensive_cherry_pick_range_rewrite_log_matches_git_re
         })
         .expect("cherry-pick start event should exist");
 
-    assert_eq!(start.source_commits, expected, "rewrite log source commits should follow git rev-list --reverse range expansion");
+    assert_eq!(
+        start.source_commits, expected,
+        "rewrite log source commits should follow git rev-list --reverse range expansion"
+    );
 }
 
 #[test]
@@ -425,7 +534,10 @@ fn git2_migration_aux_comprehensive_cherry_pick_short_sha_rewrite_log_matches_gi
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
     write_file(&repo, "short-sha.txt", "base\nfeature\n");
-    let commit = repo.stage_all_and_commit("feature short sha").unwrap().commit_sha;
+    let commit = repo
+        .stage_all_and_commit("feature short sha")
+        .unwrap()
+        .commit_sha;
     let short = &commit[..8];
     let expected = git_rev_parse(&repo, short);
 
@@ -441,7 +553,11 @@ fn git2_migration_aux_comprehensive_cherry_pick_short_sha_rewrite_log_matches_gi
         })
         .expect("cherry-pick start event should exist");
 
-    assert_eq!(start.source_commits, vec![expected], "single commit cherry-pick should resolve short SHA the same way as git rev-parse");
+    assert_eq!(
+        start.source_commits,
+        vec![expected],
+        "single commit cherry-pick should resolve short SHA the same way as git rev-parse"
+    );
 }
 
 #[test]
@@ -453,7 +569,10 @@ fn git2_migration_aux_comprehensive_cherry_pick_short_signoff_preserves_next_com
 
     repo.git(&["checkout", "-b", "feature"]).unwrap();
     write_file(&repo, "signoff.txt", "feature\n");
-    let commit = repo.stage_all_and_commit("feature with signoff").unwrap().commit_sha;
+    let commit = repo
+        .stage_all_and_commit("feature with signoff")
+        .unwrap()
+        .commit_sha;
     let expected = git_rev_parse(&repo, &commit);
 
     repo.git(&["checkout", &trunk]).unwrap();
@@ -476,7 +595,8 @@ fn git2_migration_aux_comprehensive_cherry_pick_short_signoff_preserves_next_com
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_rebase_skip_middle_commit_matches_subject_alignment_in_complete_event() {
+fn git2_migration_aux_comprehensive_rebase_skip_middle_commit_matches_subject_alignment_in_complete_event()
+ {
     let repo = TestRepo::new();
     write_file(&repo, "base.txt", "base\n");
     repo.stage_all_and_commit("base").unwrap();
@@ -486,16 +606,23 @@ fn git2_migration_aux_comprehensive_rebase_skip_middle_commit_matches_subject_al
     write_file(&repo, "alpha.txt", "alpha\n");
     repo.stage_all_and_commit("subject alpha").unwrap();
     write_file(&repo, "beta.txt", "beta\n");
-    let beta = repo.stage_all_and_commit("subject beta").unwrap().commit_sha;
+    let beta = repo
+        .stage_all_and_commit("subject beta")
+        .unwrap()
+        .commit_sha;
     write_file(&repo, "gamma.txt", "gamma\n");
-    let gamma = repo.stage_all_and_commit("subject gamma").unwrap().commit_sha;
+    let gamma = repo
+        .stage_all_and_commit("subject gamma")
+        .unwrap()
+        .commit_sha;
 
     repo.git(&["checkout", &trunk]).unwrap();
     write_file(&repo, "beta.txt", "beta\n");
     repo.stage_all_and_commit("pre-apply beta on main").unwrap();
 
     repo.git(&["checkout", "feature"]).unwrap();
-    repo.git(&["rebase", &trunk]).expect("rebase should succeed with skipped middle commit");
+    repo.git(&["rebase", &trunk])
+        .expect("rebase should succeed with skipped middle commit");
 
     let complete = repo_rewrite_events(&repo)
         .into_iter()
@@ -516,33 +643,64 @@ fn git2_migration_aux_comprehensive_rebase_skip_middle_commit_matches_subject_al
         .map(|sha| commit_subject(&repo, sha))
         .collect();
 
-    assert!(original_subjects.contains(&commit_subject(&repo, &beta)), "precondition: skipped source commit should be present in original mapping input");
-    assert!(original_subjects.contains(&commit_subject(&repo, &gamma)), "precondition: later source commit should be present in original mapping input");
-    assert_eq!(new_subjects, vec!["subject alpha".to_string(), "subject gamma".to_string()], "rebase completion should preserve the actually rewritten first-parent subjects");
-    assert!(!new_subjects.contains(&"subject beta".to_string()), "skipped middle commit should not appear in rewritten commit subjects");
+    assert!(
+        original_subjects.contains(&commit_subject(&repo, &beta)),
+        "precondition: skipped source commit should be present in original mapping input"
+    );
+    assert!(
+        original_subjects.contains(&commit_subject(&repo, &gamma)),
+        "precondition: later source commit should be present in original mapping input"
+    );
+    assert_eq!(
+        new_subjects,
+        vec!["subject alpha".to_string(), "subject gamma".to_string()],
+        "rebase completion should preserve the actually rewritten first-parent subjects"
+    );
+    assert!(
+        !new_subjects.contains(&"subject beta".to_string()),
+        "skipped middle commit should not appear in rewritten commit subjects"
+    );
 }
 
 #[test]
 fn git2_migration_aux_comprehensive_search_by_commit_range_is_empty_for_empty_range() {
     let repo = TestRepo::new();
-    let head = create_ai_commit(&repo, "search-empty.ts", "const a = 1;\n", "const a = 1;\nconst b = 2;\n");
+    let head = create_ai_commit(
+        &repo,
+        "search-empty.ts",
+        "const a = 1;\n",
+        "const a = 1;\nconst b = 2;\n",
+    );
     let repository = open_repo(&repo);
 
-    let result = search_by_commit_range(&repository, &head, &head).expect("empty range search should succeed");
+    let result = search_by_commit_range(&repository, &head, &head)
+        .expect("empty range search should succeed");
 
-    assert!(result.is_empty(), "same start/end should not search any commits");
+    assert!(
+        result.is_empty(),
+        "same start/end should not search any commits"
+    );
 }
 
 #[test]
 fn git2_migration_aux_comprehensive_search_by_commit_range_returns_single_commit_results() {
     let repo = TestRepo::new();
-    let commit = create_ai_commit(&repo, "search-single.ts", "const a = 1;\n", "const a = 1;\nconst b = 2;\n");
+    let commit = create_ai_commit(
+        &repo,
+        "search-single.ts",
+        "const a = 1;\n",
+        "const a = 1;\nconst b = 2;\n",
+    );
     let parent = git_rev_parse(&repo, "HEAD^");
     let repository = open_repo(&repo);
 
-    let result = search_by_commit_range(&repository, &parent, &commit).expect("single commit range should succeed");
+    let result = search_by_commit_range(&repository, &parent, &commit)
+        .expect("single commit range should succeed");
 
-    assert!(!result.is_empty(), "single commit range should surface AI prompt metadata");
+    assert!(
+        !result.is_empty(),
+        "single commit range should surface AI prompt metadata"
+    );
     assert!(
         result
             .prompt_commits
@@ -554,7 +712,8 @@ fn git2_migration_aux_comprehensive_search_by_commit_range_returns_single_commit
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_blame_abbrev_hashes_match_git_for_default_and_explicit_widths() {
+fn git2_migration_aux_comprehensive_blame_abbrev_hashes_match_git_for_default_and_explicit_widths()
+{
     let repo = TestRepo::new();
     write_file(&repo, "blame.txt", "root\nshared\n");
     repo.stage_all_and_commit("root").unwrap();
@@ -568,7 +727,9 @@ fn git2_migration_aux_comprehensive_blame_abbrev_hashes_match_git_for_default_an
             Some(width) => repo
                 .git(&["blame", &format!("--abbrev={width}"), "blame.txt"])
                 .expect("git blame should succeed"),
-            None => repo.git(&["blame", "blame.txt"]).expect("git blame should succeed"),
+            None => repo
+                .git(&["blame", "blame.txt"])
+                .expect("git blame should succeed"),
         };
         let git_ai_output = match extra {
             Some(width) => repo
@@ -581,7 +742,10 @@ fn git2_migration_aux_comprehensive_blame_abbrev_hashes_match_git_for_default_an
 
         let git_hashes = extract_blame_hashes(&git_output);
         let git_ai_hashes = extract_blame_hashes(&git_ai_output);
-        assert_eq!(git_ai_hashes, git_hashes, "abbreviated blame SHAs should match git for width {extra:?}");
+        assert_eq!(
+            git_ai_hashes, git_hashes,
+            "abbreviated blame SHAs should match git for width {extra:?}"
+        );
     }
 }
 
@@ -593,7 +757,10 @@ fn git2_migration_aux_comprehensive_ref_exists_tracks_existing_and_missing_refs(
     let repository = open_repo(&repo);
     let branch_name = repo.current_branch();
 
-    assert!(ref_exists(&repository, "HEAD"), "HEAD should always resolve");
+    assert!(
+        ref_exists(&repository, "HEAD"),
+        "HEAD should always resolve"
+    );
     assert!(
         ref_exists(&repository, &format!("refs/heads/{branch_name}")),
         "current branch ref should exist"
@@ -613,10 +780,14 @@ fn git2_migration_aux_comprehensive_copy_ref_creates_missing_destination_and_pre
 
     assert!(!ref_exists(&repository, "refs/notes/ai-backup"));
 
-    copy_ref(&repository, "HEAD", "refs/notes/ai-backup").expect("copy_ref should create destination");
+    copy_ref(&repository, "HEAD", "refs/notes/ai-backup")
+        .expect("copy_ref should create destination");
 
     assert!(ref_exists(&repository, "refs/notes/ai-backup"));
-    assert_eq!(git_rev_parse(&repo, "HEAD"), git_rev_parse(&repo, "refs/notes/ai-backup"));
+    assert_eq!(
+        git_rev_parse(&repo, "HEAD"),
+        git_rev_parse(&repo, "refs/notes/ai-backup")
+    );
 }
 
 #[test]
@@ -632,19 +803,25 @@ fn git2_migration_aux_comprehensive_copy_ref_overwrites_existing_destination() {
         .expect("seed destination ref");
     assert_eq!(git_rev_parse(&repo, "refs/notes/overwrite-dest"), first);
 
-    copy_ref(&repository, "HEAD", "refs/notes/overwrite-dest").expect("copy_ref should overwrite existing destination");
+    copy_ref(&repository, "HEAD", "refs/notes/overwrite-dest")
+        .expect("copy_ref should overwrite existing destination");
 
     assert_eq!(git_rev_parse(&repo, "refs/notes/overwrite-dest"), second);
 }
 
 #[test]
-fn git2_migration_aux_comprehensive_copy_ref_errors_for_missing_source_without_creating_destination() {
+fn git2_migration_aux_comprehensive_copy_ref_errors_for_missing_source_without_creating_destination()
+ {
     let repo = TestRepo::new();
     write_file(&repo, "copy-missing.txt", "content\n");
     repo.stage_all_and_commit("copy missing").unwrap();
     let repository = open_repo(&repo);
 
-    let result = copy_ref(&repository, "refs/heads/does-not-exist", "refs/notes/missing-copy");
+    let result = copy_ref(
+        &repository,
+        "refs/heads/does-not-exist",
+        "refs/notes/missing-copy",
+    );
 
     assert!(result.is_err(), "missing source ref should fail copy_ref");
     assert!(

@@ -144,7 +144,7 @@ fn test_cherry_pick_preserves_prompt_only_commit_note_metadata() {
     );
     assert!(
         source_log.metadata.prompts.is_empty(),
-         "precondition: source commit should not have prompts before test mutation"
+        "precondition: source commit should not have prompts before test mutation"
     );
 
     let mut test_attrs = HashMap::new();

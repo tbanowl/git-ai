@@ -308,8 +308,14 @@ fn test_continue_context_includes_full_commit_message_body_when_present() {
         output.contains("Subject line"),
         "output should include the commit subject somewhere in the restored context"
     );
-    assert!(output.contains("Extended body line 1"), "output should include the first body line");
-    assert!(output.contains("Extended body line 2"), "output should include the second body line");
+    assert!(
+        output.contains("Extended body line 1"),
+        "output should include the first body line"
+    );
+    assert!(
+        output.contains("Extended body line 2"),
+        "output should include the second body line"
+    );
 }
 
 #[test]
@@ -322,7 +328,10 @@ fn test_continue_context_git_status_matches_branch_and_recent_commits() {
     for idx in 0..5 {
         fs::write(
             &file_path,
-            format!("const x = 1;\nconst y = 2;\nconst z = 3;\nconst extra = {};\n", idx),
+            format!(
+                "const x = 1;\nconst y = 2;\nconst z = 3;\nconst extra = {};\n",
+                idx
+            ),
         )
         .expect("should update tracked file");
         repo.stage_all_and_commit(&format!("extra commit {idx}"))
@@ -341,7 +350,10 @@ fn test_continue_context_git_status_matches_branch_and_recent_commits() {
         .git_ai(&["continue", "--commit", &ai_commit_sha])
         .expect("continue should succeed for AI commit while repo state has advanced");
 
-    assert!(output.contains(&format!("Current branch: {}", branch)), "git status block should report the current branch");
+    assert!(
+        output.contains(&format!("Current branch: {}", branch)),
+        "git status block should report the current branch"
+    );
     assert!(
         output.contains("Recent commits") || expected_recent.is_empty(),
         "git status block should still surface recent commit information when available"
@@ -364,10 +376,7 @@ fn test_continue_context_git_status_uses_detached_head_current_state() {
     repo.git(&["checkout", "--detach", &ai_commit_sha])
         .expect("detach checkout should succeed");
     let expected_branch = repo
-        .git(&[
-            "branch",
-            "--show-current",
-        ])
+        .git(&["branch", "--show-current"])
         .expect("branch --show-current should succeed")
         .trim()
         .to_string();
@@ -479,7 +488,9 @@ fn test_continue_ignores_git_external_diff_env_for_internal_show() {
         output
     );
     assert!(
-        output.contains("test.ts") && output.contains("const y = 2;") && output.contains("const z = 3;"),
+        output.contains("test.ts")
+            && output.contains("const y = 2;")
+            && output.contains("const z = 3;"),
         "git-ai continue should still include the internal commit diff content even when GIT_EXTERNAL_DIFF is set, got:\n{}",
         output
     );

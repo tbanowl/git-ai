@@ -469,9 +469,10 @@ fn walk_first_parent_commits(
 
     let g2repo = Git2Repository::open(repository.path())
         .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
-    let mut current_oid = Oid::from_str(head)
-        .map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
-    let base_oid = Oid::from_str(base).map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let mut current_oid =
+        Oid::from_str(head).map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
+    let base_oid =
+        Oid::from_str(base).map_err(|e| crate::error::GitAiError::Generic(e.to_string()))?;
     let mut commits = Vec::new();
 
     while current_oid != base_oid && commits.len() < max_count {
@@ -767,7 +768,7 @@ mod tests {
         let new_head = repo.get_head_commit_sha().expect("new head");
 
         let computed_merge_base = repo
-                .gitai_repo()
+            .gitai_repo()
             .merge_base(original_head.clone(), new_head.clone())
             .expect("merge_base");
 

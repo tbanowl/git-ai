@@ -10291,7 +10291,6 @@ fn test_conflict_ai_resolves_preserving_human_context_lines() {
     // C5': util_e.py only
     assert_note_base_commit_matches(&repo, &chain[4], "c5_base");
     assert_note_files_exact(&repo, &chain[4], "c5_files", &["util_e.py"]);
-
 }
 
 /// Test 4: version.py — conflict is on C1 (the VERY FIRST feature commit).
@@ -10466,7 +10465,6 @@ fn test_conflict_ai_resolves_on_first_commit() {
     // C5': migration_guide.py only
     assert_note_base_commit_matches(&repo, &chain[4], "c5_base");
     assert_note_files_exact(&repo, &chain[4], "c5_files", &["migration_guide.py"]);
-
 }
 
 /// Test 5: schema.rs max_connections — conflict is on C5 (LAST feature commit).
@@ -11028,7 +11026,6 @@ fn test_conflict_ai_resolves_then_more_ai_builds_on_result() {
     // C5': event_bus.py only
     assert_note_base_commit_matches(&repo, &chain[4], "c5_base");
     assert_note_files_exact(&repo, &chain[4], "c5_files", &["event_bus.py"]);
-
 }
 
 /// Test 8: models.rs struct fields — feature (C3) AI adds 4 new fields,
@@ -11228,7 +11225,6 @@ fn test_conflict_ai_resolves_rust_struct_fields() {
     // C5': utils.rs only
     assert_note_base_commit_matches(&repo, &chain[4], "c5_base");
     assert_note_files_exact(&repo, &chain[4], "c5_files", &["src/utils.rs"]);
-
 }
 
 /// Test 9: service.py process_payment — feature (C4) AI implements a 20-line
@@ -11467,7 +11463,6 @@ fn test_conflict_ai_resolves_complex_function_with_error_handling() {
     // C5': utils.py only
     assert_note_base_commit_matches(&repo, &chain[4], "c5_base");
     assert_note_files_exact(&repo, &chain[4], "c5_files", &["utils.py"]);
-
 }
 
 /// Test 10: Two conflicts — C2 (AI resolved) and C4 (human resolved).

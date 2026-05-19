@@ -695,7 +695,8 @@ fn resolve_live_checkpoint_execution(
             .map(|files| files.is_empty())
             .unwrap_or(true);
         let has_initial_attributions = !working_log.read_initial_attributions().files.is_empty();
-        let has_explicit_ai_agent_context = kind != CheckpointKind::Human && agent_run_result.is_some();
+        let has_explicit_ai_agent_context =
+            kind != CheckpointKind::Human && agent_run_result.is_some();
 
         if has_no_ai_edits
             && !has_initial_attributions
@@ -905,12 +906,12 @@ fn execute_resolved_checkpoint(
         checkpoint.timestamp = (resolved.ts / 1000) as u64;
         checkpoint.line_stats = compute_line_stats(&file_stats)?;
 
-        if kind != CheckpointKind::Human {
-            if let Some(agent_run) = &agent_run_result {
-                checkpoint.transcript = Some(agent_run.transcript.clone().unwrap_or_default());
-                checkpoint.agent_id = Some(agent_run.agent_id.clone());
-                checkpoint.agent_metadata = agent_run.agent_metadata.clone();
-            }
+        if kind != CheckpointKind::Human
+            && let Some(agent_run) = &agent_run_result
+        {
+            checkpoint.transcript = Some(agent_run.transcript.clone().unwrap_or_default());
+            checkpoint.agent_id = Some(agent_run.agent_id.clone());
+            checkpoint.agent_metadata = agent_run.agent_metadata.clone();
         }
         tracing::debug!(
             "[BENCHMARK] Checkpoint creation took {:?}",

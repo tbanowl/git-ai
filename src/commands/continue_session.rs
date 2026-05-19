@@ -94,8 +94,8 @@ impl CommitInfo {
         // - git log -1 --format=%H|||%an|||%ai|||%s <sha>
         // - git log -1 --format=%B <sha>
         // Backend: git2
-        let g2repo = Git2Repository::open(repo.path())
-            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let g2repo =
+            Git2Repository::open(repo.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
         let oid = Oid::from_str(sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
         let commit = g2repo
             .find_commit(oid)

@@ -147,12 +147,15 @@ impl CiContext {
                         ))
                     })?;
                     println!("Fetched base branch.");
-                    self.repo.revparse_single(base_ref).map_err(|e| {
-                        GitAiError::Generic(format!(
-                            "Failed to resolve base ref '{}' after fetch: {}",
-                            base_ref, e
-                        ))
-                    })?.id()
+                    self.repo
+                        .revparse_single(base_ref)
+                        .map_err(|e| {
+                            GitAiError::Generic(format!(
+                                "Failed to resolve base ref '{}' after fetch: {}",
+                                base_ref, e
+                            ))
+                        })?
+                        .id()
                 };
 
                 // Detect squash vs rebase merge by counting commits

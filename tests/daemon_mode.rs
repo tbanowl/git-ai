@@ -3248,7 +3248,11 @@ fn daemon_ref_update_ancestor_family_distinguishes_equal_ancestor_non_ancestor_a
     })
     .expect("checkout default branch should succeed");
 
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_top_level_completions);
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
     let baseline_rebase_events = rewrite_event_count(&repo, "\"rebase_complete\"");
 
     traced_git_with_env(
@@ -3302,10 +3306,14 @@ fn daemon_ref_update_ancestor_family_distinguishes_equal_ancestor_non_ancestor_a
         "daemon should emit rebase_complete only for the explicit non-ancestor ref update case"
     );
 
-    let rewrite_log = fs::read_to_string(&rewrite_log_path(&repo))
+    let rewrite_log = fs::read_to_string(rewrite_log_path(&repo))
         .expect("rewrite log should exist after ancestor family trace frames");
     assert!(
-        rewrite_log.lines().filter(|line| line.contains("\"rebase_complete\"")).count() == 1,
+        rewrite_log
+            .lines()
+            .filter(|line| line.contains("\"rebase_complete\""))
+            .count()
+            == 1,
         "ancestor family daemon path should synthesize exactly one rebase_complete across equal / ancestor / non-ancestor / missing-object cases, rewrite_log: {}",
         rewrite_log
     );
