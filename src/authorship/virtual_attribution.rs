@@ -1263,6 +1263,16 @@ fn split_lines_preserving_terminators(s: &str) -> Vec<&str> {
     lines
 }
 
+fn committed_gap_line_existed_in_parent(
+    line: u32,
+    committed_line_contents: &[&str],
+    parent_line_contents: &HashSet<&str>,
+) -> bool {
+    line.checked_sub(1)
+        .and_then(|idx| committed_line_contents.get(idx as usize))
+        .is_some_and(|content| parent_line_contents.contains(content))
+}
+
 impl VirtualAttributions {
     /// Split VirtualAttributions into committed and uncommitted buckets
     ///
@@ -1445,6 +1455,20 @@ impl VirtualAttributions {
             // attributed line before and after it. If both neighbors have the
             // same AI author (not human/h_), fill the gap with that author.
             if let Some(hunks) = file_committed_hunks {
+                let committed_content =
+                    get_file_content_at_commit(repo, commit_sha, &nfc_file_path)?;
+                let parent_content = if parent_sha == "initial" {
+                    String::new()
+                } else {
+                    get_file_content_at_commit(repo, parent_sha, &nfc_file_path)?
+                };
+                let committed_line_contents =
+                    split_lines_preserving_terminators(&committed_content);
+                let parent_line_contents: HashSet<&str> =
+                    split_lines_preserving_terminators(&parent_content)
+                        .into_iter()
+                        .collect();
+
                 // Build a sorted map of committed line → author_id for neighbor lookups
                 let mut line_to_author: Vec<(u32, &str)> = Vec::new();
                 for (author_id, lines) in &committed_lines_map {
@@ -1476,6 +1500,11 @@ impl VirtualAttributions {
                         if let (Some((_, prev_author)), Some((_, next_author))) = (prev, next)
                             && prev_author == next_author
                             && !prev_author.starts_with("h_")
+                            && committed_gap_line_existed_in_parent(
+                                line,
+                                &committed_line_contents,
+                                &parent_line_contents,
+                            )
                         {
                             gap_fills.push((prev_author.to_string(), line));
                         }
@@ -1717,6 +1746,20 @@ impl VirtualAttributions {
             // directly attributed (e.g. empty lines between AI-authored blocks).
             // Only fill if both nearest neighbors share the same AI author.
             {
+                let committed_content =
+                    get_file_content_at_commit(repo, commit_sha, &nfc_file_path)?;
+                let parent_content = if parent_sha == "initial" {
+                    String::new()
+                } else {
+                    get_file_content_at_commit(repo, parent_sha, &nfc_file_path)?
+                };
+                let committed_line_contents =
+                    split_lines_preserving_terminators(&committed_content);
+                let parent_line_contents: HashSet<&str> =
+                    split_lines_preserving_terminators(&parent_content)
+                        .into_iter()
+                        .collect();
+
                 let mut line_to_author: Vec<(u32, &str)> = Vec::new();
                 for (author_id, lines) in &committed_lines_map {
                     for &line in lines {
@@ -1740,6 +1783,11 @@ impl VirtualAttributions {
                         if let (Some((_, prev_author)), Some((_, next_author))) = (prev, next)
                             && prev_author == next_author
                             && !prev_author.starts_with("h_")
+                            && committed_gap_line_existed_in_parent(
+                                line,
+                                &committed_line_contents,
+                                &parent_line_contents,
+                            )
                         {
                             gap_fills.push((prev_author.to_string(), line));
                         }

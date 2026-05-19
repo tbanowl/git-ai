@@ -153,6 +153,42 @@ fn test_simple_additions_on_top_of_ai_contributions() {
 }
 
 #[test]
+fn test_human_insert_between_ai_lines_before_first_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("test.txt");
+
+    fs::write(&file_path, "Header\nFooter\n").unwrap();
+    repo.stage_all_and_commit("Base commit").unwrap();
+
+    fs::write(
+        &file_path,
+        "Header\nAI line 1\nAI line 2\nAI line 3\nFooter\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "test.txt"]).unwrap();
+
+    fs::write(
+        &file_path,
+        "Header\nAI line 1\nHuman inserted line\nAI line 2\nAI line 3\nFooter\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "--", "test.txt"]).unwrap();
+
+    repo.stage_all_and_commit("AI block with human insertion")
+        .unwrap();
+
+    let mut file = repo.filename("test.txt");
+    file.assert_lines_and_blame(crate::lines![
+        "Header".human(),
+        "AI line 1".ai(),
+        "Human inserted line".human(),
+        "AI line 2".ai(),
+        "AI line 3".ai(),
+        "Footer".human(),
+    ]);
+}
+
+#[test]
 fn test_simple_additions_new_file_not_git_added() {
     let repo = TestRepo::new();
     let mut file = repo.filename("new_file.txt");
