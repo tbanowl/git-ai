@@ -275,7 +275,10 @@ fn print_help() {
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
     );
     eprintln!("    mock_ai [pathspecs...]           Test preset accepting optional file pathspecs");
-    eprintln!("    mock_known_human [pathspecs...]  Test preset for KnownHuman checkpoints");
+    eprintln!("    mock_known_human [pathspecs...]  Compatibility alias for human checkpoints");
+    eprintln!(
+        "    known_human [pathspecs...]       Deprecated compatibility alias for human checkpoints"
+    );
     eprintln!("  log [args...]      Show commit log with AI authorship notes");
     eprintln!(
         "                        Proxies git log --notes=ai with all standard git log options"
@@ -639,6 +642,40 @@ fn handle_checkpoint(args: &[String]) {
                     }
                 }
             }
+            "known_human" | "mock_known_human" => {
+                let will_edit_filepaths = if args.len() > 1 {
+                    let paths = collect_checkpoint_preset_pathspecs(&args[1..]);
+                    if paths.is_empty() { None } else { Some(paths) }
+                } else {
+                    let working_dir = agent_run_result
+                        .as_ref()
+                        .and_then(|r| r.repo_working_dir.clone())
+                        .unwrap_or(repository_working_dir.clone());
+                    Some(get_all_files_for_mock_ai(&working_dir))
+                };
+
+                agent_run_result = Some(AgentRunResult {
+                    agent_id: AgentId {
+                        tool: "mock_known_human".to_string(),
+                        id: format!(
+                            "human-thread-{}",
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or_else(|_| 0)
+                        ),
+                        model: "unknown".to_string(),
+                    },
+                    agent_metadata: None,
+                    checkpoint_kind: CheckpointKind::Human,
+                    transcript: None,
+                    repo_working_dir: None,
+                    edited_filepaths: None,
+                    will_edit_filepaths,
+                    dirty_files: None,
+                    captured_checkpoint_id: None,
+                });
+            }
             "mock_ai" => {
                 let mock_agent_id = format!(
                     "ai-thread-{}",
@@ -650,13 +687,7 @@ fn handle_checkpoint(args: &[String]) {
 
                 // Collect all remaining args (after mock_ai and flags) as pathspecs
                 let edited_filepaths = if args.len() > 1 {
-                    let mut paths = Vec::new();
-                    for arg in &args[1..] {
-                        // Skip flags
-                        if !arg.starts_with("--") {
-                            paths.push(arg.clone());
-                        }
-                    }
+                    let paths = collect_checkpoint_preset_pathspecs(&args[1..]);
                     if paths.is_empty() { None } else { Some(paths) }
                 } else {
                     let working_dir = agent_run_result
@@ -1540,6 +1571,30 @@ fn strip_utf8_bom(input: String) -> String {
     } else {
         input
     }
+}
+
+fn collect_checkpoint_preset_pathspecs(args: &[String]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--hook-input" => {
+                i += 2;
+            }
+            "--" => {
+                paths.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            arg if arg.starts_with("--") => {
+                i += 1;
+            }
+            _ => {
+                paths.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    paths
 }
 
 #[derive(Debug, Default, Deserialize)]

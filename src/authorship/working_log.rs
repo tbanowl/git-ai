@@ -65,6 +65,7 @@ impl CheckpointKind {
     pub fn from_str(s: &str) -> Self {
         match s {
             "human" => CheckpointKind::Human,
+            "known_human" => CheckpointKind::Human,
             "ai_agent" => CheckpointKind::AiAgent,
             "ai_tab" => CheckpointKind::AiTab,
             _ => panic!("Invalid checkpoint kind: {}", s),

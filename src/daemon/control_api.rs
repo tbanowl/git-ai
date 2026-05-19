@@ -63,6 +63,8 @@ impl CheckpointRunRequest {
 pub struct LiveCheckpointRunRequest {
     #[serde(default)]
     pub repo_working_dir: String,
+    /// External control inputs may still send compatibility aliases such as
+    /// `known_human`; daemon execution normalizes them before running a checkpoint.
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]

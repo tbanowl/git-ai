@@ -1415,6 +1415,7 @@ fn compute_watermarks_from_stat(
 fn parse_checkpoint_kind(value: &str) -> Option<CheckpointKind> {
     match value {
         "human" => Some(CheckpointKind::Human),
+        "known_human" => Some(CheckpointKind::Human),
         "ai_agent" => Some(CheckpointKind::AiAgent),
         "ai_tab" => Some(CheckpointKind::AiTab),
         _ => None,
@@ -5653,7 +5654,9 @@ impl ActorDaemonCoordinator {
                     // Extract kind before request is consumed by apply_checkpoint_side_effect.
                     let is_live_human_checkpoint = matches!(
                         request.as_ref(),
-                        CheckpointRunRequest::Live(req) if req.kind.as_deref() == Some("human")
+                        CheckpointRunRequest::Live(req)
+                            if req.kind.as_deref().and_then(parse_checkpoint_kind)
+                                == Some(CheckpointKind::Human)
                     );
                     let should_log_completion =
                         crate::daemon::test_sync::tracks_checkpoint_request_for_test_sync(&request);
