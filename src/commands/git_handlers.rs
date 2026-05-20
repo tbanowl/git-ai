@@ -758,6 +758,14 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
         None => return,
     };
 
+    if std::env::var("GIT_AI_WAIT_COMMIT_STATS").unwrap_or_default() != "1" {
+        eprintln!(
+            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            commit_sha
+        );
+        return;
+    }
+
     // Use a longer timeout under test to avoid flakiness on saturated CI machines.
     // GIT_AI_POST_COMMIT_TIMEOUT_MS allows tests to override the timeout.
     let timeout = if let Some(ms) = std::env::var("GIT_AI_POST_COMMIT_TIMEOUT_MS")
