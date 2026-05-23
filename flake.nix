@@ -36,13 +36,17 @@
         # Build the git-ai binary using the pinned Rust toolchain
         git-ai-unwrapped = rustPlatform.buildRustPackage {
           pname = "git-ai";
-          version = "1.1.8";
+          version = "1.3.3";
 
           src = ./.;
 
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+
+          # Prevent openssl-sys from vendoring OpenSSL (which requires perl).
+          # Instead, link against the system OpenSSL provided by buildInputs.
+          OPENSSL_NO_VENDOR = "1";
 
           # Native build inputs needed for rusqlite with bundled SQLite
           nativeBuildInputs = with pkgs; [
@@ -55,6 +59,8 @@
           buildInputs = with pkgs; [
             # rusqlite bundled mode compiles its own SQLite, but needs these headers
             sqlite
+            # openssl-sys needs system OpenSSL headers and libraries
+            openssl
           ] ++ lib.optionals stdenv.hostPlatform.isDarwin [
             # macOS-specific dependencies
             libiconv
@@ -180,6 +186,8 @@
             cargo-watch     # Auto-rebuild on file changes
             cargo-expand    # Show macro expansions
             cargo-llvm-cov  # Code coverage via LLVM instrumentation
+            lefthook        # Git hooks manager
+            go-task         # Task runner (Taskfile.yml)
           ] ++ lib.optionals stdenv.hostPlatform.isDarwin [
             libiconv
             apple-sdk_15
@@ -191,7 +199,7 @@
             # SDK (14.4) and apple-sdk_15 (15.5) baked into the clang wrapper.
             unset DEVELOPER_DIR
 
-            # Set up development git-ai wrappers (replicates scripts/dev-symlinks.sh)
+            # Set up development git-ai wrappers for nix develop (Nix-specific; non-Nix devs use scripts/dev.sh)
             BUILD_TYPE="''${GIT_AI_BUILD_TYPE:-debug}"
             GITWRAP_DIR="$HOME/.git-ai-local-dev/gitwrap/bin"
             TARGET_DIR="''${CARGO_TARGET_DIR:-$(pwd)/target}"
@@ -236,6 +244,10 @@ GITOGEOF
             if [ -x "$BINARY" ]; then
               "$GITWRAP_DIR/git-ai" install-hooks 2>/dev/null || true
             fi
+
+            # Install lefthook git hooks (use real git, not the git-ai wrapper,
+            # since the dev binary may not be built yet)
+            PATH="${pkgs.git}/bin:$PATH" lefthook install 2>/dev/null || true
 
             # Set up environment for development
             export RUST_BACKTRACE=1
@@ -282,6 +294,59 @@ GITOGEOF
           exePath = "/bin/git-ai";
         };
 
+        # Nix flake checks: run with `nix flake check`
+        # Tests are not included here -- they require network access, Node.js,
+        # and the Graphite CLI, which are not available in the Nix sandbox.
+        # Tests run in CI via the existing test.yml workflow instead.
+        checks =
+          let
+            commonNativeBuildInputs = with pkgs; [ pkg-config ]
+              ++ [ rustPlatform.bindgenHook ];
+            commonBuildInputs = with pkgs; [ sqlite openssl ]
+              ++ lib.optionals stdenv.hostPlatform.isDarwin [
+                libiconv apple-sdk_15
+              ];
+            mkCheck = attrs: rustPlatform.buildRustPackage ({
+              version = git-ai-unwrapped.version;
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              OPENSSL_NO_VENDOR = "1";
+              nativeBuildInputs = commonNativeBuildInputs;
+              buildInputs = commonBuildInputs;
+              installPhase = "mkdir -p $out";
+              doCheck = false;
+            } // attrs);
+          in
+          {
+            # Build check - ensures the package builds
+            build = git-ai-unwrapped;
+
+            # Clippy lint check with warnings as errors
+            clippy = mkCheck {
+              pname = "git-ai-clippy";
+              buildPhase = ''
+                cargo clippy --all-targets -- -D warnings
+              '';
+            };
+
+            # Format check
+            fmt = mkCheck {
+              pname = "git-ai-fmt";
+              buildPhase = ''
+                cargo fmt -- --check
+              '';
+            };
+
+            # Doc check with warnings as errors
+            doc = mkCheck {
+              pname = "git-ai-doc";
+              RUSTDOCFLAGS = "-D warnings";
+              buildPhase = ''
+                cargo doc --no-deps
+              '';
+            };
+          };
+
         # Formatter for `nix fmt`
         formatter = pkgs.nixpkgs-fmt;
       }
@@ -320,9 +385,18 @@ GITOGEOF
             disable_auto_updates = cfg.settings.disableAutoUpdates;
             update_channel = cfg.settings.updateChannel;
             feature_flags =
-              if cfg.settings.featureFlags != { }
-              then cfg.settings.featureFlags
-              else null;
+              let
+                knownFlags = filterAttrs (n: v: v != null) {
+                  async_mode = cfg.settings.featureFlags.asyncMode;
+                  rewrite_stash = cfg.settings.featureFlags.rewriteStash;
+                  checkpoint_inter_commit_move = cfg.settings.featureFlags.interCommitMove;
+                  auth_keyring = cfg.settings.featureFlags.authKeyring;
+                  git_hooks_enabled = cfg.settings.featureFlags.gitHooksEnabled;
+                  git_hooks_externally_managed = cfg.settings.featureFlags.gitHooksExternallyManaged;
+                };
+                merged = cfg.settings.featureFlags.extraFlags // knownFlags;
+              in
+              if merged != { } then merged else null;
           };
 
           # Generate the config file in the Nix store
@@ -475,21 +549,81 @@ GITOGEOF
               };
 
               updateChannel = mkOption {
-                type = types.nullOr (types.enum [ "latest" "next" ]);
+                type = types.nullOr (types.enum [
+                  "latest" "next" "enterprise-latest" "enterprise-next"
+                ]);
                 default = null;
                 description = ''
-                  Update channel: "latest" for stable releases, "next" for pre-releases.
+                  Update channel: "latest" for stable releases, "next" for
+                  pre-releases, "enterprise-latest" and "enterprise-next" for
+                  enterprise deployments.
                 '';
               };
 
-              featureFlags = mkOption {
-                type = jsonFormat.type;
-                default = { };
-                example = { rewrite_stash = true; };
-                description = ''
-                  Feature flags as a JSON-compatible attribute set.
-                  See git-ai documentation for available flags.
-                '';
+              featureFlags = {
+                asyncMode = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable async daemon mode for background processing.
+                    When enabled, git operations are processed asynchronously
+                    through a background daemon, improving performance for IDE
+                    and agent workflows.
+                    Equivalent to: git ai config set feature_flags.async_mode true
+                  '';
+                };
+
+                rewriteStash = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable stash rewriting for improved AI tracking of stash
+                    operations.
+                  '';
+                };
+
+                interCommitMove = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable checkpoint inter-commit move tracking.
+                  '';
+                };
+
+                authKeyring = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable system keyring integration for authentication.
+                  '';
+                };
+
+                gitHooksEnabled = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable git hooks integration for git-ai tracking.
+                  '';
+                };
+
+                gitHooksExternallyManaged = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Indicate that git hooks are managed externally
+                    (e.g., by lefthook or husky). When enabled, git-ai will not
+                    attempt to install or manage git hooks itself.
+                  '';
+                };
+
+                extraFlags = mkOption {
+                  type = types.attrsOf types.bool;
+                  default = { };
+                  description = ''
+                    Additional feature flags not explicitly defined above.
+                    Keys should use snake_case to match the config.json format.
+                  '';
+                };
               };
             };
           };
@@ -559,9 +693,18 @@ GITOGEOF
             disable_auto_updates = cfg.settings.disableAutoUpdates;
             update_channel = cfg.settings.updateChannel;
             feature_flags =
-              if cfg.settings.featureFlags != { }
-              then cfg.settings.featureFlags
-              else null;
+              let
+                knownFlags = filterAttrs (n: v: v != null) {
+                  async_mode = cfg.settings.featureFlags.asyncMode;
+                  rewrite_stash = cfg.settings.featureFlags.rewriteStash;
+                  checkpoint_inter_commit_move = cfg.settings.featureFlags.interCommitMove;
+                  auth_keyring = cfg.settings.featureFlags.authKeyring;
+                  git_hooks_enabled = cfg.settings.featureFlags.gitHooksEnabled;
+                  git_hooks_externally_managed = cfg.settings.featureFlags.gitHooksExternallyManaged;
+                };
+                merged = cfg.settings.featureFlags.extraFlags // knownFlags;
+              in
+              if merged != { } then merged else null;
           };
         in
         {
@@ -701,21 +844,81 @@ GITOGEOF
               };
 
               updateChannel = mkOption {
-                type = types.nullOr (types.enum [ "latest" "next" ]);
+                type = types.nullOr (types.enum [
+                  "latest" "next" "enterprise-latest" "enterprise-next"
+                ]);
                 default = null;
                 description = ''
-                  Update channel: "latest" for stable releases, "next" for pre-releases.
+                  Update channel: "latest" for stable releases, "next" for
+                  pre-releases, "enterprise-latest" and "enterprise-next" for
+                  enterprise deployments.
                 '';
               };
 
-              featureFlags = mkOption {
-                type = jsonFormat.type;
-                default = { };
-                example = { rewrite_stash = true; };
-                description = ''
-                  Feature flags as a JSON-compatible attribute set.
-                  See git-ai documentation for available flags.
-                '';
+              featureFlags = {
+                asyncMode = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable async daemon mode for background processing.
+                    When enabled, git operations are processed asynchronously
+                    through a background daemon, improving performance for IDE
+                    and agent workflows.
+                    Equivalent to: git ai config set feature_flags.async_mode true
+                  '';
+                };
+
+                rewriteStash = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable stash rewriting for improved AI tracking of stash
+                    operations.
+                  '';
+                };
+
+                interCommitMove = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable checkpoint inter-commit move tracking.
+                  '';
+                };
+
+                authKeyring = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable system keyring integration for authentication.
+                  '';
+                };
+
+                gitHooksEnabled = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Enable git hooks integration for git-ai tracking.
+                  '';
+                };
+
+                gitHooksExternallyManaged = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = ''
+                    Indicate that git hooks are managed externally
+                    (e.g., by lefthook or husky). When enabled, git-ai will not
+                    attempt to install or manage git hooks itself.
+                  '';
+                };
+
+                extraFlags = mkOption {
+                  type = types.attrsOf types.bool;
+                  default = { };
+                  description = ''
+                    Additional feature flags not explicitly defined above.
+                    Keys should use snake_case to match the config.json format.
+                  '';
+                };
               };
             };
           };

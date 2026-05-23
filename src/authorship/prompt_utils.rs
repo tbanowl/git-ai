@@ -7,11 +7,11 @@ use crate::commands::checkpoint_agent::agent_presets::{
 };
 use crate::commands::checkpoint_agent::amp_preset::AmpPreset;
 use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
+use crate::commands::checkpoint_agent::pi_preset::PiPreset;
 use crate::error::GitAiError;
 use crate::git::refs::{get_authorship, grep_ai_notes};
 use crate::git::repository::Repository;
 use crate::observability::log_error;
-use crate::utils::debug_log;
 use std::collections::{HashMap, HashSet};
 
 /// Find a prompt in the repository history
@@ -178,9 +178,10 @@ pub fn update_prompt_from_tool(
         "droid" => update_droid_prompt(agent_metadata, current_model),
         "amp" => update_amp_prompt(external_thread_id, agent_metadata, current_model),
         "opencode" => update_opencode_prompt(external_thread_id, agent_metadata, current_model),
+        "pi" => update_pi_prompt(agent_metadata, current_model),
         "windsurf" => update_windsurf_prompt(agent_metadata, current_model),
         _ => {
-            debug_log(&format!("Unknown tool: {}", tool));
+            tracing::debug!("Unknown tool: {}", tool);
             PromptUpdateResult::Unchanged
         }
     }
@@ -199,10 +200,11 @@ fn update_codex_prompt(
                     model.unwrap_or_else(|| current_model.to_string()),
                 ),
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse Codex rollout JSONL transcript from {}: {}",
-                        transcript_path, e
-                    ));
+                        transcript_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({
@@ -221,52 +223,39 @@ fn update_codex_prompt(
     }
 }
 
-/// Update Cursor prompt by fetching from Cursor's database
+/// Update Cursor prompt by re-reading the JSONL transcript file
 fn update_cursor_prompt(
-    conversation_id: &str,
+    _conversation_id: &str,
     metadata: Option<&HashMap<String, String>>,
     current_model: &str,
 ) -> PromptUpdateResult {
-    // For Cursor, we check the env var first (it represents the current database state),
-    // then fall back to metadata (stored during checkpoint for git hook subprocesses
-    // which don't inherit env vars).
-    let res = if let Ok(env_db_path) = std::env::var("GIT_AI_CURSOR_GLOBAL_DB_PATH") {
-        // Environment variable takes precedence (allows resync to use updated database)
-        CursorPreset::fetch_cursor_conversation_from_db(
-            std::path::Path::new(&env_db_path),
-            conversation_id,
-        )
-    } else if let Some(db_path) = metadata.and_then(|m| m.get("__test_cursor_db_path")) {
-        // Fall back to metadata path (for git hook subprocesses in tests)
-        CursorPreset::fetch_cursor_conversation_from_db(
-            std::path::Path::new(db_path),
-            conversation_id,
-        )
+    if let Some(metadata) = metadata {
+        if let Some(transcript_path) = metadata.get("transcript_path") {
+            match CursorPreset::transcript_and_model_from_cursor_jsonl(transcript_path) {
+                Ok((transcript, _)) => {
+                    PromptUpdateResult::Updated(transcript, current_model.to_string())
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to parse Cursor JSONL transcript from {}: {}",
+                        transcript_path,
+                        e
+                    );
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "cursor",
+                            "operation": "transcript_and_model_from_cursor_jsonl"
+                        })),
+                    );
+                    PromptUpdateResult::Failed(e)
+                }
+            }
+        } else {
+            PromptUpdateResult::Unchanged
+        }
     } else {
-        // Use default Cursor database location
-        CursorPreset::fetch_latest_cursor_conversation(conversation_id)
-    };
-    match res {
-        Ok(Some((latest_transcript, _db_model))) => {
-            // For Cursor, preserve the model from the checkpoint (which came from hook input)
-            // rather than using the database model
-            PromptUpdateResult::Updated(latest_transcript, current_model.to_string())
-        }
-        Ok(None) => PromptUpdateResult::Unchanged,
-        Err(e) => {
-            debug_log(&format!(
-                "Failed to fetch latest Cursor conversation for ID {}: {}",
-                conversation_id, e
-            ));
-            log_error(
-                &e,
-                Some(serde_json::json!({
-                    "agent_tool": "cursor",
-                    "operation": "fetch_latest_cursor_conversation"
-                })),
-            );
-            PromptUpdateResult::Failed(e)
-        }
+        PromptUpdateResult::Unchanged
     }
 }
 
@@ -289,10 +278,11 @@ fn update_claude_prompt(
                     )
                 }
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse Claude JSONL transcript from {}: {}",
-                        transcript_path, e
-                    ));
+                        transcript_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({
@@ -332,10 +322,11 @@ fn update_gemini_prompt(
                     )
                 }
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse Gemini JSON transcript from {}: {}",
-                        transcript_path, e
-                    ));
+                        transcript_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({
@@ -377,10 +368,11 @@ fn update_github_copilot_prompt(
                     )
                 }
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse GitHub Copilot chat session JSON from {}: {}",
-                        chat_session_path, e
-                    ));
+                        chat_session_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({
@@ -418,10 +410,11 @@ fn update_continue_cli_prompt(
                     PromptUpdateResult::Updated(transcript, current_model.to_string())
                 }
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse Continue CLI JSON transcript from {}: {}",
-                        transcript_path, e
-                    ));
+                        transcript_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({
@@ -454,10 +447,11 @@ fn update_droid_prompt(
                 match DroidPreset::transcript_and_model_from_droid_jsonl(transcript_path) {
                     Ok((transcript, _model)) => transcript,
                     Err(e) => {
-                        debug_log(&format!(
+                        tracing::debug!(
                             "Failed to parse Droid JSONL transcript from {}: {}",
-                            transcript_path, e
-                        ));
+                            transcript_path,
+                            e
+                        );
                         log_error(
                             &e,
                             Some(serde_json::json!({
@@ -475,10 +469,11 @@ fn update_droid_prompt(
                     Ok(Some(m)) => m,
                     Ok(None) => current_model.to_string(),
                     Err(e) => {
-                        debug_log(&format!(
+                        tracing::debug!(
                             "Failed to parse Droid settings.json from {}: {}",
-                            settings_path, e
-                        ));
+                            settings_path,
+                            e
+                        );
                         current_model.to_string()
                     }
                 }
@@ -509,8 +504,32 @@ fn update_amp_prompt(
     {
         AmpPreset::transcript_and_model_from_thread_path(std::path::Path::new(transcript_path))
             .map(|(transcript, model, _)| (transcript, model))
+    } else if let Some(threads_dir) = metadata
+        .and_then(|m| m.get("__test_amp_threads_path"))
+        .filter(|p| !p.trim().is_empty())
+    {
+        let threads_dir = std::path::Path::new(threads_dir);
+        if !thread_id.trim().is_empty() {
+            AmpPreset::transcript_and_model_from_thread_id_in_dir(threads_dir, thread_id)
+        } else if let Some(tool_use_id) = metadata
+            .and_then(|m| m.get("tool_use_id"))
+            .filter(|p| !p.trim().is_empty())
+        {
+            AmpPreset::transcript_and_model_from_tool_use_id_in_dir(threads_dir, tool_use_id)
+        } else {
+            return PromptUpdateResult::Unchanged;
+        }
     } else if !thread_id.trim().is_empty() {
         AmpPreset::transcript_and_model_from_thread_id(thread_id)
+    } else if let Some(tool_use_id) = metadata
+        .and_then(|m| m.get("tool_use_id"))
+        .filter(|p| !p.trim().is_empty())
+    {
+        let default_threads = match AmpPreset::amp_threads_path() {
+            Ok(path) => path,
+            Err(e) => return PromptUpdateResult::Failed(e),
+        };
+        AmpPreset::transcript_and_model_from_tool_use_id_in_dir(&default_threads, tool_use_id)
     } else {
         return PromptUpdateResult::Unchanged;
     };
@@ -521,10 +540,11 @@ fn update_amp_prompt(
             model.unwrap_or_else(|| current_model.to_string()),
         ),
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Failed to fetch Amp transcript for thread {}: {}",
-                thread_id, e
-            ));
+                thread_id,
+                e
+            );
             log_error(
                 &e,
                 Some(serde_json::json!({
@@ -564,10 +584,11 @@ fn update_opencode_prompt(
             model.unwrap_or_else(|| current_model.to_string()),
         ),
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Failed to fetch OpenCode transcript for session {}: {}",
-                session_id, e
-            ));
+                session_id,
+                e
+            );
             log_error(
                 &e,
                 Some(serde_json::json!({
@@ -577,6 +598,41 @@ fn update_opencode_prompt(
             );
             PromptUpdateResult::Failed(e)
         }
+    }
+}
+
+/// Update Pi prompt from session JSONL file
+fn update_pi_prompt(
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    if let Some(session_path) = metadata
+        .and_then(|m| m.get("session_path"))
+        .filter(|path| !path.trim().is_empty())
+    {
+        match PiPreset::transcript_and_model_from_pi_session(session_path) {
+            Ok((transcript, model)) => PromptUpdateResult::Updated(
+                transcript,
+                model.unwrap_or_else(|| current_model.to_string()),
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to parse Pi session JSONL from {}: {}",
+                    session_path,
+                    e
+                );
+                log_error(
+                    &e,
+                    Some(serde_json::json!({
+                        "agent_tool": "pi",
+                        "operation": "transcript_and_model_from_pi_session"
+                    })),
+                );
+                PromptUpdateResult::Failed(e)
+            }
+        }
+    } else {
+        PromptUpdateResult::Unchanged
     }
 }
 
@@ -593,10 +649,11 @@ fn update_windsurf_prompt(
                     model.unwrap_or_else(|| current_model.to_string()),
                 ),
                 Err(e) => {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Failed to parse Windsurf JSONL transcript from {}: {}",
-                        transcript_path, e
-                    ));
+                        transcript_path,
+                        e
+                    );
                     log_error(
                         &e,
                         Some(serde_json::json!({

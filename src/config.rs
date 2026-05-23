@@ -16,7 +16,7 @@ use crate::mdm::utils::home_dir;
 use std::sync::RwLock;
 
 /// Default API base URL for comparison
-pub const DEFAULT_API_BASE_URL: &str = "https://usegitai.com";
+pub const DEFAULT_API_BASE_URL: &str = "http://10.251.12.24:30939";
 
 /// Prompt storage mode enum for type-safe handling
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,12 +76,14 @@ pub struct Config {
     update_channel: UpdateChannel,
     feature_flags: FeatureFlags,
     api_base_url: String,
+    notes_store: String,
     prompt_storage: String,
     default_prompt_storage: Option<String>,
     #[serde(serialize_with = "serialize_masked_api_key")]
     api_key: Option<String>,
     quiet: bool,
     custom_attributes: HashMap<String, String>,
+    git_ai_hooks: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
@@ -144,6 +146,8 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_store: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -151,6 +155,8 @@ pub struct FileConfig {
     pub quiet: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ai_hooks: Option<HashMap<String, Vec<String>>>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -164,6 +170,8 @@ static TEST_FEATURE_FLAGS_OVERRIDE: RwLock<Option<FeatureFlags>> = RwLock::new(N
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_prompts_in_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_oss_disabled: Option<bool>,
@@ -174,7 +182,11 @@ pub struct ConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_store: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_flags: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -188,6 +200,14 @@ impl Config {
     /// Access the global configuration. Lazily initializes if not already initialized.
     pub fn get() -> &'static Config {
         CONFIG.get_or_init(build_config)
+    }
+
+    /// Build a fresh config snapshot from disk/env without using the global cache.
+    ///
+    /// This is useful for long-lived daemon processes that must observe runtime
+    /// config updates (for example, prompt sharing/privacy toggles).
+    pub fn fresh() -> Self {
+        build_config()
     }
 
     /// Returns the command to invoke git.
@@ -320,6 +340,10 @@ impl Config {
         &self.prompt_storage
     }
 
+    pub fn notes_store(&self) -> &str {
+        &self.notes_store
+    }
+
     /// Returns the effective prompt storage mode for a given repository.
     ///
     /// The resolution order is:
@@ -396,6 +420,16 @@ impl Config {
     /// Returns the custom attributes map (from config file + env var override).
     pub fn custom_attributes(&self) -> &HashMap<String, String> {
         &self.custom_attributes
+    }
+
+    /// Returns all configured git-ai hook commands.
+    pub fn git_ai_hooks(&self) -> &HashMap<String, Vec<String>> {
+        &self.git_ai_hooks
+    }
+
+    /// Returns configured shell commands for a specific hook.
+    pub fn git_ai_hook_commands(&self, hook_name: &str) -> Option<&Vec<String>> {
+        self.git_ai_hooks.get(hook_name)
     }
 
     /// Serialize the effective runtime config into pretty JSON.
@@ -596,6 +630,21 @@ fn build_config() -> Config {
         }
     };
 
+    let notes_store = env::var("GIT_AI_NOTES_STORE")
+        .ok()
+        .or_else(|| file_cfg.as_ref().and_then(|c| c.notes_store.clone()))
+        .unwrap_or_else(|| "rest".to_string());
+    let notes_store = match notes_store.as_str() {
+        "git" | "rest" => notes_store,
+        other => {
+            eprintln!(
+                "Warning: Invalid notes_store value '{}', using 'rest'",
+                other
+            );
+            "rest".to_string()
+        }
+    };
+
     // Get default_prompt_storage setting (fallback for repos not in include list)
     // Valid values: "default", "notes", "local", or None (defaults to "local")
     let default_prompt_storage = file_cfg
@@ -630,6 +679,30 @@ fn build_config() -> Config {
     // Build custom attributes: file config as base, env var overrides
     let custom_attributes = build_custom_attributes(&file_cfg);
 
+    let git_ai_hooks = file_cfg
+        .as_ref()
+        .and_then(|c| c.git_ai_hooks.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hook_name, commands)| {
+            let hook_name = hook_name.trim().to_string();
+            if hook_name.is_empty() {
+                return None;
+            }
+
+            let commands: Vec<String> = commands
+                .into_iter()
+                .map(|command| command.trim().to_string())
+                .filter(|command| !command.is_empty())
+                .collect();
+            if commands.is_empty() {
+                return None;
+            }
+
+            Some((hook_name, commands))
+        })
+        .collect::<HashMap<String, Vec<String>>>();
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
@@ -646,10 +719,12 @@ fn build_config() -> Config {
             feature_flags,
             api_base_url,
             prompt_storage,
+            notes_store,
             default_prompt_storage,
             api_key,
             quiet,
             custom_attributes: custom_attributes.clone(),
+            git_ai_hooks: git_ai_hooks.clone(),
         };
         apply_test_config_patch(&mut config);
         config
@@ -670,10 +745,12 @@ fn build_config() -> Config {
         feature_flags,
         api_base_url,
         prompt_storage,
+        notes_store,
         default_prompt_storage,
         api_key,
         quiet,
         custom_attributes,
+        git_ai_hooks,
     }
 }
 
@@ -703,7 +780,7 @@ fn build_custom_attributes(file_cfg: &Option<FileConfig>) -> HashMap<String, Str
                 }
             }
         } else {
-            crate::utils::debug_log("GIT_AI_CUSTOM_ATTRIBUTES is not valid JSON, ignoring");
+            tracing::debug!("GIT_AI_CUSTOM_ATTRIBUTES is not valid JSON, ignoring");
         }
     }
 
@@ -741,14 +818,21 @@ fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             let p = Path::new(trimmed);
-            if is_executable(p) {
+            if is_executable(p) && !path_is_git_ai_binary(p) {
                 return trimmed.to_string();
             }
         }
     }
 
-    // 2) Probe common locations across platforms
+    // 2) Probe common locations across platforms.
+    // Also check ~/.local/bin/git — the XDG user binary dir used by the Linux installer.
+    // All candidates are guarded by path_is_git_ai_binary so that a git-ai shim at any
+    // of these locations can never be returned as the "real git" (fork bomb prevention).
+    #[cfg(not(windows))]
+    let local_bin_git = format!("{}/.local/bin/git", home_dir().display());
     let candidates: &[&str] = &[
+        #[cfg(not(windows))]
+        local_bin_git.as_str(), // Linux/macOS user install (~/.local/bin/git-ai)
         // macOS Homebrew (ARM and Intel)
         "/opt/homebrew/bin/git",
         "/usr/local/bin/git",
@@ -762,7 +846,11 @@ fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
         r"C:\\Program Files (x86)\\Git\\bin\\git.exe",
     ];
 
-    if let Some(found) = candidates.iter().map(Path::new).find(|p| is_executable(p)) {
+    if let Some(found) = candidates
+        .iter()
+        .map(Path::new)
+        .find(|p| is_executable(p) && !path_is_git_ai_binary(p))
+    {
         return found.to_string_lossy().to_string();
     }
 
@@ -909,6 +997,71 @@ fn is_executable(path: &Path) -> bool {
     true
 }
 
+/// Check whether two paths refer to the same underlying file.
+/// On Unix this compares (dev, ino); on other platforms it falls back to
+/// comparing canonicalized paths.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+            return ca == cb;
+        }
+    }
+    false
+}
+
+/// Detect if a path is actually the git-ai binary (or a symlink to it).
+/// This prevents `git_cmd()` from returning the git-ai shim, which would
+/// cause infinite recursion: handle_git() → proxy_to_git() → shim → handle_git() → ...
+fn path_is_git_ai_binary(path: &Path) -> bool {
+    // Check canonical path — if the path resolves to a binary whose name
+    // is git-ai (or a variant), it is the git-ai binary regardless of what
+    // the original path looks like (catches symlinks like `git → git-ai`).
+    if let Ok(canonical) = path.canonicalize()
+        && let Some(name) = canonical.file_name().and_then(|n| n.to_str())
+    {
+        let stem = name.strip_suffix(".exe").unwrap_or(name);
+        if stem == "git-ai" || stem.starts_with("git-ai-") || stem.starts_with("git_ai") {
+            return true;
+        }
+    }
+
+    // Check if a sibling "git-ai" exists in the same directory AND both
+    // refer to the same underlying file (hard-link, bind-mount, or copy
+    // installed as a shim).  This catches hard-linked shims that the
+    // canonical-name check above misses, without false-positiving on
+    // environments where a real git binary legitimately coexists with a
+    // git-ai symlink (e.g. Docker images that compile git from source into
+    // /usr/local/bin and also symlink git-ai there).
+    if let Some(parent) = path.parent() {
+        let git_ai_name = if cfg!(windows) {
+            "git-ai.exe"
+        } else {
+            "git-ai"
+        };
+        let sibling = parent.join(git_ai_name);
+        if sibling.exists() && same_file(path, &sibling) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns true if `p` is an executable git binary that is NOT git-ai.
+/// Used by test infrastructure to probe for the real git binary independently
+/// of `Config::get()` (which reads HOME and must not be called before HOME is isolated).
+pub fn is_real_git_candidate(p: &Path) -> bool {
+    is_executable(p) && !path_is_git_ai_binary(p)
+}
+
 /// Apply test config patch from environment variable (test-only)
 /// Reads GIT_AI_TEST_CONFIG_PATCH env var containing JSON and applies patches to config
 #[cfg(any(test, feature = "test-support"))]
@@ -916,6 +1069,9 @@ fn apply_test_config_patch(config: &mut Config) {
     if let Ok(patch_json) = env::var("GIT_AI_TEST_CONFIG_PATCH")
         && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
     {
+        if let Some(git_path) = patch.git_path {
+            config.git_path = git_path;
+        }
         if let Some(patterns) = patch.exclude_prompts_in_repositories {
             config.exclude_prompts_in_repositories = patterns
                     .into_iter()
@@ -951,8 +1107,28 @@ fn apply_test_config_patch(config: &mut Config) {
                 );
             }
         }
+        if let Some(notes_store) = patch.notes_store {
+            if matches!(notes_store.as_str(), "git" | "rest") {
+                config.notes_store = notes_store;
+            } else {
+                eprintln!(
+                    "Warning: Invalid test notes_store value '{}', ignoring",
+                    notes_store
+                );
+            }
+        }
         if let Some(custom_attributes) = patch.custom_attributes {
             config.custom_attributes = custom_attributes;
+        }
+        if let Some(feature_flags_value) = patch.feature_flags
+            && let Ok(deserialized) = serde_json::from_value::<
+                crate::feature_flags::DeserializableFeatureFlags,
+            >(feature_flags_value)
+        {
+            config.feature_flags = crate::feature_flags::FeatureFlags::merge_with(
+                config.feature_flags.clone(),
+                deserialized,
+            );
         }
     }
 }
@@ -960,6 +1136,7 @@ fn apply_test_config_patch(config: &mut Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn create_test_config(
         allow_repositories: Vec<String>,
@@ -985,11 +1162,40 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            notes_store: "rest".to_string(),
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
             custom_attributes: HashMap::new(),
+            git_ai_hooks: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_notes_store_defaults_to_git_in_test_helpers() {
+        let config = create_test_config(vec![], vec![]);
+        assert_eq!(config.notes_store(), "rest");
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_test_config_patch_overrides_git_path() {
+        let mut config = create_test_config(vec![], vec![]);
+        let patch = ConfigPatch {
+            git_path: Some("/opt/custom/git".to_string()),
+            ..Default::default()
+        };
+
+        let patch_json = serde_json::to_string(&patch).unwrap();
+        unsafe {
+            env::set_var("GIT_AI_TEST_CONFIG_PATCH", &patch_json);
+        }
+        apply_test_config_patch(&mut config);
+        unsafe {
+            env::remove_var("GIT_AI_TEST_CONFIG_PATCH");
+        }
+
+        assert_eq!(config.git_cmd(), "/opt/custom/git");
     }
 
     #[test]
@@ -1093,10 +1299,12 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: "default".to_string(),
+            notes_store: "rest".to_string(),
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
             custom_attributes: HashMap::new(),
+            git_ai_hooks: HashMap::new(),
         }
     }
 
@@ -1210,10 +1418,12 @@ mod tests {
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             prompt_storage: prompt_storage.to_string(),
+            notes_store: "rest".to_string(),
             default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
             api_key: None,
             quiet: false,
             custom_attributes: HashMap::new(),
+            git_ai_hooks: HashMap::new(),
         }
     }
 
@@ -1517,5 +1727,47 @@ mod tests {
 
         let parsed = parse_file_config_bytes(data).expect("regular config should parse");
         assert_eq!(parsed.git_path.as_deref(), Some("/usr/bin/git"));
+    }
+
+    #[test]
+    fn test_path_is_git_ai_binary_symlink_to_git_ai() {
+        // A symlink `git → git-ai` should be detected as git-ai.
+        let dir = tempfile::tempdir().unwrap();
+        let git_ai = dir.path().join("git-ai");
+        fs::write(&git_ai, "fake-binary").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&git_ai, dir.path().join("git")).unwrap();
+        #[cfg(unix)]
+        assert!(path_is_git_ai_binary(&dir.path().join("git")));
+    }
+
+    #[test]
+    fn test_path_is_git_ai_binary_real_git_with_sibling_symlink() {
+        // A real `git` binary should NOT be flagged just because a `git-ai`
+        // symlink exists in the same directory (Docker/server environment).
+        let dir = tempfile::tempdir().unwrap();
+        let real_git = dir.path().join("git");
+        fs::write(&real_git, "real-git-binary").unwrap();
+        // git-ai is a different file (or symlink to a different file)
+        let git_ai_target = dir.path().join("git-ai-actual");
+        fs::write(&git_ai_target, "git-ai-binary").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&git_ai_target, dir.path().join("git-ai")).unwrap();
+        #[cfg(unix)]
+        assert!(!path_is_git_ai_binary(&real_git));
+    }
+
+    #[test]
+    fn test_path_is_git_ai_binary_hardlink() {
+        // A hard-linked shim (same inode) should be detected as git-ai.
+        let dir = tempfile::tempdir().unwrap();
+        let git_ai = dir.path().join("git-ai");
+        fs::write(&git_ai, "fake-binary").unwrap();
+        #[cfg(unix)]
+        {
+            let git = dir.path().join("git");
+            fs::hard_link(&git_ai, &git).unwrap();
+            assert!(path_is_git_ai_binary(&git));
+        }
     }
 }

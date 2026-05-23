@@ -2,6 +2,7 @@ use crate::git::repository::Repository;
 use glob::Pattern;
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "*.lock",
@@ -25,6 +26,16 @@ const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "**/*.snap",
     "**/*.snap.new",
     "**/drizzle/meta/**",
+    // Protobuf generated code
+    "*.pbobjc.h",
+    "*.pbobjc.m",
+    "*.pb.go",
+    "*.pb.h",
+    "*.pb.cc",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "*.pb.swift",
+    "*.pb.dart",
 ];
 
 #[derive(Clone, Debug)]
@@ -92,7 +103,10 @@ pub fn load_linguist_generated_patterns_from_root_gitattributes(repo: &Repositor
     let Some(contents) = load_root_gitattributes_contents(repo) else {
         return Vec::new();
     };
+    parse_linguist_generated_patterns(&contents)
+}
 
+fn parse_linguist_generated_patterns(contents: &str) -> Vec<String> {
     let mut patterns = Vec::new();
 
     for raw_line in contents.lines() {
@@ -183,6 +197,34 @@ fn load_root_git_ai_ignore_contents(repo: &Repository) -> Option<String> {
     let workdir = repo.workdir().ok()?;
     let ignore_path = workdir.join(".git-ai-ignore");
     fs::read_to_string(ignore_path).ok()
+}
+
+/// Load `.git-ai-ignore` patterns from a repo root path directly (no Repository object needed).
+/// Use this when you have a `&Path` but not a `Repository` (e.g. in snapshot capture code).
+pub fn load_git_ai_ignore_patterns_from_path(repo_root: &Path) -> Vec<String> {
+    let contents = match fs::read_to_string(repo_root.join(".git-ai-ignore")) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut patterns = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        patterns.push(line.to_string());
+    }
+    dedupe_patterns(patterns)
+}
+
+/// Load linguist-generated patterns from `.gitattributes` at a repo root path directly.
+/// Use this when you have a `&Path` but not a `Repository` (e.g. in snapshot capture code).
+/// Uses the same parser as `load_linguist_generated_patterns_from_root_gitattributes`.
+pub fn load_linguist_generated_patterns_from_path(repo_root: &Path) -> Vec<String> {
+    match fs::read_to_string(repo_root.join(".gitattributes")) {
+        Ok(contents) => parse_linguist_generated_patterns(&contents),
+        Err(_) => Vec::new(),
+    }
 }
 
 pub fn effective_ignore_patterns(
@@ -710,5 +752,81 @@ docs/**
         assert!(patterns.contains(&"generated/**".to_string()));
         assert!(patterns.contains(&"docs/**".to_string()));
         assert!(patterns.contains(&"*.lock".to_string()));
+    }
+
+    #[test]
+    fn defaults_include_protobuf_generated_patterns() {
+        let defaults = default_ignore_patterns();
+        // Objective-C protobuf
+        assert!(defaults.contains(&"*.pbobjc.h".to_string()));
+        assert!(defaults.contains(&"*.pbobjc.m".to_string()));
+        // Go protobuf
+        assert!(defaults.contains(&"*.pb.go".to_string()));
+        // C++ protobuf
+        assert!(defaults.contains(&"*.pb.h".to_string()));
+        assert!(defaults.contains(&"*.pb.cc".to_string()));
+        // Python protobuf
+        assert!(defaults.contains(&"*_pb2.py".to_string()));
+        assert!(defaults.contains(&"*_pb2_grpc.py".to_string()));
+        // Swift protobuf
+        assert!(defaults.contains(&"*.pb.swift".to_string()));
+        // Dart protobuf
+        assert!(defaults.contains(&"*.pb.dart".to_string()));
+    }
+
+    #[test]
+    fn defaults_ignore_protobuf_generated_files() {
+        let defaults = default_ignore_patterns();
+        let matcher = build_ignore_matcher(&defaults);
+
+        // Bare filenames
+        assert!(should_ignore_file_with_matcher(
+            "Message.pbobjc.h",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher(
+            "Message.pbobjc.m",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher("service.pb.go", &matcher));
+        assert!(should_ignore_file_with_matcher("message.pb.h", &matcher));
+        assert!(should_ignore_file_with_matcher("message.pb.cc", &matcher));
+        assert!(should_ignore_file_with_matcher("types_pb2.py", &matcher));
+        assert!(should_ignore_file_with_matcher(
+            "service_pb2_grpc.py",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher(
+            "message.pb.swift",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher("message.pb.dart", &matcher));
+
+        // Nested paths
+        assert!(should_ignore_file_with_matcher(
+            "proto/gen/service.pb.go",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher(
+            "ios/Proto/Message.pbobjc.h",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher(
+            "backend/api/types_pb2.py",
+            &matcher
+        ));
+        assert!(should_ignore_file_with_matcher(
+            "cpp/protos/message.pb.cc",
+            &matcher
+        ));
+
+        // Non-protobuf files should NOT be matched
+        assert!(!should_ignore_file_with_matcher("main.go", &matcher));
+        assert!(!should_ignore_file_with_matcher("service.py", &matcher));
+        assert!(!should_ignore_file_with_matcher("header.h", &matcher));
+        assert!(!should_ignore_file_with_matcher("source.cc", &matcher));
+        assert!(!should_ignore_file_with_matcher("app.swift", &matcher));
+        assert!(!should_ignore_file_with_matcher("widget.dart", &matcher));
+        assert!(!should_ignore_file_with_matcher("Objective.m", &matcher));
     }
 }

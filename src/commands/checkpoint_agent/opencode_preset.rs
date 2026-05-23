@@ -3,8 +3,12 @@ use crate::{
         transcript::{AiTranscript, Message},
         working_log::{AgentId, CheckpointKind},
     },
-    commands::checkpoint_agent::agent_presets::{
-        AgentCheckpointFlags, AgentCheckpointPreset, AgentRunResult,
+    commands::checkpoint_agent::{
+        agent_presets::{
+            AgentCheckpointFlags, AgentCheckpointPreset, AgentRunResult, BashPreHookStrategy,
+            prepare_agent_bash_pre_hook,
+        },
+        bash_tool::{self, Agent, BashCheckpointAction, HookEvent, ToolClass},
     },
     error::GitAiError,
     observability::log_error,
@@ -23,13 +27,11 @@ struct OpenCodeHookInput {
     hook_event_name: String,
     session_id: String,
     cwd: String,
-    tool_input: Option<ToolInput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolInput {
-    #[serde(rename = "filePath")]
-    file_path: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default, alias = "toolUseId")]
+    tool_use_id: Option<String>,
 }
 
 /// Message metadata from legacy file storage message/{session_id}/{msg_id}.json
@@ -160,17 +162,23 @@ impl AgentCheckpointPreset for OpenCodePreset {
         let hook_input: OpenCodeHookInput = serde_json::from_str(&hook_input_json)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
+        // Determine if this is a bash tool invocation (before destructuring)
+        let is_bash_tool = hook_input
+            .tool_name
+            .as_deref()
+            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name) == ToolClass::Bash)
+            .unwrap_or(false);
+
         let OpenCodeHookInput {
             hook_event_name,
             session_id,
             cwd,
             tool_input,
+            tool_name: _,
+            tool_use_id,
         } = hook_input;
 
-        // Extract file_path from tool_input if present
-        let file_path_as_vec = tool_input
-            .and_then(|ti| ti.file_path)
-            .map(|path| vec![path]);
+        let file_paths = Self::extract_filepaths_from_tool_input(tool_input.as_ref(), &cwd);
 
         // Determine OpenCode path (test override can point to either root or legacy storage path)
         let opencode_path = if let Ok(test_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
@@ -210,8 +218,20 @@ impl AgentCheckpointPreset for OpenCodePreset {
             agent_metadata.insert("__test_storage_path".to_string(), test_path);
         }
 
+        let tool_use_id = tool_use_id.as_deref().unwrap_or("bash");
+
         // Check if this is a PreToolUse event (human checkpoint)
         if hook_event_name == "PreToolUse" {
+            let pre_hook_captured_id = prepare_agent_bash_pre_hook(
+                is_bash_tool,
+                Some(&cwd),
+                &agent_id.id,
+                tool_use_id,
+                &agent_id,
+                Some(&agent_metadata),
+                BashPreHookStrategy::EmitHumanCheckpoint,
+            )?
+            .captured_checkpoint_id();
             return Ok(AgentRunResult {
                 agent_id,
                 agent_metadata: None,
@@ -219,10 +239,47 @@ impl AgentCheckpointPreset for OpenCodePreset {
                 transcript: None,
                 repo_working_dir: Some(cwd),
                 edited_filepaths: None,
-                will_edit_filepaths: file_path_as_vec,
+                will_edit_filepaths: file_paths,
                 dirty_files: None,
+                captured_checkpoint_id: pre_hook_captured_id,
             });
         }
+
+        // PostToolUse: for bash tools, diff snapshots to detect changed files
+        let bash_result = if is_bash_tool {
+            let repo_root = Path::new(&cwd);
+            Some(bash_tool::handle_bash_tool(
+                HookEvent::PostToolUse,
+                repo_root,
+                &agent_id.id,
+                tool_use_id,
+            ))
+        } else {
+            None
+        };
+        let edited_filepaths = if is_bash_tool {
+            match bash_result.as_ref().unwrap().as_ref().map(|r| &r.action) {
+                Ok(BashCheckpointAction::Checkpoint(paths)) => Some(paths.clone()),
+                Ok(BashCheckpointAction::NoChanges) => None,
+                Ok(BashCheckpointAction::Fallback) => {
+                    // snapshot unavailable or repo too large; no paths to report
+                    None
+                }
+                Ok(BashCheckpointAction::TakePreSnapshot) => None,
+                Err(e) => {
+                    tracing::debug!("Bash tool post-hook error: {}", e);
+                    None
+                }
+            }
+        } else {
+            file_paths
+        };
+
+        let bash_captured_checkpoint_id = bash_result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|r| r.captured_checkpoint.as_ref())
+            .map(|info| info.capture_id.clone());
 
         // PostToolUse event - AI checkpoint
         Ok(AgentRunResult {
@@ -231,14 +288,137 @@ impl AgentCheckpointPreset for OpenCodePreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(cwd),
-            edited_filepaths: file_path_as_vec,
+            edited_filepaths,
             will_edit_filepaths: None,
             dirty_files: None,
+            captured_checkpoint_id: bash_captured_checkpoint_id,
         })
     }
 }
 
 impl OpenCodePreset {
+    fn extract_filepaths_from_tool_input(
+        tool_input: Option<&serde_json::Value>,
+        cwd: &str,
+    ) -> Option<Vec<String>> {
+        let mut raw_paths = Vec::new();
+
+        if let Some(value) = tool_input {
+            Self::collect_tool_paths(value, &mut raw_paths);
+        }
+
+        let mut normalized_paths = Vec::new();
+        for raw in raw_paths {
+            if let Some(path) = Self::normalize_hook_path(&raw, cwd)
+                && !normalized_paths.contains(&path)
+            {
+                normalized_paths.push(path);
+            }
+        }
+
+        if normalized_paths.is_empty() {
+            None
+        } else {
+            Some(normalized_paths)
+        }
+    }
+
+    fn collect_apply_patch_paths_from_text(raw: &str, out: &mut Vec<String>) {
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            let maybe_path = trimmed
+                .strip_prefix("*** Update File: ")
+                .or_else(|| trimmed.strip_prefix("*** Add File: "))
+                .or_else(|| trimmed.strip_prefix("*** Delete File: "))
+                .or_else(|| trimmed.strip_prefix("*** Move to: "));
+
+            if let Some(path) = maybe_path {
+                let path = path.trim().trim_matches('"').trim_matches('\'');
+                if !path.is_empty() && !out.iter().any(|existing| existing == path) {
+                    out.push(path.to_string());
+                }
+            }
+        }
+    }
+
+    fn collect_tool_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map {
+                    let key_lower = key.to_ascii_lowercase();
+                    let is_single_path_key = key_lower == "file_path"
+                        || key_lower == "filepath"
+                        || key_lower == "path"
+                        || key_lower == "fspath";
+
+                    let is_multi_path_key = key_lower == "files"
+                        || key_lower == "filepaths"
+                        || key_lower == "file_paths";
+
+                    if is_single_path_key {
+                        if let Some(path) = val.as_str() {
+                            out.push(path.to_string());
+                        }
+                    } else if is_multi_path_key {
+                        match val {
+                            serde_json::Value::String(path) => out.push(path.to_string()),
+                            serde_json::Value::Array(paths) => {
+                                for path_value in paths {
+                                    if let Some(path) = path_value.as_str() {
+                                        out.push(path.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    Self::collect_tool_paths(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    Self::collect_tool_paths(item, out);
+                }
+            }
+            serde_json::Value::String(s) => {
+                if s.starts_with("file://") {
+                    out.push(s.to_string());
+                }
+                Self::collect_apply_patch_paths_from_text(s, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn normalize_hook_path(raw_path: &str, cwd: &str) -> Option<String> {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let path_without_scheme = trimmed
+            .strip_prefix("file://localhost")
+            .or_else(|| trimmed.strip_prefix("file://"))
+            .unwrap_or(trimmed);
+
+        let path = Path::new(path_without_scheme);
+        let joined = if path.is_absolute()
+            || path_without_scheme.starts_with("\\\\")
+            || path_without_scheme
+                .as_bytes()
+                .get(1)
+                .map(|b| *b == b':')
+                .unwrap_or(false)
+        {
+            PathBuf::from(path_without_scheme)
+        } else {
+            Path::new(cwd).join(path_without_scheme)
+        };
+
+        Some(joined.to_string_lossy().replace('\\', "/"))
+    }
+
     /// Get the OpenCode data directory based on platform.
     /// Expected layout: {data_dir}/opencode.db and {data_dir}/storage
     pub fn opencode_data_path() -> Result<PathBuf, GitAiError> {
@@ -432,8 +612,15 @@ impl OpenCodePreset {
     }
 
     fn open_sqlite_readonly(path: &Path) -> Result<Connection, GitAiError> {
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| GitAiError::Generic(format!("Failed to open {:?}: {}", path, e)))
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| GitAiError::Generic(format!("Failed to open {:?}: {}", path, e)))?;
+
+        // Limit SQLite page cache to ~2MB to prevent unbounded memory growth
+        // when scanning large databases without indexes.
+        // Default can grow much larger during repeated full table scans.
+        let _ = conn.execute_batch("PRAGMA cache_size = -2000;");
+
+        Ok(conn)
     }
 
     fn transcript_and_model_from_sqlite(
@@ -447,8 +634,14 @@ impl OpenCodePreset {
             return Ok((AiTranscript::new(), None));
         }
 
+        // Batch-load all parts for the session in a single query instead of
+        // one query per message (N+1). Without indexes on the OpenCode DB,
+        // each query requires a full table scan — doing this once instead of
+        // N times prevents extreme memory/CPU usage on large databases.
+        let mut parts_by_message = Self::read_all_session_parts_from_sqlite(&conn, session_id)?;
+
         Self::build_transcript_from_messages(messages, |message_id| {
-            Self::read_message_parts_from_sqlite(&conn, session_id, message_id)
+            Ok(parts_by_message.remove(message_id).unwrap_or_default())
         })
     }
 
@@ -725,22 +918,23 @@ impl OpenCodePreset {
         Ok(messages)
     }
 
-    fn read_message_parts_from_sqlite(
+    /// Read all parts for a session in a single query, grouped by message_id.
+    /// This avoids N+1 full table scans on databases without indexes.
+    fn read_all_session_parts_from_sqlite(
         conn: &Connection,
         session_id: &str,
-        message_id: &str,
-    ) -> Result<Vec<OpenCodePart>, GitAiError> {
+    ) -> Result<HashMap<String, Vec<OpenCodePart>>, GitAiError> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, time_created, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY id ASC",
+                "SELECT id, message_id, time_created, data FROM part WHERE session_id = ? ORDER BY message_id ASC, id ASC",
             )
             .map_err(|e| GitAiError::Generic(format!("SQLite query prepare failed: {}", e)))?;
 
         let mut rows = stmt
-            .query([session_id, message_id])
+            .query([session_id])
             .map_err(|e| GitAiError::Generic(format!("SQLite query failed: {}", e)))?;
 
-        let mut parts: Vec<(i64, OpenCodePart)> = Vec::new();
+        let mut parts_by_message: HashMap<String, Vec<(i64, OpenCodePart)>> = HashMap::new();
 
         while let Some(row) = rows
             .next()
@@ -749,17 +943,23 @@ impl OpenCodePreset {
             let part_id: String = row
                 .get(0)
                 .map_err(|e| GitAiError::Generic(format!("SQLite field read failed: {}", e)))?;
-            let created_column: i64 = row
+            let message_id: String = row
                 .get(1)
                 .map_err(|e| GitAiError::Generic(format!("SQLite field read failed: {}", e)))?;
-            let data_text: String = row
+            let created_column: i64 = row
                 .get(2)
+                .map_err(|e| GitAiError::Generic(format!("SQLite field read failed: {}", e)))?;
+            let data_text: String = row
+                .get(3)
                 .map_err(|e| GitAiError::Generic(format!("SQLite field read failed: {}", e)))?;
 
             match serde_json::from_str::<OpenCodePart>(&data_text) {
                 Ok(part) => {
                     let created = Self::part_created_for_sort(&part, created_column);
-                    parts.push((created, part));
+                    parts_by_message
+                        .entry(message_id)
+                        .or_default()
+                        .push((created, part));
                 }
                 Err(e) => {
                     eprintln!(
@@ -770,7 +970,16 @@ impl OpenCodePreset {
             }
         }
 
-        parts.sort_by_key(|(created, _)| *created);
-        Ok(parts.into_iter().map(|(_, part)| part).collect())
+        // Sort each message's parts by creation time
+        let mut result: HashMap<String, Vec<OpenCodePart>> = HashMap::new();
+        for (message_id, mut parts) in parts_by_message {
+            parts.sort_by_key(|(created, _)| *created);
+            result.insert(
+                message_id,
+                parts.into_iter().map(|(_, part)| part).collect(),
+            );
+        }
+
+        Ok(result)
     }
 }

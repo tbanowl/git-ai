@@ -6,10 +6,12 @@ use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
 use crate::git::refs::{get_authorship, show_authorship_note};
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
+use git2::Oid;
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
+use unicode_normalization::UnicodeNormalization;
 
 // ============================================================================
 // Data Structures
@@ -113,8 +115,8 @@ pub struct DiffCommitStats {
     pub ai_deletions_generated: u32,
     #[serde(default)]
     pub human_lines_added: u32,
-    #[serde(default)]
-    pub unknown_lines_added: u32,
+    // #[serde(default)]
+    // pub unknown_lines_added: u32,
     #[serde(default)]
     pub git_lines_added: u32,
     #[serde(default)]
@@ -148,6 +150,8 @@ pub struct DiffJsonHunk {
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,23 +407,18 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
 // ============================================================================
 
 fn resolve_commit(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("rev-parse".to_string());
-    args.push(rev.to_string());
-
-    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
-    let sha = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Failed to parse rev-parse output: {}", e)))?
-        .trim()
-        .to_string();
-
+    // Migrated from: git rev-parse <rev>
+    // Backend: git2
+    let obj = repo.revparse_single(rev)?;
+    let commit = obj.peel_to_commit()?;
+    let sha = commit.id().to_string();
+    let _oid = Oid::from_str(&sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
     if sha.is_empty() {
         return Err(GitAiError::Generic(format!(
             "Could not resolve commit: {}",
             rev
         )));
     }
-
     Ok(sha)
 }
 
@@ -571,12 +570,11 @@ fn parse_diff_hunks(diff_text: &str) -> Result<Vec<DiffHunk>, GitAiError> {
 fn normalize_diff_path_token(path: &str) -> String {
     let unescaped = crate::utils::unescape_git_path(path.trim_end());
     let prefixes = ["a/", "b/", "c/", "w/", "i/", "o/"];
-    for prefix in prefixes {
-        if let Some(stripped) = unescaped.strip_prefix(prefix) {
-            return stripped.to_string();
-        }
-    }
-    unescaped
+    let stripped = prefixes
+        .iter()
+        .find_map(|prefix| unescaped.strip_prefix(prefix))
+        .unwrap_or(&unescaped);
+    stripped.nfc().collect()
 }
 
 fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
@@ -965,8 +963,12 @@ fn apply_blame_for_side(
                     .or_default()
                     .push(*line);
                 Attribution::Ai(tool)
-            } else {
+            } else if author_marker.starts_with("h_") {
+                // Historical h_ human attestation marker.
                 Attribution::Human(author_marker.clone())
+            } else {
+                // Legacy or unrecognized marker (e.g. "human") — treat as unattested
+                Attribution::NoData
             };
             attributions.insert(key.clone(), attribution);
             line_details.insert(
@@ -1174,6 +1176,7 @@ fn build_json_hunk_segments(
     let mut current_start = 0u32;
     let mut current_end = 0u32;
     let mut current_prompt_id: Option<String> = None;
+    let mut current_human_id: Option<String> = None;
     let mut current_original_commit_sha: Option<String> = None;
     let mut current_commit_sha = String::new();
     let mut current_contents: Vec<String> = Vec::new();
@@ -1182,6 +1185,7 @@ fn build_json_hunk_segments(
                  current_start: &mut u32,
                  current_end: &mut u32,
                  current_prompt_id: &mut Option<String>,
+                 current_human_id: &mut Option<String>,
                  current_original_commit_sha: &mut Option<String>,
                  current_commit_sha: &mut String,
                  current_contents: &mut Vec<String>| {
@@ -1198,10 +1202,12 @@ fn build_json_hunk_segments(
             end_line: *current_end,
             file_path: diff_hunk.file_path.clone(),
             prompt_id: current_prompt_id.clone(),
+            human_id: current_human_id.clone(),
         });
         *current_start = 0;
         *current_end = 0;
         *current_prompt_id = None;
+        *current_human_id = None;
         *current_original_commit_sha = None;
         current_commit_sha.clear();
         current_contents.clear();
@@ -1245,6 +1251,7 @@ fn build_json_hunk_segments(
                 &mut current_start,
                 &mut current_end,
                 &mut current_prompt_id,
+                &mut current_human_id,
                 &mut current_original_commit_sha,
                 &mut current_commit_sha,
                 &mut current_contents,
@@ -1266,6 +1273,7 @@ fn build_json_hunk_segments(
         &mut current_start,
         &mut current_end,
         &mut current_prompt_id,
+        &mut current_human_id,
         &mut current_original_commit_sha,
         &mut current_commit_sha,
         &mut current_contents,
@@ -1411,12 +1419,14 @@ fn calculate_diff_commit_stats(
         }
         match attribution {
             Attribution::Human(_) => stats.human_lines_added += 1,
-            Attribution::NoData => stats.unknown_lines_added += 1,
+            Attribution::NoData => stats.human_lines_added += 1,
+            // Attribution::NoData => stats.unknown_lines_added += 1,
             Attribution::Ai(_) => {}
         }
     }
-    stats.git_lines_added =
-        stats.ai_lines_added + stats.human_lines_added + stats.unknown_lines_added;
+    stats.git_lines_added = stats.ai_lines_added + stats.human_lines_added;
+    // stats.git_lines_added =
+    //     stats.ai_lines_added + stats.human_lines_added + stats.unknown_lines_added;
 
     for hunk in &artifacts.json_hunks {
         if hunk.hunk_kind == "deletion" {
@@ -2498,6 +2508,7 @@ index abc123..def456 100644
                 end_line: 6,
                 file_path: "f.rs".to_string(),
                 prompt_id: None,
+                human_id: None,
             }],
             commits: BTreeMap::new(),
             included_files: HashSet::new(),
@@ -2505,8 +2516,9 @@ index abc123..def456 100644
 
         let stats = calculate_diff_commit_stats(&artifacts, &prompts);
         assert_eq!(stats.ai_lines_added, 1);
-        assert_eq!(stats.human_lines_added, 1);
-        assert_eq!(stats.unknown_lines_added, 1);
+        assert_eq!(stats.human_lines_added, 2);
+        // assert_eq!(stats.human_lines_added, 1);
+        // assert_eq!(stats.unknown_lines_added, 1);
         assert_eq!(stats.git_lines_added, 3);
         assert_eq!(stats.git_lines_deleted, 2);
         assert_eq!(stats.ai_lines_generated, 5);

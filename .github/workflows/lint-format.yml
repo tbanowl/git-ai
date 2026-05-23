@@ -2,9 +2,26 @@ name: Lint & Format
 
 on:
   pull_request:
-    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Taskfile.yml'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/lint-format.yml'
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Taskfile.yml'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/lint-format.yml'
   merge_group:
     branches: [main]
 
@@ -17,14 +34,14 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.93.0"
           components: rustfmt
 
-      - uses: go-task/setup-task@v1
+      - uses: go-task/setup-task@v2
 
       - run: task format:check
 
@@ -36,7 +53,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -53,7 +70,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-lint-
 
-      - uses: go-task/setup-task@v1
+      - uses: go-task/setup-task@v2
 
       - run: task lint
 
@@ -63,7 +80,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -79,6 +96,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-doc-
 
-      - uses: go-task/setup-task@v1
+      - uses: go-task/setup-task@v2
 
       - run: task doc

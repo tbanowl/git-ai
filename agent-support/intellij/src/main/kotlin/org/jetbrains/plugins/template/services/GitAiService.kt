@@ -4,6 +4,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
 import org.jetbrains.plugins.template.model.AgentV1Input
+import org.jetbrains.plugins.template.model.KnownHumanInput
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -68,9 +69,9 @@ class GitAiService {
      * Finds the git-ai binary by checking known installation locations first,
      * then falling back to PATH lookup.
      *
-     * Known locations (from install.sh, install.ps1, dev-symlinks.sh):
-     * - Production: ~/.git-ai/bin/git-ai
-     * - Development: ~/.git-ai-local-dev/gitwrap/bin/git-ai
+     * Known locations (from install.sh, install.ps1, scripts/dev.sh):
+     * - Production/dev build: ~/.git-ai/bin/git-ai  (dev.sh installs here too)
+     * - Nix development: ~/.git-ai-local-dev/gitwrap/bin/git-ai  (nix develop shellHook)
      *
      * @return The full path to git-ai if found, or null if not found
      */
@@ -87,17 +88,17 @@ class GitAiService {
         val homeDir = System.getProperty("user.home")
         val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
-        // Known installation locations from install.sh/install.ps1/dev-symlinks.sh
-        // Dev symlinks checked first so developers can test local builds
+        // Known installation locations from install.sh/install.ps1/scripts/dev.sh
+        // Nix dev path checked first so nix develop users can test local builds
         val knownPaths = if (isWindows) {
             listOf(
-                "$homeDir\\.git-ai-local-dev\\gitwrap\\bin\\git-ai.exe",  // Dev symlinks (checked first)
-                "$homeDir\\.git-ai\\bin\\git-ai.exe"                      // Production install (install.ps1)
+                "$homeDir\\.git-ai-local-dev\\gitwrap\\bin\\git-ai.exe",  // Nix dev (nix develop shellHook)
+                "$homeDir\\.git-ai\\bin\\git-ai.exe"                      // Production + non-Nix dev (install.ps1 / dev.sh)
             )
         } else {
             listOf(
-                "$homeDir/.git-ai-local-dev/gitwrap/bin/git-ai", // Dev symlinks (checked first)
-                "$homeDir/.git-ai/bin/git-ai"                    // Production install (install.sh)
+                "$homeDir/.git-ai-local-dev/gitwrap/bin/git-ai", // Nix dev (nix develop shellHook)
+                "$homeDir/.git-ai/bin/git-ai"                    // Production + non-Nix dev (install.sh / dev.sh)
             )
         }
 
@@ -343,6 +344,71 @@ class GitAiService {
         } catch (e: Exception) {
             logger.warn("Failed to create checkpoint: ${e.message}", e)
             TelemetryService.getInstance().captureError(e, mapOf("context" to "checkpoint_creation"))
+            false
+        }
+    }
+
+    /**
+     * Creates a known_human checkpoint by calling git-ai checkpoint known_human command.
+     *
+     * @param input The checkpoint data to send via stdin
+     * @param workingDirectory The working directory (git repo root) for the command
+     * @return true if checkpoint was created successfully
+     */
+    fun checkpointKnownHuman(input: KnownHumanInput, workingDirectory: String): Boolean {
+        if (!checkAvailable()) {
+            logger.warn("Skipping known_human checkpoint - git-ai not available")
+            return false
+        }
+
+        val gitAiPath = resolvedGitAiPath
+        if (gitAiPath == null) {
+            logger.warn("Skipping known_human checkpoint - git-ai path not resolved")
+            return false
+        }
+
+        return try {
+            val jsonInput = input.toJson()
+            logger.info("Creating known_human checkpoint for ${input.editedFilepaths}")
+            logger.info("known_human checkpoint input: $jsonInput")
+
+            val command = listOf(gitAiPath, "checkpoint", "known_human", "--hook-input", "stdin")
+            val process = ProcessBuilder(command)
+                .directory(File(workingDirectory))
+                .redirectErrorStream(false)
+                .start()
+
+            process.outputStream.bufferedWriter().use { writer ->
+                writer.write(jsonInput)
+            }
+
+            val completed = process.waitFor(30, TimeUnit.SECONDS)
+            if (!completed) {
+                process.destroyForcibly()
+                logger.warn("git-ai known_human checkpoint timed out")
+                return false
+            }
+
+            val output = process.inputStream.bufferedReader().readText().trim()
+            val errorOutput = process.errorStream.bufferedReader().readText().trim()
+            val exitCode = process.exitValue()
+
+            if (exitCode != 0) {
+                logger.warn("""
+                    git-ai known_human checkpoint failed
+                    Command: ${command.joinToString(" ")}
+                    Exit code: $exitCode
+                    Stdout: $output
+                    Stderr: $errorOutput
+                """.trimIndent())
+                return false
+            }
+
+            logger.info("known_human checkpoint created successfully")
+            if (output.isNotEmpty()) logger.info("git-ai output: $output")
+            true
+        } catch (e: Exception) {
+            logger.warn("Failed to create known_human checkpoint: ${e.message}", e)
             false
         }
     }

@@ -1,4 +1,5 @@
-use crate::commands::flush_metrics_db::spawn_background_metrics_db_flush;
+use crate::config;
+use crate::daemon::DaemonConfig;
 use crate::error::GitAiError;
 use crate::mdm::agents::get_all_installers;
 use crate::mdm::git_client_installer::GitClientInstallerParams;
@@ -7,7 +8,14 @@ use crate::mdm::hook_installer::HookInstallerParams;
 use crate::mdm::skills_installer;
 use crate::mdm::spinner::{Spinner, print_diff};
 use crate::mdm::utils::{get_current_binary_path, git_shim_path};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
+const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
+const TRACE2_EVENT_NESTING_VALUE: &str = "10";
 
 /// Installation status for a tool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +115,223 @@ fn print_amp_plugins_note(installer_id: &str) {
     }
 }
 
+/// Find PIDs of running processes that match any of the given process names.
+/// Returns a list of (pid, process_name) tuples for each match found.
+fn find_running_pids(process_names: &[&str]) -> Vec<(u32, String)> {
+    if process_names.is_empty() {
+        return vec![];
+    }
+
+    let output = {
+        #[cfg(unix)]
+        {
+            Command::new("ps")
+                .args(["axo", "pid,comm"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+        }
+        #[cfg(windows)]
+        {
+            Command::new("tasklist")
+                .args(["/FO", "CSV", "/NH"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+        }
+    };
+
+    let Ok(output) = output else {
+        return vec![];
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results: Vec<(u32, String)> = Vec::new();
+
+    for line in stdout.lines() {
+        #[cfg(unix)]
+        {
+            let trimmed = line.trim();
+            // ps output: "  PID COMM" — split on whitespace
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let pid_str = parts.next().unwrap_or("").trim();
+            let comm = parts.next().unwrap_or("").trim();
+            // comm may be a full path; extract the basename
+            let base = comm.rsplit('/').next().unwrap_or(comm);
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                for &name in process_names {
+                    if base.eq_ignore_ascii_case(name) {
+                        results.push((pid, base.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // tasklist CSV: "Image Name","PID",...
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields.len() >= 2 {
+                let image = fields[0].trim_matches('"');
+                let pid_str = fields[1].trim_matches('"');
+                let base = image.strip_suffix(".exe").unwrap_or(image);
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    for &name in process_names {
+                        if base.eq_ignore_ascii_case(name) {
+                            results.push((pid, base.to_string()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+fn set_global_git_config_value(git_cmd: &str, key: &str, value: &str) -> Result<(), GitAiError> {
+    let status = Command::new(git_cmd)
+        .args(["config", "--global", key, value])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitAiError::Generic(format!(
+            "failed to set global git config key '{}'",
+            key
+        )))
+    }
+}
+
+fn ensure_global_git_config_dirs() -> Result<(), GitAiError> {
+    if let Ok(path) = std::env::var("GIT_CONFIG_GLOBAL") {
+        let config_path = PathBuf::from(path);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        fs::create_dir_all(home)?;
+    }
+
+    Ok(())
+}
+
+fn remove_global_git_config_section(git_cmd: &str, section: &str) -> Result<(), GitAiError> {
+    let status = Command::new(git_cmd)
+        .args(["config", "--global", "--remove-section", section])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    // Exit code 128 means the section doesn't exist, which is fine.
+    if status.success() || status.code() == Some(128) {
+        Ok(())
+    } else {
+        Err(GitAiError::Generic(format!(
+            "failed to remove global git config section '{}'",
+            section
+        )))
+    }
+}
+
+fn maybe_configure_async_mode_daemon_trace2(dry_run: bool) -> Result<(), GitAiError> {
+    let runtime_config = config::Config::fresh();
+
+    if !runtime_config.feature_flags().async_mode {
+        if !dry_run {
+            // Async mode is off — clean up any trace2 config we previously wrote.
+            let _ = remove_global_git_config_section(runtime_config.git_cmd(), "trace2");
+        }
+        return Ok(());
+    }
+
+    ensure_global_git_config_dirs()?;
+
+    let daemon_config = DaemonConfig::from_env_or_default_paths()?;
+    let event_target = daemon_config.trace2_event_target();
+
+    if dry_run {
+        return Ok(());
+    }
+
+    // Fully reset any existing trace2 config the user may have set
+    // (e.g. trace2.normalTarget, trace2.perfTarget, trace2.configParams, etc.)
+    // before writing only the keys we need.
+    remove_global_git_config_section(runtime_config.git_cmd(), "trace2")?;
+
+    set_global_git_config_value(
+        runtime_config.git_cmd(),
+        TRACE2_EVENT_TARGET_KEY,
+        &event_target,
+    )?;
+    set_global_git_config_value(
+        runtime_config.git_cmd(),
+        TRACE2_EVENT_NESTING_KEY,
+        TRACE2_EVENT_NESTING_VALUE,
+    )?;
+    Ok(())
+}
+
+fn maybe_teardown_async_mode(dry_run: bool) {
+    if dry_run {
+        return;
+    }
+
+    let runtime_config = config::Config::fresh();
+    if runtime_config.feature_flags().async_mode {
+        return;
+    }
+
+    // Don't touch daemon inside test harnesses
+    if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
+        || std::env::var_os("GITAI_TEST_DB_PATH").is_some()
+    {
+        return;
+    }
+
+    // Shut down any leftover daemon from when async_mode was enabled.
+    // Uses stop_daemon which tries soft shutdown then escalates to hard kill.
+    if let Ok(daemon_config) = DaemonConfig::from_env_or_default_paths() {
+        let _ =
+            crate::commands::daemon::stop_daemon(&daemon_config, std::time::Duration::from_secs(5));
+    }
+}
+
+fn maybe_ensure_daemon(dry_run: bool) {
+    if dry_run {
+        return;
+    }
+
+    let runtime_config = config::Config::fresh();
+    if !runtime_config.feature_flags().async_mode {
+        return;
+    }
+
+    // Don't touch daemon inside test harnesses
+    if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
+        || std::env::var_os("GITAI_TEST_DB_PATH").is_some()
+    {
+        return;
+    }
+
+    let Ok(daemon_config) = DaemonConfig::from_env_or_default_paths() else {
+        return;
+    };
+
+    // Restart daemon so it picks up the freshly-written trace2 config.
+    // Uses soft shutdown → hard kill escalation if needed.
+    if let Err(e) = crate::commands::daemon::restart_daemon(&daemon_config) {
+        eprintln!(
+            "[git-ai] warning: failed to restart background service: {}",
+            e
+        );
+    }
+}
+
 /// Main entry point for install-hooks command
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
     // Parse flags
@@ -121,8 +346,24 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
         }
     }
 
+    // In async mode, daemon trace2 config must be in place before any install work starts.
+    // If async mode was disabled, tear down any leftover daemon and trace2 config.
+    // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
+    if let Err(e) = maybe_configure_async_mode_daemon_trace2(dry_run) {
+        eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
+    }
+    maybe_teardown_async_mode(dry_run);
+    maybe_ensure_daemon(dry_run);
+
+    // Now that the daemon is (re)started, initialize the telemetry handle so
+    // that install-hooks metrics and observability events route through it.
+    if config::Config::get().feature_flags().async_mode && !dry_run {
+        let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
+    }
+
     // Get absolute path to the current binary
     let binary_path = get_current_binary_path()?;
+    persist_install_api_base_config(&binary_path, dry_run)?;
     let params = HookInstallerParams { binary_path };
 
     // Run async operations with smol and convert result
@@ -130,9 +371,80 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
 
     // Spawn background processes to flush metrics
     crate::observability::spawn_background_flush();
-    spawn_background_metrics_db_flush();
+
+    // Clean up legacy envelope logs directory and related artifacts.
+    // These are no longer used — all telemetry now routes through the daemon.
+    if !dry_run {
+        cleanup_legacy_envelope_logs();
+    }
 
     Ok(to_hashmap(statuses))
+}
+
+fn persist_install_api_base_config(binary_path: &Path, dry_run: bool) -> Result<bool, GitAiError> {
+    if dry_run {
+        return Ok(false);
+    }
+
+    let api_base = std::env::var("API_BASE").ok().filter(|s| !s.is_empty());
+    let Some(api_base) = api_base else {
+        return Ok(false);
+    };
+
+    let mut file_config = crate::config::load_file_config_public().map_err(GitAiError::Generic)?;
+    let mut changed = false;
+
+    if file_config.api_base_url.as_deref() != Some(api_base.as_str()) {
+        file_config.api_base_url = Some(api_base);
+        changed = true;
+    }
+
+    let git_path_missing = file_config
+        .git_path
+        .as_ref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+    if git_path_missing && let Some(git_path) = detect_install_git_path(binary_path) {
+        file_config.git_path = Some(git_path);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    crate::config::save_file_config(&file_config).map_err(GitAiError::Generic)?;
+    Ok(true)
+}
+
+fn detect_install_git_path(binary_path: &Path) -> Option<String> {
+    let install_dir = binary_path.parent()?;
+
+    #[cfg(windows)]
+    {
+        parse_git_og_cmd_path(&fs::read_to_string(install_dir.join("git-og.cmd")).ok()?)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let target = fs::read_link(install_dir.join("git-og")).ok()?;
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            install_dir.join(target)
+        };
+        Some(resolved.to_string_lossy().to_string())
+    }
+}
+
+#[cfg(windows)]
+fn parse_git_og_cmd_path(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let start = line.find('"')?;
+        let rest = &line[start + 1..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    })
 }
 
 /// Main entry point for uninstall-hooks command
@@ -169,14 +481,6 @@ async fn async_run_install(
     // Track detailed results for metrics (tool_id, result)
     let mut detailed_results: Vec<(String, InstallResult)> = Vec::new();
 
-    // Install skills first (these are global, not per-agent)
-    // Skills are always nuked and reinstalled fresh (silently)
-    if let Ok(result) = skills_installer::install_skills(dry_run, verbose)
-        && result.changed
-    {
-        has_changes = true;
-    }
-
     // Ensure git symlinks for Fork compatibility
     if let Err(e) = crate::mdm::ensure_git_symlinks() {
         eprintln!("Warning: Failed to create git symlinks: {}", e);
@@ -186,8 +490,11 @@ async fn async_run_install(
     println!("\n\x1b[1mCoding Agents\x1b[0m");
 
     let installers = get_all_installers();
+    let mut installed_tools: HashSet<String> = HashSet::new();
+    // Track agents whose hooks were updated (name, process_names) for restart warnings
+    let mut updated_agents: Vec<(String, Vec<String>)> = Vec::new();
 
-    for installer in installers {
+    for installer in &installers {
         let name = installer.name();
         let id = installer.id();
 
@@ -200,6 +507,7 @@ async fn async_run_install(
                     continue;
                 }
 
+                installed_tools.insert(id.to_string());
                 any_checked = true;
 
                 // Install/update hooks (only for tools that use config file hooks)
@@ -222,6 +530,18 @@ async fn async_run_install(
                             has_changes = true;
                             statuses.insert(id.to_string(), InstallStatus::Installed);
                             detailed_results.push((id.to_string(), InstallResult::installed()));
+
+                            // Track this agent for restart detection (skip in dry-run)
+                            if !dry_run {
+                                let pnames: Vec<String> = installer
+                                    .process_names()
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                if !pnames.is_empty() {
+                                    updated_agents.push((name.to_string(), pnames));
+                                }
+                            }
                         }
                         Ok(None) => {
                             spinner.success(&format!("{}: Hooks already up to date", name));
@@ -244,9 +564,11 @@ async fn async_run_install(
                 // Install extras (extensions, git.path, etc.)
                 match installer.install_extras(params, dry_run) {
                     Ok(results) => {
+                        let mut extras_changed = false;
                         for result in results {
                             if result.changed {
                                 has_changes = true;
+                                extras_changed = true;
                             }
                             if result.changed && !dry_run {
                                 let extra_spinner = Spinner::new(&result.message);
@@ -283,6 +605,21 @@ async fn async_run_install(
                                 detail.warnings.push(result.message.clone());
                             }
                         }
+
+                        // Track restart detection for extras-only agents (e.g. JetBrains, VS Code)
+                        if extras_changed
+                            && !dry_run
+                            && !updated_agents.iter().any(|(n, _)| n == name)
+                        {
+                            let pnames: Vec<String> = installer
+                                .process_names()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                            if !pnames.is_empty() {
+                                updated_agents.push((name.to_string(), pnames));
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("  Error installing extras for {}: {}", name, e);
@@ -308,6 +645,13 @@ async fn async_run_install(
                 detailed_results.push((id.to_string(), InstallResult::failed(error_msg)));
             }
         }
+    }
+
+    // Install skills for detected agents only
+    if let Ok(result) = skills_installer::install_skills(dry_run, verbose, &installed_tools)
+        && result.changed
+    {
+        has_changes = true;
     }
 
     if !any_checked {
@@ -391,6 +735,46 @@ async fn async_run_install(
         println!("\n\x1b[33m⚠ Dry-run mode (default). No changes were made.\x1b[0m");
         println!("To apply these changes, run:");
         println!("\x1b[1m  git-ai install-hooks --dry-run=false\x1b[0m");
+    }
+
+    // Check for running agents that had hooks updated and warn about restart
+    if !dry_run && !updated_agents.is_empty() {
+        let mut any_running = false;
+
+        for (agent_name, pnames) in &updated_agents {
+            let refs: Vec<&str> = pnames.iter().map(|s| s.as_str()).collect();
+            let pids = find_running_pids(&refs);
+            if !pids.is_empty() {
+                if !any_running {
+                    println!(
+                        "\n\x1b[33m⚠ The following agents are currently running and must be restarted:\x1b[0m"
+                    );
+                    any_running = true;
+                }
+                let pid_list: Vec<String> = pids.iter().map(|(pid, _)| pid.to_string()).collect();
+                println!(
+                    "  \x1b[1m{}\x1b[0m (PID: {})",
+                    agent_name,
+                    pid_list.join(", ")
+                );
+            }
+        }
+
+        if any_running {
+            println!();
+            println!(
+                "\x1b[33mRestart the agents listed above for git-ai attribution to take effect.\x1b[0m"
+            );
+            println!(
+                "Any work done before installing git-ai (or before restarting) will be attributed as human."
+            );
+            println!(
+                "This is expected — once you commit and start a fresh session, attribution will work correctly."
+            );
+            println!(
+                "If the issue persists, please open an issue at https://github.com/git-ai-project/git-ai/issues"
+            );
+        }
     }
 
     // Emit metrics for each agent/git_client result (only if not dry-run)
@@ -606,4 +990,210 @@ async fn async_run_uninstall(
     }
 
     Ok(statuses)
+}
+
+/// Remove the legacy envelope logs directory and related lock/marker files.
+///
+/// All telemetry now flows through the daemon control socket, so the per-PID
+/// log file system under `~/.git-ai/internal/logs/` is no longer needed.
+fn cleanup_legacy_envelope_logs() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let internal = home.join(".git-ai").join("internal");
+
+    // Remove the entire logs directory
+    let logs_dir = internal.join("logs");
+    if logs_dir.is_dir() {
+        let _ = fs::remove_dir_all(&logs_dir);
+    }
+
+    // Remove the flush-logs lock file
+    let _ = fs::remove_file(internal.join("flush-logs.lock"));
+
+    // Remove the debounce marker file
+    let _ = fs::remove_file(internal.join("last_flush_trigger_ts"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: tests marked `serial` avoid concurrent env mutation.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: tests marked `serial` avoid concurrent env mutation.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests marked `serial` avoid concurrent env mutation.
+            unsafe {
+                if let Some(old) = &self.old {
+                    std::env::set_var(self.key, old);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn test_binary_path(install_dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            install_dir.join("git-ai.exe")
+        }
+
+        #[cfg(not(windows))]
+        {
+            install_dir.join("git-ai")
+        }
+    }
+
+    fn write_install_git_marker(install_dir: &Path, git_path: &str) {
+        #[cfg(windows)]
+        {
+            fs::write(
+                install_dir.join("git-og.cmd"),
+                format!("@echo off\r\n\"{}\" %*\r\n", git_path),
+            )
+            .unwrap();
+        }
+
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(git_path, install_dir.join("git-og")).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn persist_install_api_base_updates_config_and_backfills_git_path() {
+        let temp = tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(test_binary_path(&install_dir), "").unwrap();
+
+        let expected_git_path = if cfg!(windows) {
+            r"C:\Program Files\Git\bin\git.exe"
+        } else {
+            "/opt/custom/bin/git"
+        };
+        write_install_git_marker(&install_dir, expected_git_path);
+
+        let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        #[cfg(windows)]
+        let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
+        let _api_base = EnvVarGuard::set("API_BASE", "https://enterprise.example");
+
+        let changed =
+            persist_install_api_base_config(&test_binary_path(&install_dir), false).unwrap();
+
+        assert!(changed);
+
+        let config = crate::config::load_file_config_public().unwrap();
+        assert_eq!(
+            config.api_base_url.as_deref(),
+            Some("https://enterprise.example")
+        );
+        assert_eq!(config.git_path.as_deref(), Some(expected_git_path));
+    }
+
+    #[test]
+    #[serial]
+    fn persist_install_api_base_preserves_existing_git_path() {
+        let temp = tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(test_binary_path(&install_dir), "").unwrap();
+        write_install_git_marker(
+            &install_dir,
+            if cfg!(windows) {
+                r"C:\Program Files\Git\bin\git.exe"
+            } else {
+                "/opt/custom/bin/git"
+            },
+        );
+
+        let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        #[cfg(windows)]
+        let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
+        let _api_base = EnvVarGuard::set("API_BASE", "https://enterprise.example");
+
+        let existing_git_path = if cfg!(windows) {
+            r"D:\PortableGit\bin\git.exe"
+        } else {
+            "/usr/local/bin/git"
+        };
+        crate::config::save_file_config(&crate::config::FileConfig {
+            git_path: Some(existing_git_path.to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_install_api_base_config(&test_binary_path(&install_dir), false).unwrap();
+
+        let config = crate::config::load_file_config_public().unwrap();
+        assert_eq!(
+            config.api_base_url.as_deref(),
+            Some("https://enterprise.example")
+        );
+        assert_eq!(config.git_path.as_deref(), Some(existing_git_path));
+    }
+
+    #[test]
+    #[serial]
+    fn persist_install_api_base_skips_without_env_or_in_dry_run() {
+        let temp = tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(test_binary_path(&install_dir), "").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        #[cfg(windows)]
+        let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
+        let _api_base = EnvVarGuard::remove("API_BASE");
+
+        let changed =
+            persist_install_api_base_config(&test_binary_path(&install_dir), false).unwrap();
+        assert!(!changed);
+        assert!(!temp.path().join(".git-ai").join("config.json").exists());
+
+        let _api_base = EnvVarGuard::set("API_BASE", "https://enterprise.example");
+        let changed =
+            persist_install_api_base_config(&test_binary_path(&install_dir), true).unwrap();
+        assert!(!changed);
+        assert!(!temp.path().join(".git-ai").join("config.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_git_og_cmd_path_extracts_wrapped_git_path() {
+        assert_eq!(
+            parse_git_og_cmd_path("@echo off\r\n\"C:\\Program Files\\Git\\bin\\git.exe\" %*\r\n"),
+            Some("C:\\Program Files\\Git\\bin\\git.exe".to_string())
+        );
+    }
 }

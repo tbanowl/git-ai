@@ -13,7 +13,8 @@ use crate::commands::search::{
 };
 use crate::error::GitAiError;
 use crate::git::find_repository_in_path;
-use crate::git::repository::{InternalGitProfile, Repository, exec_git, exec_git_with_profile};
+use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
+use git2::{Oid, Repository as Git2Repository, Sort};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::io::{BufRead, IsTerminal, Write};
@@ -89,47 +90,58 @@ impl CommitInfo {
     /// delimiter-based format, then fetches the full message body separately
     /// (since `%B` can contain the delimiter).
     pub fn from_commit_sha(repo: &Repository, sha: &str) -> Result<Self, GitAiError> {
-        // Step 1: Get structured metadata
-        let mut args = repo.global_args_for_exec();
-        args.push("log".to_string());
-        args.push("-1".to_string());
-        args.push("--format=%H|||%an|||%ai|||%s".to_string());
-        args.push(sha.to_string());
+        // Migrated from:
+        // - git log -1 --format=%H|||%an|||%ai|||%s <sha>
+        // - git log -1 --format=%B <sha>
+        // Backend: git2
+        let g2repo =
+            Git2Repository::open(repo.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let oid = Oid::from_str(sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
+        let commit = g2repo
+            .find_commit(oid)
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-        let output = exec_git(&args)?;
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| GitAiError::Generic(format!("Invalid UTF-8 in git output: {}", e)))?;
-
-        let parts: Vec<&str> = stdout.trim().split("|||").collect();
-        if parts.len() < 4 {
-            return Err(GitAiError::Generic(format!(
-                "Failed to parse commit info for {}",
-                sha
-            )));
-        }
-
-        // Step 2: Get full commit message body (separate call to avoid
-        // delimiter conflicts in multi-line messages)
-        let mut body_args = repo.global_args_for_exec();
-        body_args.push("log".to_string());
-        body_args.push("-1".to_string());
-        body_args.push("--format=%B".to_string());
-        body_args.push(parts[0].to_string());
-
-        let full_message = exec_git(&body_args)
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| parts[3].to_string());
+        let author = commit.author();
+        let message = commit.summary().unwrap_or("").to_string();
+        let full_message = std::str::from_utf8(commit.message_bytes())
+            .map_err(|e| GitAiError::Generic(format!("Invalid UTF-8 in git output: {}", e)))?
+            .trim()
+            .to_string();
 
         Ok(CommitInfo {
-            sha: parts[0].to_string(),
-            author: parts[1].to_string(),
-            date: parts[2].to_string(),
-            message: parts[3..].join("|||"),
-            full_message,
+            sha: commit.id().to_string(),
+            author: author.name().unwrap_or("").to_string(),
+            date: format_git_log_author_date(author.when()),
+            message: message.clone(),
+            full_message: if full_message.is_empty() {
+                message
+            } else {
+                full_message
+            },
         })
     }
+}
+
+fn format_git_log_author_date(time: git2::Time) -> String {
+    chrono::DateTime::from_timestamp(time.seconds(), 0)
+        .unwrap_or_default()
+        .with_timezone(
+            &chrono::FixedOffset::east_opt(time.offset_minutes() * 60)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap()),
+        )
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string()
+}
+
+fn format_oneline_commit(commit: &git2::Commit<'_>) -> Result<String, GitAiError> {
+    let short = commit
+        .as_object()
+        .short_id()
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let short = short
+        .as_str()
+        .ok_or_else(|| GitAiError::Generic("Invalid UTF-8 in git output".to_string()))?;
+    Ok(format!("{} {}", short, commit.summary().unwrap_or("")))
 }
 
 /// Get the diff for a specific commit.
@@ -194,30 +206,45 @@ fn read_project_context(repo: &Repository) -> Option<String> {
 /// Get current git status information (branch name and recent commits).
 ///
 /// Returns a formatted string similar to the `gitStatus` block that Claude Code
-/// provides on startup, or `None` if the information cannot be retrieved.
+/// provides on startup.
+///
+/// Returns `None` only when the repository cannot be opened. For detached HEAD
+/// we intentionally mirror `git branch --show-current` and render an empty
+/// branch name; if reading `HEAD` itself fails after opening the repo, we fall
+/// back to `(unknown)` while still attempting to include recent commits.
 fn get_git_status_info(repo: &Repository) -> Option<String> {
-    // Get current branch
-    let mut branch_args = repo.global_args_for_exec();
-    branch_args.push("branch".to_string());
-    branch_args.push("--show-current".to_string());
+    // Migrated from:
+    // - git branch --show-current
+    // - git log --oneline -5
+    // Backend: git2
+    let g2repo = Git2Repository::open(repo.path()).ok()?;
 
-    let branch = exec_git(&branch_args)
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "(unknown)".to_string());
+    let branch = match g2repo.head() {
+        Ok(head) if head.is_branch() => head.shorthand().unwrap_or("").to_string(),
+        Ok(_) => String::new(),
+        Err(_) => "(unknown)".to_string(),
+    };
 
-    // Get recent commit log
-    let mut log_args = repo.global_args_for_exec();
-    log_args.push("log".to_string());
-    log_args.push("--oneline".to_string());
-    log_args.push("-5".to_string());
+    let recent_commits = (|| -> Result<String, GitAiError> {
+        let mut walk = g2repo
+            .revwalk()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
+        walk.push_head()
+            .map_err(|e| GitAiError::Generic(e.to_string()))?;
 
-    let recent_commits = exec_git(&log_args)
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+        let mut lines = Vec::new();
+        for oid in walk.take(5) {
+            let oid = oid.map_err(|e| GitAiError::Generic(e.to_string()))?;
+            let commit = g2repo
+                .find_commit(oid)
+                .map_err(|e| GitAiError::Generic(e.to_string()))?;
+            lines.push(format_oneline_commit(&commit)?);
+        }
+        Ok(lines.join("\n"))
+    })()
+    .unwrap_or_default();
 
     let mut info = String::new();
     info.push_str(&format!("Current branch: {}\n", branch));

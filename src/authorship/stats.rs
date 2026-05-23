@@ -3,8 +3,7 @@ use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_ma
 use crate::authorship::transcript::Message;
 use crate::error::GitAiError;
 use crate::git::refs::get_authorship;
-use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
-use crate::utils::debug_log;
+use crate::git::repository::Repository;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -75,10 +74,11 @@ pub fn stats_command(
         (target, name)
     };
 
-    debug_log(&format!(
+    tracing::debug!(
         "Stats command found commit: {} refname: {}",
-        target, refname
-    ));
+        target,
+        refname
+    );
 
     let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
 
@@ -130,7 +130,6 @@ pub fn write_stats_to_terminal(stats: &CommitStats, print: bool) -> String {
     let total_additions = stats.human_additions + stats.ai_additions;
 
     // Calculate AI acceptance percentage (capped at 100%)
-    // It can go higher because AI can write on top of AI code. This feels reasonable for now
     let _ai_acceptance_percentage = if stats.ai_additions > 0 {
         ((stats.ai_accepted as f64 / stats.ai_additions as f64) * 100.0).min(100.0)
     } else {
@@ -313,8 +312,16 @@ pub fn write_stats_to_markdown(stats: &CommitStats) -> String {
     // Total = pure human + mixed (AI-edited-by-human) + pure AI (accepted)
     let total_additions = stats.git_diff_added_lines;
 
-    // Pure human additions (not including mixed)
-    let pure_human = stats.human_additions;
+    // Calculate AI acceptance percentage (capped at 100%)
+    // It can go higher because AI can write on top of AI code. This feels reasonable for now
+    let _ai_acceptance_percentage = if stats.ai_additions > 0 {
+        ((stats.ai_accepted as f64 / stats.ai_additions as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    // Pure human = human_additions - mixed_additions (overridden lines)
+    let pure_human = stats.human_additions.saturating_sub(stats.mixed_additions);
     // Mixed = AI lines that were edited by human
     let mixed = stats.mixed_additions;
     // Pure AI = AI lines accepted without changes
@@ -642,57 +649,42 @@ fn line_range_overlap_len(range: &LineRange, added_lines: &[u32]) -> u32 {
 }
 
 /// Get git diff statistics between commit and its parent
+/// Uses the same diff engine as git ai diff to properly handle renames
 pub fn get_git_diff_stats(
     repo: &Repository,
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<(u32, u32), GitAiError> {
-    // Use git show --numstat to get diff statistics
-    let mut args = repo.global_args_for_exec();
-    args.push("show".to_string());
-    args.push("--numstat".to_string());
-    args.push("--format=".to_string()); // No format, just the numstat
-    args.push(commit_sha.to_string());
+    use crate::commands::diff::get_diff_with_line_numbers;
 
-    let output = exec_git_with_profile(&args, InternalGitProfile::NumstatParse)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commit_obj = repo.revparse_single(commit_sha)?.peel_to_commit()?;
+    let parent_count = commit_obj.parent_count()?;
 
+    // For merge commits, return (0, 0) to match the behavior of `git show --numstat`
+    // which shows a combined diff (typically 0 lines for clean merges)
+    if parent_count > 1 {
+        return Ok((0, 0));
+    }
+
+    let from_ref = if parent_count == 0 {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+    } else {
+        commit_obj.parent(0)?.id()
+    };
+
+    // Use the diff engine which properly handles renames with --find-renames=1%
+    let hunks = get_diff_with_line_numbers(repo, &from_ref, commit_sha)?;
+
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
     let mut added_lines = 0u32;
     let mut deleted_lines = 0u32;
-    let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
-    // Parse numstat output
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
+    for hunk in hunks {
+        if should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher) {
             continue;
         }
-
-        // Skip the commit message lines (they don't start with numbers)
-        if !line.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            continue;
-        }
-
-        // Parse numstat format: "added\tdeleted\tfilename"
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            // Check if this file should be ignored
-            let filename = parts[2];
-            if should_ignore_file_with_matcher(filename, &ignore_matcher) {
-                continue;
-            }
-
-            // Parse added lines
-            if let Ok(added) = parts[0].parse::<u32>() {
-                added_lines += added;
-            }
-
-            // Parse deleted lines (handle "-" for binary files)
-            if parts[1] != "-"
-                && let Ok(deleted) = parts[1].parse::<u32>()
-            {
-                deleted_lines += deleted;
-            }
-        }
+        added_lines += hunk.added_lines.len() as u32;
+        deleted_lines += hunk.deleted_lines.len() as u32;
     }
 
     Ok((added_lines, deleted_lines))
@@ -1018,6 +1010,8 @@ mod tests {
         let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
 
         // Verify the stats
+        // trigger_checkpoint_with_author produces canonical human checkpoints, so
+        // human-written lines count toward human_additions.
         assert_eq!(stats.human_additions, 2, "Human added 2 lines");
         assert_eq!(stats.ai_additions, 2, "AI added 2 lines");
         assert_eq!(stats.ai_accepted, 2, "AI lines were accepted");

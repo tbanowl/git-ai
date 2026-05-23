@@ -162,7 +162,6 @@ pub struct GitAiBlameOptions {
 
     // Split hunks when lines have different AI human authors
     // When true, a single git blame hunk may be split into multiple hunks
-    // if different lines were authored by different humans working with AI
     pub split_hunks_by_ai_author: bool,
 }
 
@@ -312,7 +311,7 @@ impl Repository {
         } else if let Some(ref commit) = options.newest_commit {
             // Read file content from the specified commit.
             // This ensures blame is independent of which branch is checked out.
-            let commit_obj = self.find_commit(commit.clone())?;
+            let commit_obj = self.revparse_single(commit)?.peel_to_commit()?;
             let tree = commit_obj.tree()?;
 
             match tree.get_path(std::path::Path::new(relative_file_path)) {
@@ -442,6 +441,8 @@ impl Repository {
         requests_by_len: &HashMap<usize, Vec<String>>,
     ) -> HashMap<(String, usize), String> {
         let mut resolved: HashMap<(String, usize), String> = HashMap::new();
+        let git2_repo = git2::Repository::open(self.path()).ok();
+        let odb = git2_repo.as_ref().and_then(|repo| repo.odb().ok());
 
         for (&requested_len, commit_shas) in requests_by_len {
             if commit_shas.is_empty() {
@@ -449,28 +450,29 @@ impl Repository {
             }
 
             for commit_sha_batch in commit_shas.chunks(Self::BLAME_ABBREV_BATCH_SIZE) {
-                let mut args = self.global_args_for_exec();
-                args.push("rev-parse".to_string());
-                args.push(format!("--short={requested_len}"));
-                args.extend(commit_sha_batch.iter().cloned());
+                if let Some(odb) = odb.as_ref() {
+                    for commit_sha in commit_sha_batch {
+                        let resolved_abbrev =
+                            git2::Oid::from_str(commit_sha).ok().and_then(|full_oid| {
+                                (requested_len.min(commit_sha.len())..=commit_sha.len()).find_map(
+                                    |len| {
+                                        let prefix = &commit_sha[..len];
+                                        let short_oid = git2::Oid::from_str(prefix).ok()?;
+                                        let found_oid = odb.exists_prefix(short_oid, len).ok()?;
+                                        (found_oid == full_oid).then(|| prefix.to_string())
+                                    },
+                                )
+                            });
 
-                let batched_result = exec_git(&args)
-                    .ok()
-                    .and_then(|output| String::from_utf8(output.stdout).ok())
-                    .map(|stdout| {
-                        stdout
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| !line.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    });
-
-                if let Some(short_shas) = batched_result
-                    && short_shas.len() == commit_sha_batch.len()
-                {
-                    for (commit_sha, short_sha) in commit_sha_batch.iter().zip(short_shas) {
-                        resolved.insert((commit_sha.clone(), requested_len), short_sha);
+                        if let Some(short_sha) = resolved_abbrev {
+                            resolved.insert((commit_sha.clone(), requested_len), short_sha);
+                        } else {
+                            resolved
+                                .entry((commit_sha.clone(), requested_len))
+                                .or_insert_with(|| {
+                                    Self::fallback_blame_abbrev_sha(commit_sha, requested_len)
+                                });
+                        }
                     }
                     continue;
                 }
@@ -635,6 +637,16 @@ impl Repository {
         // Ignore whitespace option
         if options.ignore_whitespace {
             args.push("-w".to_string());
+        }
+
+        // Detect lines moved within a file (-M) and copied from other files (-C, implies -M).
+        // Needed so that lines shifted by an adjacent insertion/deletion are traced back to the
+        // commit that originally wrote them rather than the commit that moved them.
+        if options.detect_moves {
+            args.push("-M".to_string());
+        }
+        for _ in 0..options.detect_copies {
+            args.push("-C".to_string());
         }
 
         // Respect ignore options in use
@@ -1036,7 +1048,6 @@ fn overlay_ai_authorship(
     let mut simulated_authorship_logs: HashMap<String, AuthorshipLog> = HashMap::new();
     // Cache for foreign prompts to avoid repeated grepping
     let mut foreign_prompts_cache: HashMap<String, Option<PromptRecord>> = HashMap::new();
-
     for hunk in blame_hunks {
         // Check if we've already looked up this commit's authorship
         let authorship_log = if let Some(cached) = commit_authorship_cache.get(&hunk.commit_sha) {
@@ -1049,7 +1060,7 @@ fn overlay_ai_authorship(
         };
 
         // If we have AI authorship data, look up the author for lines in this hunk
-        if let Some(authorship_log) = authorship_log {
+        if let Some(ref authorship_log) = authorship_log {
             commits_with_notes.insert(hunk.commit_sha.clone());
             // Check each line in this hunk for AI authorship using compact schema
             // IMPORTANT: Use the original line numbers from the commit, not the current line numbers
@@ -1078,9 +1089,10 @@ fn overlay_ai_authorship(
                             line_authors
                                 .insert(current_line_num, prompt_record.agent_id.tool.clone());
                         }
+
                         prompt_records.insert(prompt_hash, prompt_record.clone());
                     } else {
-                        // Has authorship log but line not AI = human-authored
+                        // Has authorship log but line not AI
                         if options.return_human_authors_as_human {
                             line_authors.insert(
                                 current_line_num,
@@ -1091,7 +1103,7 @@ fn overlay_ai_authorship(
                         }
                     }
                 } else {
-                    // Has authorship log but no attribution found = human-authored
+                    // Has authorship log but no attribution found = unattested (unknown)
                     if options.return_human_authors_as_human {
                         line_authors
                             .insert(current_line_num, CheckpointKind::Human.to_str().to_string());

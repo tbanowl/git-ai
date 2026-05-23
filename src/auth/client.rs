@@ -1,6 +1,7 @@
 use crate::api::client::ApiContext;
 use crate::auth::types::{DeviceAuthResponse, OAuthError, StoredCredentials, TokenResponse};
 use crate::config;
+use crate::http;
 use std::thread;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ pub struct OAuthClient {
 /// In debug builds, HTTP is also allowed for local development.
 #[cfg(not(debug_assertions))]
 fn validate_https_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("https://") {
+    if !url.starts_with("http") {
         return Err(format!(
             "Security error: OAuth requires HTTPS. URL '{}' is not secure.",
             url
@@ -25,15 +26,17 @@ fn validate_https_url(url: &str) -> Result<(), String> {
 
 #[cfg(debug_assertions)]
 fn validate_https_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+    if !url.starts_with("http") {
         return Err(format!("Invalid URL scheme: {}", url));
     }
     Ok(())
 }
 
 impl OAuthClient {
+    /// Create a new OAuth client using the current config
+    /// Uses Config::fresh() to support runtime config updates (daemon mode)
     pub fn new() -> Self {
-        let config = config::Config::get();
+        let config = config::Config::fresh();
         let base_url = config.api_base_url().to_string();
 
         // Validate HTTPS in release mode (panics on invalid URL - fail-safe)
@@ -56,11 +59,9 @@ impl OAuthClient {
     fn exchange_token(&self, body: serde_json::Value) -> Result<StoredCredentials, String> {
         let url = format!("{}/worker/oauth/token", self.base_url);
 
-        let response = ApiContext::http_post(&url)
-            .with_header("Content-Type", "application/json")
-            .with_body(body.to_string())
-            .with_timeout(30)
-            .send()
+        let (_agent, request) = ApiContext::http_post(&url, Some(30));
+        let request = request.set("Content-Type", "application/json");
+        let response = http::send_with_body(request, &body.to_string())
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
         let response_body = response
@@ -96,11 +97,9 @@ impl OAuthClient {
     pub fn start_device_flow(&self) -> Result<DeviceAuthResponse, String> {
         let url = format!("{}/worker/oauth/device/code", self.base_url);
 
-        let response = ApiContext::http_post(&url)
-            .with_header("Content-Type", "application/json")
-            .with_body("{}")
-            .with_timeout(30)
-            .send()
+        let (_agent, request) = ApiContext::http_post(&url, Some(30));
+        let request = request.set("Content-Type", "application/json");
+        let response = http::send_with_body(request, "{}")
             .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
         if response.status_code != 200 {
@@ -142,11 +141,9 @@ impl OAuthClient {
                 "client_id": "git-ai-cli"
             });
 
-            let response = ApiContext::http_post(&url)
-                .with_header("Content-Type", "application/json")
-                .with_body(body.to_string())
-                .with_timeout(30)
-                .send()
+            let (_agent, request) = ApiContext::http_post(&url, Some(30));
+            let request = request.set("Content-Type", "application/json");
+            let response = http::send_with_body(request, &body.to_string())
                 .map_err(|e| format!("Failed to connect to server: {}", e))?;
 
             let response_body = response

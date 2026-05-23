@@ -205,6 +205,8 @@ pub fn handle_flush_logs(args: &[String]) {
             }
         }
 
+        crate::commands::flush_metrics_db::handle_flush_metrics_db(args);
+
         std::process::exit(0);
     }
 
@@ -290,6 +292,8 @@ pub fn handle_flush_logs(args: &[String]) {
         }
     }
 
+    crate::commands::flush_metrics_db::handle_flush_metrics_db(args);
+
     // Exit 0 - processing completed successfully even if no events were sent
     // (e.g., debug builds skip non-metrics events, which is expected behavior)
     std::process::exit(0);
@@ -373,11 +377,17 @@ impl SentryClient {
         // Parse DSN: https://PUBLIC_KEY@HOST/PROJECT_ID
         let url = url::Url::parse(dsn).ok()?;
         let public_key = url.username().to_string();
-        let host = url.host_str()?;
+        let host: &str = url.host_str()?;
+
         let project_id = url.path().trim_start_matches('/');
 
         let scheme = url.scheme();
-        let endpoint = format!("{}://{}/api/{}/store/", scheme, host, project_id);
+        let port = url.port();
+        let host_with_port = match port {
+            Some(p) if p != 80 && p != 443 => format!("{}:{}", host, p),
+            _ => host.to_string(),
+        };
+        let endpoint = format!("{}://{}/api/{}/store/", scheme, host_with_port, project_id);
 
         Some(SentryClient {
             endpoint,
@@ -394,11 +404,13 @@ impl SentryClient {
 
         let body = serde_json::to_string(&event)?;
 
-        let response = minreq::post(&self.endpoint)
-            .with_header("X-Sentry-Auth", auth_header)
-            .with_header("Content-Type", "application/json")
-            .with_body(body)
-            .send()?;
+        let agent = crate::http::build_agent(Some(30));
+        let request = agent
+            .post(&self.endpoint)
+            .set("X-Sentry-Auth", &auth_header)
+            .set("Content-Type", "application/json");
+        let response = crate::http::send_with_body(request, &body)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
         let status = response.status_code;
         let event_id = serde_json::from_str::<Value>(response.as_str()?)
@@ -427,10 +439,12 @@ impl PostHogClient {
     fn send_event(&self, event: Value) -> Result<(), Box<dyn std::error::Error>> {
         let body = serde_json::to_string(&event)?;
 
-        let response = minreq::post(&self.endpoint)
-            .with_header("Content-Type", "application/json")
-            .with_body(body)
-            .send()?;
+        let agent = crate::http::build_agent(Some(30));
+        let request = agent
+            .post(&self.endpoint)
+            .set("Content-Type", "application/json");
+        let response = crate::http::send_with_body(request, &body)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
         let status = response.status_code;
 

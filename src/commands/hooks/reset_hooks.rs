@@ -1,9 +1,10 @@
 use crate::{
     authorship::working_log::CheckpointKind,
     commands::hooks::commit_hooks,
+    commands::hooks::plumbing_rewrite_hooks::apply_wrapper_plumbing_rewrite_if_possible,
     git::{cli_parser::ParsedGitInvocation, repository::Repository, rewrite_log::ResetKind},
-    utils::debug_log,
 };
+use git2::{Oid, Repository as Git2Repository};
 
 pub fn pre_reset_hook(parsed_args: &ParsedGitInvocation, repository: &mut Repository) {
     // Get the human author for the checkpoint
@@ -15,8 +16,6 @@ pub fn pre_reset_hook(parsed_args: &ParsedGitInvocation, repository: &mut Reposi
         repository,
         &human_author,
         CheckpointKind::Human,
-        false,
-        false,
         true,
         None,
         true,
@@ -40,7 +39,7 @@ pub fn post_reset_hook(
     exit_status: std::process::ExitStatus,
 ) {
     if !exit_status.success() {
-        debug_log("Reset failed, skipping authorship handling");
+        tracing::debug!("Reset failed, skipping authorship handling");
         return;
     }
 
@@ -49,20 +48,17 @@ pub fn post_reset_hook(
 
     // Extract pathspecs
     let pathspecs = extract_pathspecs(parsed_args).unwrap_or_else(|e| {
-        debug_log(&format!("Failed to extract pathspecs: {}", e));
+        tracing::debug!("Failed to extract pathspecs: {}", e);
         Vec::new()
     });
 
-    debug_log(&format!(
-        "Reset: tree-ish='{}', pathspecs={:?}",
-        tree_ish, pathspecs
-    ));
+    tracing::debug!("Reset: tree-ish='{}', pathspecs={:?}", tree_ish, pathspecs);
 
     // Get old HEAD (before reset) from pre-command hook
     let old_head_sha = match &repository.pre_command_base_commit {
         Some(sha) => sha.clone(),
         None => {
-            debug_log("No pre-command head captured, skipping authorship handling");
+            tracing::debug!("No pre-command head captured, skipping authorship handling");
             return;
         }
     };
@@ -71,7 +67,7 @@ pub fn post_reset_hook(
     let new_head_sha = match repository.head().ok().and_then(|h| h.target().ok()) {
         Some(sha) => sha,
         None => {
-            debug_log("No HEAD after reset, skipping authorship handling");
+            tracing::debug!("No HEAD after reset, skipping authorship handling");
             return;
         }
     };
@@ -83,14 +79,14 @@ pub fn post_reset_hook(
         None => {
             // Fallback to resolving tree-ish post-reset (for backwards compatibility)
             // This will be incorrect for relative refs but better than failing
-            debug_log(&format!(
+            tracing::debug!(
                 "Warning: No pre-resolved target commit, attempting post-reset resolution of '{}'",
                 tree_ish
-            ));
+            );
             match resolve_tree_ish_to_commit(repository, &tree_ish) {
                 Ok(sha) => sha,
                 Err(e) => {
-                    debug_log(&format!("Failed to resolve tree-ish '{}': {}", tree_ish, e));
+                    tracing::debug!("Failed to resolve tree-ish '{}': {}", tree_ish, e);
                     return;
                 }
             }
@@ -167,15 +163,12 @@ fn handle_reset_hard(repository: &Repository, old_head_sha: &str, _target_commit
         .storage
         .delete_working_log_for_base_commit(old_head_sha);
 
-    debug_log(&format!(
-        "Reset --hard: deleted working log for {}",
-        old_head_sha
-    ));
+    tracing::debug!("Reset --hard: deleted working log for {}", old_head_sha);
 }
 
 /// Handle --soft, --mixed, --merge: preserve working directory and reconstruct working log
 fn handle_reset_preserve_working_dir(
-    repository: &Repository,
+    repository: &mut Repository,
     old_head_sha: &str,
     target_commit_sha: &str,
     new_head_sha: &str,
@@ -183,15 +176,16 @@ fn handle_reset_preserve_working_dir(
 ) {
     // Sanity check: new HEAD should equal target after reset
     if new_head_sha != target_commit_sha {
-        debug_log(&format!(
+        tracing::debug!(
             "Warning: new HEAD ({}) != target commit ({})",
-            new_head_sha, target_commit_sha
-        ));
+            new_head_sha,
+            target_commit_sha
+        );
     }
 
     // No-op if resetting to same commit
     if old_head_sha == target_commit_sha {
-        debug_log("Reset to same commit, no authorship changes needed");
+        tracing::debug!("Reset to same commit, no authorship changes needed");
         return;
     }
 
@@ -199,10 +193,22 @@ fn handle_reset_preserve_working_dir(
     let is_backward = is_ancestor(repository, target_commit_sha, old_head_sha);
 
     if !is_backward {
-        // Non-ancestor reset (e.g. branch restacked to a rebased version of the same commit).
-        // The working directory is preserved (--keep/--mixed/--soft), so the checkpoint data
-        // is still valid — just re-key it under the new HEAD.
-        debug_log("Reset to non-ancestor commit, migrating working log");
+        // Non-ancestor reset (e.g. Graphite restacking the currently checked-out branch).
+        // Try to treat this as a rewrite first so authorship notes follow the rewritten commits.
+        if apply_wrapper_plumbing_rewrite_if_possible(
+            repository,
+            old_head_sha,
+            target_commit_sha,
+            human_author,
+            true,
+        ) {
+            tracing::debug!("Reset to non-ancestor commit, handled as wrapper plumbing rewrite");
+            return;
+        }
+
+        // Fall back to re-keying the working log so uncommitted state is preserved even when
+        // we cannot derive a safe commit mapping.
+        tracing::debug!("Reset to non-ancestor commit, migrating working log");
         let _ = repository
             .storage
             .rename_working_log(old_head_sha, target_commit_sha);
@@ -216,18 +222,16 @@ fn handle_reset_preserve_working_dir(
         old_head_sha,
         human_author,
         None, // No user-specified pathspecs for regular resets
+        None,
     ) {
         Ok(_) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "✓ Successfully reconstructed working log after reset to {}",
                 target_commit_sha
-            ));
+            );
         }
         Err(e) => {
-            debug_log(&format!(
-                "Failed to reconstruct working log after reset: {}",
-                e
-            ));
+            tracing::debug!("Failed to reconstruct working log after reset: {}", e);
         }
     }
 }
@@ -242,17 +246,20 @@ fn handle_reset_pathspec_preserve_working_dir(
     human_author: &str,
     pathspecs: &[String],
 ) {
-    debug_log(&format!(
+    tracing::debug!(
         "Handling pathspec reset: old_head={}, target={}, pathspecs={:?}",
-        old_head_sha, target_commit_sha, pathspecs
-    ));
+        old_head_sha,
+        target_commit_sha,
+        pathspecs
+    );
 
     // For pathspec resets, HEAD doesn't move
     if old_head_sha != new_head_sha {
-        debug_log(&format!(
+        tracing::debug!(
             "Warning: pathspec reset but HEAD moved from {} to {}",
-            old_head_sha, new_head_sha
-        ));
+            old_head_sha,
+            new_head_sha
+        );
     }
 
     // For pathspec resets, HEAD doesn't move, so we're reconstructing for the current HEAD
@@ -262,12 +269,18 @@ fn handle_reset_pathspec_preserve_working_dir(
     let is_backward = is_ancestor(repository, target_commit_sha, old_head_sha);
 
     if !is_backward {
-        debug_log("Pathspec reset forward or to unrelated commit, no reconstruction needed");
+        tracing::debug!("Pathspec reset forward or to unrelated commit, no reconstruction needed");
         return;
     }
 
     // Backup existing working log for HEAD (non-pathspec files)
-    let working_log = repository.storage.working_log_for_base_commit(old_head_sha);
+    let working_log = match repository.storage.working_log_for_base_commit(old_head_sha) {
+        Ok(wl) => wl,
+        Err(e) => {
+            tracing::debug!("Failed to get working log for {}: {}", old_head_sha, e);
+            return;
+        }
+    };
     let existing_checkpoints = working_log.read_all_checkpoints().unwrap_or_default();
 
     // Filter existing checkpoints to keep only non-pathspec files
@@ -293,26 +306,34 @@ fn handle_reset_pathspec_preserve_working_dir(
         old_head_sha,
         human_author,
         Some(pathspecs), // Pass pathspecs to limit reconstruction
+        None,
     ) {
         Ok(_) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "✓ Reconstructed working log for pathspec reset: {:?}",
                 pathspecs
-            ));
+            );
         }
         Err(e) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Failed to reconstruct working log for pathspec reset: {}",
                 e
-            ));
+            );
             return;
         }
     }
 
     // Read the newly created working log for target_commit_sha
-    let target_working_log = repository
+    let target_working_log = match repository
         .storage
-        .working_log_for_base_commit(target_commit_sha);
+        .working_log_for_base_commit(target_commit_sha)
+    {
+        Ok(wl) => wl,
+        Err(e) => {
+            tracing::debug!("Failed to get working log for {}: {}", target_commit_sha, e);
+            return;
+        }
+    };
     let pathspec_checkpoints = target_working_log
         .read_all_checkpoints()
         .unwrap_or_default();
@@ -324,7 +345,13 @@ fn handle_reset_pathspec_preserve_working_dir(
     merged_checkpoints.extend(pathspec_checkpoints);
 
     // Save merged working log for HEAD (which hasn't moved)
-    let head_working_log = repository.storage.working_log_for_base_commit(new_head_sha);
+    let head_working_log = match repository.storage.working_log_for_base_commit(new_head_sha) {
+        Ok(wl) => wl,
+        Err(e) => {
+            tracing::debug!("Failed to get working log for {}: {}", new_head_sha, e);
+            return;
+        }
+    };
     let _ = head_working_log.reset_working_log();
     for checkpoint in merged_checkpoints {
         let _ = head_working_log.append_checkpoint(&checkpoint);
@@ -337,10 +364,11 @@ fn handle_reset_pathspec_preserve_working_dir(
             .delete_working_log_for_base_commit(target_commit_sha);
     }
 
-    debug_log(&format!(
+    tracing::debug!(
         "✓ Updated working log for pathspec reset: {} pathspec checkpoints, {} non-pathspec checkpoints preserved",
-        pathspec_count, non_pathspec_count
-    ));
+        pathspec_count,
+        non_pathspec_count
+    );
 }
 
 /// Resolve tree-ish to commit SHA
@@ -356,13 +384,23 @@ fn resolve_tree_ish_to_commit(
 
 /// Check if 'ancestor' is an ancestor of 'descendant'
 fn is_ancestor(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-
-    crate::git::repository::exec_git(&args).is_ok()
+    // Migrated from: git merge-base --is-ancestor <ancestor> <descendant>
+    // Backend: git2
+    let Ok(g2repo) = Git2Repository::open(repository.path()) else {
+        return false;
+    };
+    let Ok(ancestor_oid) = Oid::from_str(ancestor) else {
+        return false;
+    };
+    let Ok(descendant_oid) = Oid::from_str(descendant) else {
+        return false;
+    };
+    if ancestor_oid == descendant_oid {
+        return true;
+    }
+    g2repo
+        .graph_descendant_of(descendant_oid, ancestor_oid)
+        .unwrap_or(false)
 }
 
 /// Extract the tree-ish argument from git reset command

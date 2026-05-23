@@ -137,6 +137,104 @@ pub struct CAPromptStoreReadResponse {
     pub failure_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesListRequest {
+    pub repo_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_commit_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_change_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesListItem {
+    pub commit_sha: String,
+    pub content_hash: String,
+    pub change_seq: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesListData {
+    pub commit_shas: Vec<String>,
+    pub note_blob_oids: Option<Vec<String>>,
+    #[serde(default)]
+    pub items: Option<Vec<AuthorshipNotesListItem>>,
+    #[serde(default)]
+    pub next_change_seq: Option<i64>,
+    #[serde(default)]
+    pub has_more: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesListResponse {
+    pub ok: bool,
+    pub data: AuthorshipNotesListData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesBatchRequest {
+    pub repo_url: String,
+    pub commit_shas: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesBatchItem {
+    pub commit_sha: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_blob_oid: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub change_seq: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesBatchData {
+    pub notes: Vec<AuthorshipNotesBatchItem>,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipBatchResponse {
+    pub ok: bool,
+    pub data: AuthorshipNotesBatchData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesPushItem {
+    pub branch: String,
+    pub commit_sha: String,
+    pub note_blob_oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub content: String,
+    pub commit_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesPushRequest {
+    pub repo_url: String,
+    pub notes: Vec<AuthorshipNotesPushItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesPushData {
+    pub created: usize,
+    pub updated: usize,
+    #[serde(default)]
+    pub unchanged: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesPushResponse {
+    pub ok: bool,
+    pub data: AuthorshipNotesPushData,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +490,15 @@ mod tests {
     }
 
     #[test]
+    fn test_notes_list_response_has_commit_shas() {
+        let body = r#"{"ok":true,"data":{"commit_shas":["abc123","def456"]}}"#;
+        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.data.commit_shas[0], "abc123");
+        assert_eq!(parsed.data.commit_shas[1], "def456");
+    }
+
+    #[test]
     fn test_api_file_record_clone() {
         let record = ApiFileRecord {
             annotations: HashMap::new(),
@@ -418,5 +525,179 @@ mod tests {
 
         let deserialized: CasMessagesObject = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_notes_list_request_serializes_incremental_fields() {
+        let request = AuthorshipNotesListRequest {
+            repo_url: "https://github.com/example/repo".to_string(),
+            since_commit_time: None,
+            since_change_seq: Some(42),
+            limit: Some(1000),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["repo_url"], "https://github.com/example/repo");
+        assert_eq!(json["since_change_seq"], 42);
+        assert_eq!(json["limit"], 1000);
+        // since_commit_time is None and skip_serializing_if omits it from output
+        assert!(json.get("since_commit_time").is_none());
+    }
+
+    #[test]
+    fn test_notes_list_request_omits_none_incremental_fields() {
+        let request = AuthorshipNotesListRequest {
+            repo_url: "https://github.com/example/repo".to_string(),
+            since_commit_time: None,
+            since_change_seq: None,
+            limit: None,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["repo_url"], "https://github.com/example/repo");
+        assert!(json.get("since_commit_time").is_none());
+        assert!(json.get("since_change_seq").is_none());
+        assert!(json.get("limit").is_none());
+    }
+
+    #[test]
+    fn test_notes_list_response_deserializes_incremental_items() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "commit_shas": ["abc123"],
+                "items": [
+                    {
+                        "commit_sha": "abc123",
+                        "content_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "change_seq": 7,
+                        "updated_at": 1775973635847
+                    }
+                ],
+                "next_change_seq": 7,
+                "has_more": false
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
+        let items = parsed.data.items.expect("items should deserialize");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].commit_sha, "abc123");
+        assert_eq!(items[0].change_seq, 7);
+        assert_eq!(parsed.data.next_change_seq, Some(7));
+        assert_eq!(parsed.data.has_more, Some(false));
+    }
+
+    #[test]
+    fn test_notes_list_response_without_items_remains_compatible() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "commit_shas": ["abc123"],
+                "note_blob_oids": ["def456"]
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.data.commit_shas, vec!["abc123".to_string()]);
+        assert_eq!(parsed.data.note_blob_oids, Some(vec!["def456".to_string()]));
+        assert!(parsed.data.items.is_none());
+        assert!(parsed.data.next_change_seq.is_none());
+        assert!(parsed.data.has_more.is_none());
+    }
+
+    #[test]
+    fn test_notes_batch_item_deserializes_incremental_metadata() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "notes": [
+                    {
+                        "commit_sha": "abc123",
+                        "content": "{\"version\":\"authorship/3.0.0\"}",
+                        "note_blob_oid": "blob123",
+                        "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "change_seq": 9
+                    }
+                ],
+                "missing": []
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipBatchResponse = serde_json::from_str(body).unwrap();
+        let note = &parsed.data.notes[0];
+        assert_eq!(note.commit_sha, "abc123");
+        assert_eq!(
+            note.content_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(note.change_seq, Some(9));
+    }
+
+    #[test]
+    fn test_notes_batch_item_without_incremental_metadata_remains_compatible() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "notes": [
+                    {
+                        "commit_sha": "abc123",
+                        "content": "{}",
+                        "note_blob_oid": null
+                    }
+                ],
+                "missing": []
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipBatchResponse = serde_json::from_str(body).unwrap();
+        let note = &parsed.data.notes[0];
+        assert!(note.content_hash.is_none());
+        assert!(note.change_seq.is_none());
+    }
+
+    #[test]
+    fn test_notes_push_response_deserializes_optional_unchanged() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "created": 1,
+                "updated": 2,
+                "unchanged": 3
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipNotesPushResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.data.created, 1);
+        assert_eq!(parsed.data.updated, 2);
+        assert_eq!(parsed.data.unchanged, Some(3));
+    }
+
+    #[test]
+    fn test_notes_push_response_without_unchanged_remains_compatible() {
+        let body = r#"
+        {
+            "ok": true,
+            "data": {
+                "created": 1,
+                "updated": 2
+            }
+        }
+        "#;
+
+        let parsed: AuthorshipNotesPushResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.data.created, 1);
+        assert_eq!(parsed.data.updated, 2);
+        assert!(parsed.data.unchanged.is_none());
     }
 }

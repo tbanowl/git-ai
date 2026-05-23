@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::commands::git_hook_handlers::{
     ENV_SKIP_MANAGED_HOOKS, has_repo_hook_state, resolve_previous_non_managed_hooks_path,
@@ -15,18 +13,23 @@ use crate::commands::hooks::rebase_hooks;
 use crate::commands::hooks::reset_hooks;
 use crate::commands::hooks::stash_hooks;
 use crate::commands::hooks::switch_hooks;
+use crate::commands::hooks::update_ref_hooks;
 use crate::config;
 use crate::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
 use crate::git::find_repository;
 use crate::git::repository::{Repository, disable_internal_git_hooks};
 use crate::observability;
+use std::collections::HashSet;
 
 use crate::observability::wrapper_performance_targets::log_performance_target_if_violated;
 #[cfg(windows)]
 use crate::utils::CREATE_NO_WINDOW;
-use crate::utils::debug_log;
+#[cfg(windows)]
+use crate::utils::is_debug_enabled;
 #[cfg(windows)]
 use crate::utils::is_interactive_terminal;
+#[cfg(windows)]
+use crate::utils::kill_process_tree_windows;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -36,6 +39,8 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(windows)]
+use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -44,6 +49,18 @@ static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 // Windows NTSTATUS for Ctrl+C interruption (STATUS_CONTROL_C_EXIT, 0xC000013A) from Windows API docs.
 #[cfg(windows)]
 const NTSTATUS_CONTROL_C_EXIT: u32 = 0xC000013A;
+
+#[cfg(windows)]
+const DEFAULT_GIT_PROXY_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(windows)]
+const DEFAULT_GIT_PROXY_RETRY_COUNT: usize = 1;
+
+#[cfg(windows)]
+const GIT_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[cfg(windows)]
+const GIT_PROXY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Error type for hook panics
 #[derive(Debug)]
@@ -106,22 +123,140 @@ pub fn handle_git(args: &[String]) {
     // and delegate directly to the real git so existing completion scripts work.
     if in_shell_completion_context() {
         let orig_args: Vec<String> = std::env::args().skip(1).collect();
-        proxy_to_git(&orig_args, true, None);
+        proxy_to_git(&orig_args, true, None, None);
         return;
+    }
+
+    crate::observability::tracing_file::init_command_tracing("git-ai");
+
+    // Async mode: wrapper should behave as a pure passthrough to git,
+    // but capture and send authoritative pre/post state to the daemon.
+    if config::Config::get().feature_flags().async_mode {
+        let parsed = parse_git_cli_args(args);
+
+        // Read-only invocations don't need wrapper state (the daemon fast-paths
+        // their trace events and never processes them through the normalizer).
+        // Skip the invocation_id so we can also suppress trace2 for them,
+        // avoiding unnecessary daemon work and wrapper_states memory leaks.
+        //
+        // Use is_definitely_read_only_invocation (not is_definitely_read_only_command)
+        // so that subcommand-gated read-only calls like `git stash list` and
+        // `git worktree list` are also suppressed — these account for thousands
+        // of Zed IDE invocations per session.
+        let is_read_only = {
+            let subcommand = parsed.command_args.first().map(String::as_str);
+            parsed.command.as_deref().is_some_and(|cmd| {
+                crate::git::command_classification::is_definitely_read_only_invocation(
+                    cmd, subcommand,
+                )
+            })
+        };
+
+        if is_read_only {
+            let orig_args: Vec<String> = std::env::args().skip(1).collect();
+            proxy_to_git(&orig_args, true, None, None);
+            return;
+        }
+
+        // Repo-creating commands (clone, init) have no meaningful pre/post
+        // repo state — the target repo doesn't exist yet. The wrapper would
+        // either capture nothing (clone from outside a repo) or the wrong
+        // repo (clone from inside a different repo). Skip the invocation_id
+        // so the daemon doesn't wait for wrapper state that never arrives or
+        // is misleading; trace2 events still flow normally (trace2 suppression
+        // requires *both* no invocation_id and a read-only command).
+        let is_repo_creating = parsed
+            .command
+            .as_deref()
+            .is_some_and(|cmd| matches!(cmd, "clone" | "init"));
+
+        if is_repo_creating {
+            let orig_args: Vec<String> = std::env::args().skip(1).collect();
+            proxy_to_git(&orig_args, true, None, None);
+            return;
+        }
+
+        // Initialize the daemon telemetry handle so we can send wrapper state
+        if let crate::daemon::telemetry_handle::DaemonTelemetryInitResult::Failed(e) =
+            crate::daemon::telemetry_handle::init_daemon_telemetry_handle()
+        {
+            tracing::debug!("wrapper: daemon telemetry init failed: {}", e);
+        }
+
+        let repository = find_repository(&parsed.global_args).ok();
+        let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
+
+        let pre_state = worktree
+            .as_deref()
+            .and_then(crate::git::repo_state::read_head_state_for_worktree);
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+
+        // Send pre-state BEFORE running git so it's available when the daemon
+        // processes the atexit trace event and starts the wrapper state timeout.
+        send_wrapper_pre_state_to_daemon(&invocation_id, worktree.as_deref(), &pre_state);
+
+        let exit_status = proxy_to_git(args, false, None, Some(&invocation_id));
+
+        let post_state = worktree
+            .as_deref()
+            .and_then(crate::git::repo_state::read_head_state_for_worktree);
+
+        send_wrapper_post_state_to_daemon(&invocation_id, worktree.as_deref(), &post_state);
+
+        // After a successful commit, wait briefly for the daemon to produce an
+        // authorship note so we can show stats inline (same UX as plain wrapper mode).
+        if exit_status.success()
+            && parsed.command.as_deref() == Some("commit")
+            && let Some(repo) = repository.as_ref()
+        {
+            maybe_show_async_post_commit_stats(&parsed, repo);
+        }
+
+        exit_with_status(exit_status);
     }
 
     let mut parsed_args = parse_git_cli_args(args);
 
+    let find_repository_start = Instant::now();
     let mut repository_option = find_repository(&parsed_args.global_args).ok();
+    let find_repository_duration = find_repository_start.elapsed();
+    tracing::debug!(
+        "[handle-git] find_repository {}ms",
+        find_repository_duration.as_millis()
+    );
 
+    let check_hooks_start = Instant::now();
     let has_repo = repository_option.is_some();
 
-    let config = config::Config::get();
+    // Resolve aliases before is_command_skip_hooks() so "ci" → "commit" is recognized.
+    if let Some(repository) = repository_option.as_mut()
+        && let Some(resolved) = resolve_alias_invocation(&parsed_args, repository)
+    {
+        parsed_args = resolved;
+    }
 
+    if is_command_skip_hooks(&parsed_args) {
+        let orig_args: Vec<String> = std::env::args().skip(1).collect();
+        proxy_to_git(&orig_args, true, None, None);
+        return;
+    }
+
+    let get_config_start = Instant::now();
+    let config = config::Config::get();
+    tracing::debug!(
+        "[handle-git] get_config_start {}ms",
+        get_config_start.elapsed().as_millis()
+    );
+
+    let is_allowed_repository_start = Instant::now();
     let skip_hooks = !config.is_allowed_repository(&repository_option);
+    tracing::debug!(
+        "[handle-git] is_allowed_repository_start {}ms",
+        is_allowed_repository_start.elapsed().as_millis()
+    );
 
     if skip_hooks {
-        debug_log(
+        tracing::debug!(
             "Skipping git-ai hooks because repository is excluded or not in allow_repositories list",
         );
     }
@@ -130,13 +265,18 @@ pub fn handle_git(args: &[String]) {
     // Note: clone aliases (e.g., alias.cl = clone) won't trigger clone hooks because
     // alias resolution requires a Repository object, which doesn't exist yet for clone.
     if parsed_args.command.as_deref() == Some("clone") && !parsed_args.is_help && !skip_hooks {
-        let exit_status = proxy_to_git(&parsed_args.to_invocation_vec(), false, None);
+        let exit_status = proxy_to_git(&parsed_args.to_invocation_vec(), false, None, None);
         if exit_status_was_interrupted(&exit_status) {
             exit_with_status(exit_status);
         }
         clone_hooks::post_clone_hook(&parsed_args, exit_status);
         exit_with_status(exit_status);
     }
+    let check_hooks_duration = check_hooks_start.elapsed();
+    tracing::debug!(
+        "[handle-git] check_hooks_duration {}ms",
+        check_hooks_duration.as_millis()
+    );
 
     // run with hooks
     let exit_status = if !parsed_args.is_help && has_repo && !skip_hooks {
@@ -152,10 +292,6 @@ pub fn handle_git(args: &[String]) {
 
         let repository = repository_option.as_mut().unwrap();
 
-        if let Some(resolved) = resolve_alias_invocation(&parsed_args, repository) {
-            parsed_args = resolved;
-        }
-
         let pre_command_start = Instant::now();
         run_pre_command_hooks(&mut command_hooks_context, &mut parsed_args, repository);
         let pre_command_duration = pre_command_start.elapsed();
@@ -167,6 +303,7 @@ pub fn handle_git(args: &[String]) {
             &parsed_args.to_invocation_vec(),
             false,
             child_hooks_path_override.as_deref(),
+            None,
         );
         if exit_status_was_interrupted(&exit_status) {
             exit_with_status(exit_status);
@@ -198,9 +335,28 @@ pub fn handle_git(args: &[String]) {
             &parsed_args.to_invocation_vec(),
             false,
             child_hooks_path_override.as_deref(),
+            None,
         )
     };
     exit_with_status(exit_status);
+}
+
+fn is_command_skip_hooks(parsed_args: &ParsedGitInvocation) -> bool {
+    !matches!(
+        parsed_args.command.as_deref(),
+        Some("commit")
+            | Some("pull")
+            | Some("push")
+            | Some("reset")
+            | Some("merge")
+            | Some("rebase")
+            | Some("cherry-pick")
+            | Some("stash")
+            | Some("checkout")
+            | Some("switch")
+            | Some("update-ref")
+            | Some("clone")
+    )
 }
 
 /// Handle alias invocations
@@ -359,10 +515,6 @@ fn run_pre_command_hooks(
                 command_hooks_context.push_authorship_handle =
                     push_hooks::push_pre_command_hook(parsed_args, repository);
             }
-            Some("fetch") => {
-                command_hooks_context.fetch_authorship_handle =
-                    fetch_hooks::fetch_pull_pre_command_hook(parsed_args, repository);
-            }
             Some("pull") => {
                 fetch_hooks::pull_pre_command_hook(parsed_args, repository, command_hooks_context);
             }
@@ -378,6 +530,13 @@ fn run_pre_command_hooks(
             }
             Some("switch") => {
                 switch_hooks::pre_switch_hook(parsed_args, repository, command_hooks_context);
+            }
+            Some("update-ref") => {
+                update_ref_hooks::pre_update_ref_hook(
+                    parsed_args,
+                    repository,
+                    command_hooks_context,
+                );
             }
             _ => {}
         }
@@ -399,7 +558,7 @@ fn run_pre_command_hooks(
             "args": parsed_args.to_invocation_vec(),
         });
 
-        debug_log(&error_message);
+        tracing::debug!("{}", error_message);
         observability::log_error(&HookPanicError(error_message.clone()), Some(context));
     }
 }
@@ -418,12 +577,6 @@ fn run_post_command_hooks(
                 parsed_args,
                 exit_status,
                 repository,
-                command_hooks_context,
-            ),
-            Some("fetch") => fetch_hooks::fetch_pull_post_command_hook(
-                repository,
-                parsed_args,
-                exit_status,
                 command_hooks_context,
             ),
             Some("pull") => fetch_hooks::pull_post_command_hook(
@@ -480,6 +633,14 @@ fn run_post_command_hooks(
                     command_hooks_context,
                 );
             }
+            Some("update-ref") => {
+                update_ref_hooks::post_update_ref_hook(
+                    parsed_args,
+                    repository,
+                    exit_status,
+                    command_hooks_context,
+                );
+            }
             _ => {}
         }
     }));
@@ -502,7 +663,7 @@ fn run_post_command_hooks(
             "args": parsed_args.to_invocation_vec(),
         });
 
-        debug_log(&error_message);
+        tracing::debug!("{}", error_message);
         observability::log_error(&HookPanicError(error_message.clone()), Some(context));
     }
 }
@@ -532,6 +693,7 @@ fn command_uses_managed_hooks(command: Option<&str>) -> bool {
                 | "pull"
                 | "fetch"
                 | "push"
+                | "update-ref"
         )
     )
 }
@@ -562,13 +724,193 @@ fn resolve_child_git_hooks_path_override(
     Some(hooks_path)
 }
 
+/// In async (wrapper-to-daemon) mode, after a successful `git commit`, poll for
+/// the daemon-produced authorship note and display stats inline when available.
+/// Mirrors the same skip/display rules as plain wrapper mode in post_commit.rs.
+fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repository) {
+    use crate::authorship::ignore::effective_ignore_patterns;
+    use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
+    use crate::git::cli_parser::is_dry_run;
+    use crate::git::refs::show_authorship_note;
+    use std::io::IsTerminal;
+
+    // Respect the same suppression flags as the synchronous wrapper path.
+    if is_dry_run(&parsed.command_args) {
+        return;
+    }
+    let suppress_output = parsed.has_command_flag("--porcelain")
+        || parsed.has_command_flag("--quiet")
+        || parsed.has_command_flag("-q")
+        || parsed.has_command_flag("--no-status");
+    if suppress_output || config::Config::get().is_quiet() {
+        return;
+    }
+
+    let is_interactive =
+        std::io::stdout().is_terminal() || std::env::var_os("GIT_AI_TEST_FORCE_TTY").is_some();
+    if !is_interactive {
+        return;
+    }
+
+    // Determine the new commit SHA.
+    let commit_sha = match repo.head().ok().and_then(|h| h.target().ok()) {
+        Some(sha) => sha,
+        None => return,
+    };
+
+    if std::env::var("GIT_AI_WAIT_COMMIT_STATS").unwrap_or_default() != "1" {
+        eprintln!(
+            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            commit_sha
+        );
+        return;
+    }
+
+    // Use a longer timeout under test to avoid flakiness on saturated CI machines.
+    // GIT_AI_POST_COMMIT_TIMEOUT_MS allows tests to override the timeout.
+    let timeout = if let Some(ms) = std::env::var("GIT_AI_POST_COMMIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::time::Duration::from_millis(ms)
+    } else if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some() {
+        std::time::Duration::from_secs(20)
+    } else {
+        std::time::Duration::from_millis(500)
+    };
+
+    // Poll for the authorship note the daemon should be producing.
+    let poll_interval = std::time::Duration::from_millis(25);
+    let start = std::time::Instant::now();
+    let note_found = loop {
+        if show_authorship_note(repo, &commit_sha).is_some() {
+            break true;
+        }
+        if start.elapsed() >= timeout {
+            break false;
+        }
+        std::thread::sleep(poll_interval);
+    };
+
+    if !note_found {
+        eprintln!(
+            "[git-ai] still processing commit {}... run `git ai stats` to see stats.",
+            &commit_sha[..std::cmp::min(8, commit_sha.len())]
+        );
+        return;
+    }
+
+    // Check if this is a merge commit — skip expensive stats just like the sync path.
+    let is_merge = repo
+        .find_commit(commit_sha.clone())
+        .map(|c| c.parent_count().unwrap_or(0) > 1)
+        .unwrap_or(false);
+    if is_merge {
+        eprintln!(
+            "[git-ai] Skipped git-ai stats for merge commit {}.",
+            commit_sha
+        );
+        return;
+    }
+
+    // Run the same cost estimation the sync path uses.
+    let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
+    if let Ok(estimate) = crate::authorship::post_commit::estimate_stats_cost_for_head(
+        repo,
+        &commit_sha,
+        &ignore_patterns,
+    ) && estimate.should_skip()
+    {
+        eprintln!(
+            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            commit_sha
+        );
+        return;
+    }
+
+    // Compute and display the full stats.
+    if let Ok(stats) = stats_for_commit_stats(repo, &commit_sha, &ignore_patterns) {
+        write_stats_to_terminal(&stats, true);
+    }
+}
+
+fn head_state_to_repo_context(
+    s: crate::git::repo_state::HeadState,
+) -> crate::daemon::domain::RepoContext {
+    crate::daemon::domain::RepoContext {
+        head: s.head,
+        branch: s.branch,
+        detached: s.detached,
+    }
+}
+
+fn send_wrapper_pre_state_to_daemon(
+    invocation_id: &str,
+    worktree: Option<&std::path::Path>,
+    pre_state: &Option<crate::git::repo_state::HeadState>,
+) {
+    let Some(wt) = worktree else { return };
+    let Some(pre) = pre_state.clone() else { return };
+    let wt_str = wt.to_string_lossy().to_string();
+    if let Err(e) = crate::daemon::telemetry_handle::send_wrapper_pre_state(
+        invocation_id,
+        &wt_str,
+        head_state_to_repo_context(pre),
+    ) {
+        tracing::debug!(
+            "wrapper: failed to send pre-state for {}: {}",
+            invocation_id,
+            e
+        );
+    }
+}
+
+fn send_wrapper_post_state_to_daemon(
+    invocation_id: &str,
+    worktree: Option<&std::path::Path>,
+    post_state: &Option<crate::git::repo_state::HeadState>,
+) {
+    let Some(wt) = worktree else { return };
+    let Some(post) = post_state.clone() else {
+        return;
+    };
+    let wt_str = wt.to_string_lossy().to_string();
+    if let Err(e) = crate::daemon::telemetry_handle::send_wrapper_post_state(
+        invocation_id,
+        &wt_str,
+        head_state_to_repo_context(post),
+    ) {
+        tracing::debug!(
+            "wrapper: failed to send post-state for {}: {}",
+            invocation_id,
+            e
+        );
+    }
+}
+
 fn proxy_to_git(
     args: &[String],
     exit_on_completion: bool,
     child_hooks_path_override: Option<&str>,
+    wrapper_invocation_id: Option<&str>,
 ) -> std::process::ExitStatus {
-    // debug_log(&format!("proxying to git with args: {:?}", args));
-    // debug_log(&format!("prepended global args: {:?}", prepend_global(args)));
+    // Suppress trace2 for read-only invocations to avoid hitting the daemon
+    // with events that can never produce meaningful state changes.  In async
+    // mode, read-only invocations are handled before this point (no
+    // invocation_id set), so wrapper_invocation_id is only Some for mutating
+    // commands that need trace2 events for the daemon to match wrapper state.
+    //
+    // Use is_definitely_read_only_invocation so that subcommand-gated
+    // read-only calls like `git stash list` and `git worktree list` are also
+    // suppressed (matches the updated wrapper check in handle_git above).
+    let suppress_trace2 = wrapper_invocation_id.is_none() && {
+        let parsed = parse_git_cli_args(args);
+        let subcommand = parsed.command_args.first().map(String::as_str);
+        parsed.command.as_deref().is_some_and(|cmd| {
+            crate::git::command_classification::is_definitely_read_only_invocation(cmd, subcommand)
+        })
+    };
+
     // Use spawn for interactive commands
     let child = {
         #[cfg(unix)]
@@ -587,6 +929,19 @@ fn proxy_to_git(
             }
             cmd.args(args);
             cmd.env(ENV_SKIP_MANAGED_HOOKS, "1");
+            // Strip git-ai control vars so they don't leak into git subprocesses
+            // (e.g. alias scripts).  git-ai already consumed them; real git
+            // should not see them.  Notably, GIT_AI_ASYNC_MODE is read by the
+            // wrapper's FeatureFlags but must not appear inside alias scripts
+            // where tests like t0001-init.sh check for "no extra GIT_*" vars.
+            cmd.env_remove("GIT_AI_ASYNC_MODE");
+            if suppress_trace2 {
+                cmd.env("GIT_TRACE2_EVENT", "0");
+            }
+            if let Some(id) = wrapper_invocation_id {
+                cmd.env("GIT_AI_WRAPPER_INVOCATION_ID", id);
+                cmd.env("GIT_TRACE2_ENV_VARS", "GIT_AI_WRAPPER_INVOCATION_ID");
+            }
             unsafe {
                 let setpgid_flag = should_setpgid;
                 cmd.pre_exec(move || {
@@ -613,12 +968,29 @@ fn proxy_to_git(
             }
             cmd.args(args);
             cmd.env(ENV_SKIP_MANAGED_HOOKS, "1");
+            cmd.env_remove("GIT_AI_ASYNC_MODE");
+            if suppress_trace2 {
+                cmd.env("GIT_TRACE2_EVENT", "0");
+            }
+            if let Some(id) = wrapper_invocation_id {
+                cmd.env("GIT_AI_WRAPPER_INVOCATION_ID", id);
+                cmd.env("GIT_TRACE2_ENV_VARS", "GIT_AI_WRAPPER_INVOCATION_ID");
+            }
 
             #[cfg(windows)]
             {
                 if !is_interactive_terminal() {
                     cmd.creation_flags(CREATE_NO_WINDOW);
                 }
+            }
+            if exit_on_completion {
+                let status = cmd
+                    .stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .status()
+                    .unwrap();
+                exit_with_status(status);
             }
 
             cmd.spawn()
@@ -673,18 +1045,39 @@ fn proxy_to_git(
 
     #[cfg(not(unix))]
     match child {
-        Ok(mut child) => {
-            let status = child.wait();
-            match status {
-                Ok(status) => {
-                    if exit_on_completion {
-                        exit_with_status(status);
-                    }
-                    status
+        Ok(child) => {
+            #[cfg(windows)]
+            {
+                let exempt = is_command_exempt_from_retry(args);
+                let status = wait_for_git_with_retry_windows(
+                    child,
+                    args,
+                    child_hooks_path_override,
+                    wrapper_invocation_id,
+                    suppress_trace2,
+                    exempt,
+                );
+                if exit_on_completion {
+                    exit_with_status(status);
                 }
-                Err(e) => {
-                    eprintln!("Failed to wait for git process: {}", e);
-                    std::process::exit(1);
+                status
+            }
+
+            #[cfg(not(windows))]
+            {
+                let mut child = child;
+                let status = child.wait();
+                match status {
+                    Ok(status) => {
+                        if exit_on_completion {
+                            exit_with_status(status);
+                        }
+                        status
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to wait for git process: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -692,6 +1085,224 @@ fn proxy_to_git(
             eprintln!("Failed to execute git command: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_git_with_retry_windows(
+    mut child: std::process::Child,
+    args: &[String],
+    child_hooks_path_override: Option<&str>,
+    wrapper_invocation_id: Option<&str>,
+    suppress_trace2: bool,
+    exempt_from_retry: bool,
+) -> std::process::ExitStatus {
+    if exempt_from_retry {
+        return match child.wait() {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("Failed to wait for git process: {}", e);
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let max_retries = git_proxy_retry_count();
+    let timeout = git_proxy_timeout();
+    let mut attempt = 0usize;
+
+    loop {
+        match wait_for_git_process_windows(&mut child, timeout) {
+            Ok(status) => return status,
+            Err(WaitForGitProcessError::Wait(err)) => {
+                eprintln!("Failed to wait for git process: {}", err);
+                std::process::exit(1);
+            }
+            Err(WaitForGitProcessError::TimedOut) => {
+                if attempt >= max_retries {
+                    eprintln!(
+                        "git command timed out after {}ms on Windows and exceeded {} retry attempt(s), git args: {:?}",
+                        timeout.as_millis(),
+                        max_retries,
+                        args
+                    );
+                    std::process::exit(1);
+                }
+
+                let next_attempt = attempt + 2;
+                tracing::debug!(
+                    "git command timed out after {}ms on Windows; retrying attempt {}/{}, git args: {:?}",
+                    timeout.as_millis(),
+                    next_attempt,
+                    max_retries + 1,
+                    args
+                );
+                std::thread::sleep(GIT_PROXY_RETRY_BACKOFF);
+                child = spawn_git_child_windows(
+                    args,
+                    child_hooks_path_override,
+                    wrapper_invocation_id,
+                    suppress_trace2,
+                    true,
+                );
+                attempt += 1;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+enum WaitForGitProcessError {
+    TimedOut,
+    Wait(std::io::Error),
+}
+
+#[cfg(windows)]
+fn wait_for_git_process_windows(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, WaitForGitProcessError> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(err) => return Err(WaitForGitProcessError::Wait(err)),
+        }
+
+        if Instant::now() >= deadline {
+            let pid = child.id();
+            tracing::debug!(
+                "git process {} timed out after {}ms on Windows; terminating process tree",
+                pid,
+                timeout.as_millis()
+            );
+            if let Err(err) = kill_process_tree_windows(pid) {
+                eprintln!("Failed to terminate timed out git process {}: {}", pid, err);
+                std::process::exit(1);
+            }
+
+            match child.wait() {
+                Ok(status) => {
+                    tracing::debug!(
+                        "git process {} terminated after timeout with status {}",
+                        pid,
+                        status
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to wait for timed out git process {} after termination: {}",
+                        pid, err
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            return Err(WaitForGitProcessError::TimedOut);
+        }
+
+        std::thread::sleep(GIT_PROXY_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn spawn_git_child_windows(
+    args: &[String],
+    child_hooks_path_override: Option<&str>,
+    wrapper_invocation_id: Option<&str>,
+    suppress_trace2: bool,
+    is_retry: bool,
+) -> std::process::Child {
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    if let Some(hooks_path) = child_hooks_path_override
+        && !has_explicit_hooks_path_override(args)
+    {
+        cmd.arg("-c").arg(format!("core.hooksPath={}", hooks_path));
+    }
+    cmd.args(args);
+    cmd.env(ENV_SKIP_MANAGED_HOOKS, "1");
+    cmd.env_remove("GIT_AI_ASYNC_MODE");
+    if suppress_trace2 {
+        cmd.env("GIT_TRACE2_EVENT", "0");
+    }
+    if let Some(id) = wrapper_invocation_id {
+        cmd.env("GIT_AI_WRAPPER_INVOCATION_ID", id);
+        cmd.env("GIT_TRACE2_ENV_VARS", "GIT_AI_WRAPPER_INVOCATION_ID");
+    }
+
+    if !is_interactive_terminal() {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if is_debug_enabled() {
+        eprintln!(
+            "[proxy_to_git] git executable = {:?},  git args = {:?}",
+            config::Config::get().git_cmd(),
+            args
+        );
+    }
+
+    match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            if is_retry {
+                eprintln!("Failed to retry git command after timeout: {}", err);
+            } else {
+                eprintln!("Failed to execute git command: {}", err);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn git_proxy_timeout() -> Duration {
+    parse_git_proxy_timeout_ms(std::env::var("GIT_AI_GIT_PROXY_TIMEOUT_MS").ok().as_deref())
+}
+
+#[cfg(windows)]
+fn git_proxy_retry_count() -> usize {
+    parse_git_proxy_retry_count(
+        std::env::var("GIT_AI_GIT_PROXY_RETRY_COUNT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(windows)]
+fn parse_git_proxy_timeout_ms(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_GIT_PROXY_TIMEOUT)
+}
+
+#[cfg(windows)]
+fn parse_git_proxy_retry_count(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GIT_PROXY_RETRY_COUNT)
+}
+
+/// Exempt interactive, long-running, or retry-dangerous commands from the
+/// Windows proxy timeout+retry loop. Uses parse_git_cli_args to correctly
+/// extract the command regardless of global flag positioning.
+#[cfg(windows)]
+fn is_command_exempt_from_retry(args: &[String]) -> bool {
+    let parsed = parse_git_cli_args(args);
+    let Some(command) = parsed.command.as_deref() else {
+        return false;
+    };
+
+    match command {
+        "log" | "pull" | "commit" | "fetch" | "push" | "rebase" | "merge" | "stash" => true,
+        "config" => parsed
+            .command_args
+            .iter()
+            .any(|a| a == "--list" || a == "-l"),
+        _ => false,
     }
 }
 
@@ -913,5 +1524,88 @@ mod tests {
             .status()
             .expect("failed to run success test");
         assert!(!super::exit_status_was_interrupted(&status));
+    }
+
+    #[cfg(windows)]
+    mod windows_retry_exempt {
+        use super::*;
+
+        #[test]
+        fn exempt_commands_are_detected() {
+            for cmd in &[
+                "log", "pull", "commit", "fetch", "push", "rebase", "merge", "stash",
+            ] {
+                let args: Vec<String> = vec![cmd.to_string()];
+                assert!(
+                    is_command_exempt_from_retry(&args),
+                    "{cmd} should be exempt from retry"
+                );
+            }
+        }
+
+        #[test]
+        fn non_exempt_commands_are_not_detected() {
+            for cmd in &["status", "diff", "rev-parse", "blame", "init", "add"] {
+                let args: Vec<String> = vec![cmd.to_string()];
+                assert!(
+                    !is_command_exempt_from_retry(&args),
+                    "{cmd} should NOT be exempt from retry"
+                );
+            }
+        }
+
+        #[test]
+        fn config_list_is_exempt() {
+            let args: Vec<String> = vec!["config".to_string(), "--list".to_string()];
+            assert!(is_command_exempt_from_retry(&args));
+
+            let args: Vec<String> = vec!["config".to_string(), "-l".to_string()];
+            assert!(is_command_exempt_from_retry(&args));
+        }
+
+        #[test]
+        fn config_without_list_is_not_exempt() {
+            let args: Vec<String> = vec!["config".to_string(), "user.name".to_string()];
+            assert!(!is_command_exempt_from_retry(&args));
+
+            let args: Vec<String> = vec!["config".to_string()];
+            assert!(!is_command_exempt_from_retry(&args));
+        }
+
+        #[test]
+        fn global_flags_before_command_are_handled() {
+            let args: Vec<String> = vec![
+                "-C".to_string(),
+                "/some/path".to_string(),
+                "commit".to_string(),
+            ];
+            assert!(is_command_exempt_from_retry(&args));
+
+            let args: Vec<String> = vec![
+                "-c".to_string(),
+                "core.bare=false".to_string(),
+                "push".to_string(),
+            ];
+            assert!(is_command_exempt_from_retry(&args));
+        }
+
+        #[test]
+        fn empty_and_unknown_args_return_false() {
+            let args: Vec<String> = vec![];
+            assert!(!is_command_exempt_from_retry(&args));
+
+            let args: Vec<String> = vec!["--help".to_string()];
+            assert!(!is_command_exempt_from_retry(&args));
+        }
+
+        #[test]
+        fn config_list_with_other_flags_is_exempt() {
+            let args: Vec<String> = vec![
+                "config".to_string(),
+                "--list".to_string(),
+                "--show-origin".to_string(),
+            ];
+            assert!(is_command_exempt_from_retry(&args));
+        }
     }
 }

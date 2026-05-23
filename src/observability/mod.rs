@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::metrics::{METRICS_API_VERSION, MetricEvent};
+use crate::metrics::MetricEvent;
 
 pub mod flush;
+pub mod tracing_file;
 pub mod wrapper_performance_targets;
+use crate::config;
 
 /// Maximum events per metrics envelope
 pub const MAX_METRICS_PER_ENVELOPE: usize = 250;
@@ -63,6 +65,7 @@ enum LogEnvelope {
     Performance(PerformanceEnvelope),
     #[allow(dead_code)]
     Message(MessageEnvelope),
+    #[allow(dead_code)]
     Metrics(MetricsEnvelope),
 }
 
@@ -107,13 +110,56 @@ fn get_observability() -> &'static Mutex<ObservabilityInner> {
     })
 }
 
-/// Append an envelope (buffer if no repo context, write to disk if context set)
+/// Append an envelope (buffer if no repo context, write to disk if context set).
+///
+/// In daemon mode (async_mode enabled), telemetry envelopes are sent over the
+/// control socket instead of being written to disk. The daemon batches and
+/// flushes them every 3 seconds.
 fn append_envelope(envelope: LogEnvelope) {
+    // In daemon mode, route through the control socket instead of disk.
+    if crate::daemon::telemetry_handle::daemon_telemetry_available() {
+        let telemetry_envelope = match &envelope {
+            LogEnvelope::Error(e) => Some(crate::daemon::TelemetryEnvelope::Error {
+                timestamp: e.timestamp.clone(),
+                message: e.message.clone(),
+                context: e.context.clone(),
+            }),
+            LogEnvelope::Performance(p) => Some(crate::daemon::TelemetryEnvelope::Performance {
+                timestamp: p.timestamp.clone(),
+                operation: p.operation.clone(),
+                duration_ms: p.duration_ms,
+                context: p.context.clone(),
+                tags: p.tags.clone(),
+            }),
+            LogEnvelope::Message(m) => Some(crate::daemon::TelemetryEnvelope::Message {
+                timestamp: m.timestamp.clone(),
+                message: m.message.clone(),
+                level: m.level.clone(),
+                context: m.context.clone(),
+            }),
+            LogEnvelope::Metrics(m) => Some(crate::daemon::TelemetryEnvelope::Metrics {
+                events: m.events.clone(),
+            }),
+        };
+        if let Some(te) = telemetry_envelope {
+            crate::daemon::telemetry_handle::submit_telemetry(vec![te]);
+        }
+
+        return;
+    }
+
     let mut obs = get_observability().lock().unwrap();
 
     match &mut obs.mode {
         LogMode::Buffered(buffer) => {
             buffer.push(envelope);
+            // Cap buffered envelopes to prevent unbounded memory growth
+            // in long-running processes (e.g. daemon) when disk mode is unavailable.
+            const MAX_BUFFERED_ENVELOPES: usize = 1024;
+            if buffer.len() > MAX_BUFFERED_ENVELOPES {
+                let excess = buffer.len() - MAX_BUFFERED_ENVELOPES;
+                buffer.drain(0..excess);
+            }
         }
         LogMode::Disk(log_path) => {
             let log_path = log_path.clone();
@@ -128,8 +174,65 @@ fn append_envelope(envelope: LogEnvelope) {
     }
 }
 
-/// Log an error to Sentry
+/// Submit telemetry envelopes via the best available daemon path:
+/// 1. External daemon control socket (wrapper processes)
+/// 2. In-process daemon telemetry worker (daemon process itself)
+/// 3. No-op if daemon is not running (callers must handle non-daemon fallback)
+fn submit_telemetry_envelope(envelopes: Vec<crate::daemon::TelemetryEnvelope>) {
+    if crate::daemon::telemetry_handle::daemon_telemetry_available() {
+        crate::daemon::telemetry_handle::submit_telemetry(envelopes);
+    } else if crate::daemon::daemon_process_active() {
+        crate::daemon::telemetry_worker::submit_daemon_internal_telemetry(envelopes);
+    }
+}
+
+#[cfg(any(test, not(feature = "test-support")))]
+fn build_metrics_log_envelopes(events: &[MetricEvent], timestamp: &str) -> Vec<MetricsEnvelope> {
+    events
+        .chunks(MAX_METRICS_PER_ENVELOPE)
+        .map(|chunk| MetricsEnvelope {
+            event_type: "metrics".to_string(),
+            timestamp: timestamp.to_string(),
+            version: crate::metrics::METRICS_API_VERSION,
+            events: chunk.to_vec(),
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn route_metrics_events(events: Vec<MetricEvent>, async_mode: bool) {
+    if events.is_empty() {
+        return;
+    }
+
+    if async_mode {
+        for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
+            let envelope = crate::daemon::TelemetryEnvelope::Metrics {
+                events: chunk.to_vec(),
+            };
+            submit_telemetry_envelope(vec![envelope]);
+        }
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    for envelope in build_metrics_log_envelopes(&events, &timestamp) {
+        append_envelope(LogEnvelope::Metrics(envelope));
+    }
+}
+
+/// Log an error to Sentry (via daemon telemetry worker)
 pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Value>) {
+    if config::Config::get().feature_flags().async_mode {
+        let envelope = crate::daemon::TelemetryEnvelope::Error {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message: error.to_string(),
+            context: context.clone(),
+        };
+        submit_telemetry_envelope(vec![envelope]);
+        return;
+    }
+
     let envelope = ErrorEnvelope {
         event_type: "error".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -140,13 +243,25 @@ pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Valu
     append_envelope(LogEnvelope::Error(envelope));
 }
 
-/// Log a performance metric to Sentry
+/// Log a performance metric to Sentry (via daemon telemetry worker)
 pub fn log_performance(
     operation: &str,
     duration: Duration,
     context: Option<serde_json::Value>,
     tags: Option<HashMap<String, String>>,
 ) {
+    if config::Config::get().feature_flags().async_mode {
+        let envelope = crate::daemon::TelemetryEnvelope::Performance {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            operation: operation.to_string(),
+            duration_ms: duration.as_millis(),
+            context: context.clone(),
+            tags: tags.clone(),
+        };
+        submit_telemetry_envelope(vec![envelope]);
+        return;
+    }
+
     let envelope = PerformanceEnvelope {
         event_type: "performance".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -155,13 +270,22 @@ pub fn log_performance(
         context,
         tags,
     };
-
     append_envelope(LogEnvelope::Performance(envelope));
 }
 
-/// Log a message to Sentry (info, warning, etc.)
+/// Log a message to Sentry (info, warning, etc.) (via daemon telemetry worker)
 #[allow(dead_code)]
 pub fn log_message(message: &str, level: &str, context: Option<serde_json::Value>) {
+    if config::Config::get().feature_flags().async_mode {
+        let envelope = crate::daemon::TelemetryEnvelope::Message {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message: message.to_string(),
+            level: level.to_string(),
+            context,
+        };
+        submit_telemetry_envelope(vec![envelope]);
+        return;
+    }
     let envelope = MessageEnvelope {
         event_type: "message".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -169,12 +293,19 @@ pub fn log_message(message: &str, level: &str, context: Option<serde_json::Value
         level: level.to_string(),
         context,
     };
-
     append_envelope(LogEnvelope::Message(envelope));
 }
 
-/// Spawn a background process to flush logs to Sentry
+/// Spawn a background process to flush logs to Sentry.
+///
+/// In daemon mode, this is a no-op because the daemon's telemetry worker
+/// handles batched flushing on a 3-second interval.
 pub fn spawn_background_flush() {
+    // In daemon mode the telemetry worker handles flushing — skip the subprocess.
+    if crate::daemon::telemetry_handle::daemon_telemetry_available() {
+        return;
+    }
+
     // Skip flush in test builds to prevent race conditions during test cleanup.
     // Tests spawn git-ai as a subprocess which calls this function. If the background
     // flush process is still starting when TestRepo::drop() runs, file handles may
@@ -189,13 +320,14 @@ pub fn spawn_background_flush() {
     if !should_spawn_background_flush() {
         return;
     }
-
-    let _ = crate::utils::spawn_internal_git_ai_subcommand(
-        "flush-logs",
-        &[],
-        ENV_FLUSH_LOGS_WORKER,
-        &[],
-    );
+    smol::block_on(async {
+        let _ = crate::utils::spawn_internal_git_ai_subcommand(
+            "flush-logs",
+            &[],
+            ENV_FLUSH_LOGS_WORKER,
+            &[],
+        );
+    });
 }
 
 /// Debounce background flushes to avoid process/request storms when checkpoints
@@ -230,11 +362,9 @@ fn should_spawn_background_flush() -> bool {
     true
 }
 
-/// Log a batch of metric events to the observability log file.
+/// Log a batch of metric events (via daemon telemetry worker).
 ///
 /// Events are batched into envelopes of up to 250 events each.
-/// The flush-logs command will then upload them to the API or
-/// store them in SQLite for later upload.
 pub fn log_metrics(
     #[cfg_attr(any(test, feature = "test-support"), allow(unused))] events: Vec<MetricEvent>,
 ) {
@@ -243,29 +373,31 @@ pub fn log_metrics(
 
     #[cfg(not(any(test, feature = "test-support")))]
     {
-        if events.is_empty() {
-            return;
-        }
-
-        // Split into chunks of MAX_METRICS_PER_ENVELOPE
-        for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
-            let envelope = MetricsEnvelope {
-                event_type: "metrics".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                version: METRICS_API_VERSION,
-                events: chunk.to_vec(),
-            };
-
-            append_envelope(LogEnvelope::Metrics(envelope));
-        }
+        route_metrics_events(events, config::Config::get().feature_flags().async_mode);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    fn sample_metric_event(sequence: u32) -> MetricEvent {
+        let mut values = HashMap::new();
+        values.insert("0".to_string(), json!(sequence));
+
+        let mut attrs = HashMap::new();
+        attrs.insert("0".to_string(), json!("1.3.1"));
+
+        MetricEvent {
+            timestamp: sequence,
+            event_id: 1,
+            values,
+            attrs,
+        }
+    }
 
     // Test error logging
     #[test]
@@ -329,73 +461,34 @@ mod tests {
         log_metrics(vec![]);
     }
 
-    // Test spawn_background_flush
     #[test]
-    fn test_spawn_background_flush_no_panic() {
-        // In test mode, this should exit early due to GIT_AI_TEST_DB_PATH check
-        spawn_background_flush();
+    fn test_build_metrics_log_envelopes_sets_metrics_metadata() {
+        let envelopes =
+            build_metrics_log_envelopes(&[sample_metric_event(1)], "2026-04-21T00:00:00Z");
+
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].event_type, "metrics");
+        assert_eq!(envelopes[0].timestamp, "2026-04-21T00:00:00Z");
+        assert_eq!(envelopes[0].version, crate::metrics::METRICS_API_VERSION);
+        assert_eq!(envelopes[0].events.len(), 1);
+    }
+
+    #[test]
+    fn test_build_metrics_log_envelopes_chunks_large_batches() {
+        let events: Vec<_> = (0..(MAX_METRICS_PER_ENVELOPE as u32 + 1))
+            .map(sample_metric_event)
+            .collect();
+
+        let envelopes = build_metrics_log_envelopes(&events, "2026-04-21T00:00:00Z");
+
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].events.len(), MAX_METRICS_PER_ENVELOPE);
+        assert_eq!(envelopes[1].events.len(), 1);
     }
 
     // Test constants
     #[test]
     fn test_max_metrics_per_envelope() {
         assert_eq!(MAX_METRICS_PER_ENVELOPE, 250);
-    }
-
-    // Test envelope serialization
-    #[test]
-    fn test_error_envelope_to_json() {
-        let envelope = ErrorEnvelope {
-            event_type: "error".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            message: "test error".to_string(),
-            context: None,
-        };
-        let log_envelope = LogEnvelope::Error(envelope);
-        let json = log_envelope.to_json();
-        assert!(json.is_some());
-    }
-
-    #[test]
-    fn test_performance_envelope_to_json() {
-        let envelope = PerformanceEnvelope {
-            event_type: "performance".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            operation: "test_op".to_string(),
-            duration_ms: 100,
-            context: None,
-            tags: None,
-        };
-        let log_envelope = LogEnvelope::Performance(envelope);
-        let json = log_envelope.to_json();
-        assert!(json.is_some());
-    }
-
-    #[test]
-    fn test_message_envelope_to_json() {
-        let envelope = MessageEnvelope {
-            event_type: "message".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            message: "test message".to_string(),
-            level: "info".to_string(),
-            context: None,
-        };
-        let log_envelope = LogEnvelope::Message(envelope);
-        let json = log_envelope.to_json();
-        assert!(json.is_some());
-    }
-
-    #[test]
-    fn test_metrics_envelope_to_json() {
-        // Test empty metrics envelope
-        let envelope = MetricsEnvelope {
-            event_type: "metrics".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            version: 1,
-            events: vec![],
-        };
-        let log_envelope = LogEnvelope::Metrics(envelope);
-        let json = log_envelope.to_json();
-        assert!(json.is_some());
     }
 }

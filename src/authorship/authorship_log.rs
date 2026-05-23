@@ -1,8 +1,19 @@
 use crate::authorship::transcript::Message;
 use crate::authorship::working_log::AgentId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
+
+fn serialize_messages_release_empty<S: Serializer>(
+    messages: &Vec<Message>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if cfg!(debug_assertions) {
+        messages.serialize(serializer)
+    } else {
+        Vec::<Message>::new().serialize(serializer)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Author {
@@ -192,6 +203,7 @@ impl fmt::Display for LineRange {
 pub struct PromptRecord {
     pub agent_id: AgentId,
     pub human_author: Option<String>,
+    #[serde(serialize_with = "serialize_messages_release_empty")]
     pub messages: Vec<Message>,
     #[serde(default)]
     pub total_additions: u32,

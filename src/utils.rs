@@ -4,15 +4,11 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Check if debug logging is enabled via environment variable
-///
-/// This is checked once at module initialization to avoid repeated environment variable lookups.
-static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static DEBUG_PERFORMANCE_LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 static IS_TERMINAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static IS_IN_BACKGROUND_AGENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn is_debug_enabled() -> bool {
+pub fn is_debug_enabled() -> bool {
     *DEBUG_ENABLED.get_or_init(|| {
         (cfg!(debug_assertions)
             || std::env::var("GIT_AI_DEBUG").unwrap_or_default() == "1"
@@ -20,46 +16,6 @@ fn is_debug_enabled() -> bool {
             && std::env::var("GIT_AI_DEBUG").unwrap_or_default() != "0"
     })
 }
-
-fn is_debug_performance_enabled() -> bool {
-    debug_performance_level() >= 1
-}
-
-fn debug_performance_level() -> u8 {
-    *DEBUG_PERFORMANCE_LEVEL.get_or_init(|| {
-        std::env::var("GIT_AI_DEBUG_PERFORMANCE")
-            .unwrap_or_default()
-            .parse::<u8>()
-            .unwrap_or(0)
-    })
-}
-
-pub fn debug_performance_log(msg: &str) {
-    if is_debug_performance_enabled() {
-        eprintln!("\x1b[1;33m[git-ai (perf)]\x1b[0m {}", msg);
-    }
-}
-
-pub fn debug_performance_log_structured(json: serde_json::Value) {
-    if debug_performance_level() >= 2 {
-        eprintln!("\x1b[1;33m[git-ai (perf-json)]\x1b[0m {}", json);
-    }
-}
-
-/// Debug logging utility function
-///
-/// Prints debug messages with a colored prefix when debug assertions are enabled or when
-/// the `GIT_AI_DEBUG` environment variable is set to "1".
-///
-/// # Arguments
-///
-/// * `msg` - The debug message to print
-pub fn debug_log(msg: &str) {
-    if is_debug_enabled() {
-        eprintln!("\x1b[1;33m[git-ai]\x1b[0m {}", msg);
-    }
-}
-
 /// Print a git diff in a readable format
 ///
 /// Prints the diff between two commits/trees showing which files changed and their status.
@@ -97,6 +53,26 @@ pub fn _print_diff(diff: &Diff, old_label: &str, new_label: &str) {
 #[inline]
 pub fn normalize_to_posix(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// Returns true when async/daemon checkpoint delegation is enabled.
+///
+/// Checks the `async_mode` feature flag first, then falls back to the
+/// `GIT_AI_DAEMON_CHECKPOINT_DELEGATE` environment variable.  Used by both
+/// the main hook handler and the bash tool to skip capture work when the
+/// daemon will not be available to consume captured checkpoint files.
+pub fn checkpoint_delegation_enabled() -> bool {
+    if crate::config::Config::get().feature_flags().async_mode {
+        return true;
+    }
+    matches!(
+        std::env::var("GIT_AI_DAEMON_CHECKPOINT_DELEGATE")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 fn resolve_git_ai_exe_from_invocation_path(path: PathBuf) -> PathBuf {
@@ -154,7 +130,7 @@ fn resolve_git_ai_exe_from_invocation_path(path: PathBuf) -> PathBuf {
     canonical_path
 }
 
-fn current_git_ai_exe() -> Result<PathBuf, GitAiError> {
+pub(crate) fn current_git_ai_exe() -> Result<PathBuf, GitAiError> {
     let path = std::env::current_exe()?;
     Ok(resolve_git_ai_exe_from_invocation_path(path))
 }
@@ -207,6 +183,8 @@ pub fn is_in_background_agent() -> bool {
             // Cloud agent environment (CLOUD_AGENT_* prefix)
             || std::env::vars().any(|(k, _)| k.starts_with("CLOUD_AGENT_"))
             || std::path::Path::new("/opt/.devin").is_dir()
+            // Explicit opt-in for cloud/background agent environments
+            || std::env::var("GIT_AI_CLOUD_AGENT").map(|v| v == "1").unwrap_or(false)
     })
 }
 
@@ -216,57 +194,178 @@ pub fn is_in_background_agent() -> bool {
 /// for the lifetime of the struct. The lock is automatically released when dropped
 /// or when the process exits.
 pub struct LockFile {
-    _file: std::fs::File,
+    #[cfg(windows)]
+    handle: isize,
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
 }
 
 impl LockFile {
     /// Try to acquire an exclusive lock on the given path.
     /// Returns `Some(LockFile)` if successful, `None` if another process holds the lock.
     pub fn try_acquire(path: &std::path::Path) -> Option<Self> {
-        let file = try_lock_exclusive(path)?;
-        Some(Self { _file: file })
+        let lock = try_lock_exclusive(path)?;
+        Some(lock)
     }
 }
 
 #[cfg(unix)]
 impl Drop for LockFile {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        unsafe { libc::flock(self.fd, libc::LOCK_UN) };
     }
 }
 
 #[cfg(unix)]
-#[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+fn try_lock_exclusive(path: &std::path::Path) -> Option<LockFile> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(path)
         .ok()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return None;
     }
-    Some(file)
+    // Transfer ownership: forget the File so its Drop doesn't close the fd.
+    std::mem::forget(file);
+    Some(LockFile { fd })
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn UnlockFile(
+        hFile: isize,
+        dwFileOffsetLow: u32,
+        dwFileOffsetHigh: u32,
+        nNumberOfBytesToUnlockLow: u32,
+        nNumberOfBytesToUnlockHigh: u32,
+    );
+}
+
+#[cfg(windows)]
+unsafe impl Send for LockFile {}
+#[cfg(windows)]
+unsafe impl Sync for LockFile {}
+
+#[cfg(windows)]
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // SAFETY: we own this handle and no other code uses it.
+        unsafe { UnlockFile(self.handle, 0, 0, u32::MAX, u32::MAX) };
+    }
 }
 
 #[cfg(windows)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .share_mode(0)
-        .open(path)
-        .ok()
+fn try_lock_exclusive(path: &std::path::Path) -> Option<LockFile> {
+    use libloading::{Library, Symbol};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const GENERIC_READ: u32 = 0x80000000u32;
+    const GENERIC_WRITE: u32 = 0x40000000u32;
+    const FILE_SHARE_NONE: u32 = 0u32;
+    const OPEN_ALWAYS: u32 = 4u32;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000u32;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80u32;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2u32;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1u32;
+    const INVALID_HANDLE_VALUE: isize = -1isize;
+
+    let lib = unsafe { Library::new("kernel32.dll") }.ok()?;
+
+    type CreateFileWFn = unsafe extern "system" fn(
+        *const u16,
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+    ) -> isize;
+    let create_file: Symbol<'_, CreateFileWFn> = unsafe { lib.get(b"CreateFileW") }.ok()?;
+
+    type LockFileExFn =
+        unsafe extern "system" fn(isize, u32, u32, u32, u32, *mut std::ffi::c_void) -> i32;
+    let lock_file: Symbol<'_, LockFileExFn> = unsafe { lib.get(b"LockFileEx") }.ok()?;
+
+    let wide_path: Vec<u16> = OsStr::new(path.as_os_str())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let handle = unsafe {
+        create_file(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_NONE,
+            std::ptr::null_mut(),
+            OPEN_ALWAYS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let result = unsafe {
+        lock_file(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        return None;
+    }
+
+    Some(LockFile { handle })
 }
 
 /// Windows-specific flag to prevent console window creation
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+/// Windows-specific flag to start a new process group
+#[cfg(windows)]
+pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+/// Windows-specific flag to allow a child process to break away from the current job object
+#[cfg(windows)]
+pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+#[cfg(windows)]
+pub fn kill_process_tree_windows(pid: u32) -> Result<(), String> {
+    let output = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("failed to run taskkill: {}", e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_trimmed = stderr.trim();
+    if stderr_trimmed.contains("not found")
+        || stderr_trimmed.contains("There is no running instance")
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "taskkill /F /T /PID {} failed: {}",
+        pid, stderr_trimmed
+    ))
+}
 /// Unescape a git-quoted path that may contain octal escape sequences.
 ///
 /// Git quotes filenames containing non-ASCII characters (and some special characters)
@@ -1068,30 +1167,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Debug Logging Tests
-    // =========================================================================
-
-    #[test]
-    fn test_debug_log_no_panic() {
-        // Debug logging should not panic
-        debug_log("test message");
-    }
-
-    #[test]
-    fn test_debug_performance_log_no_panic() {
-        debug_performance_log("test performance message");
-    }
-
-    #[test]
-    fn test_debug_performance_log_structured_no_panic() {
-        use serde_json::json;
-        debug_performance_log_structured(json!({
-            "operation": "test",
-            "duration_ms": 100,
-        }));
-    }
-
-    // =========================================================================
     // current_git_ai_exe Tests
     // =========================================================================
 
@@ -1123,5 +1198,17 @@ mod tests {
     fn test_create_no_window_constant() {
         // Verify the Windows constant is correct
         assert_eq!(CREATE_NO_WINDOW, 0x08000000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_new_process_group_constant() {
+        assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x00000200);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_breakaway_from_job_constant() {
+        assert_eq!(CREATE_BREAKAWAY_FROM_JOB, 0x01000000);
     }
 }

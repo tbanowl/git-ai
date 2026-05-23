@@ -1,8 +1,11 @@
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::GitAiError;
-use crate::git::repository::{exec_git, parse_git_var_identity};
+use crate::git::repository::config_get_str_for_path_no_git_exec;
+use crate::http;
 use once_cell::sync::Lazy;
+use std::env;
+use std::path::Path;
 use std::sync::Mutex;
 use url::Url;
 
@@ -62,24 +65,76 @@ fn try_load_auth_token() -> Option<String> {
 
 /// Resolve the git author identity without requiring a Repository instance.
 ///
-/// Runs `git var GIT_COMMITTER_IDENT` to get the current user's identity,
-/// respecting the full git precedence chain (env vars > config > system defaults).
+/// Produces a formatted committer identity using an in-process approximation of the
+/// config precedence needed by this code path: explicit `GIT_COMMITTER_*` env vars
+/// first, then repo/worktree-aware `user.name` / `user.email` config when inside a
+/// repository, then global config plus environment overrides as a fallback.
+///
+/// This intentionally does not claim to reproduce every `git var GIT_COMMITTER_IDENT`
+/// fallback or synthesized default. It only covers the env/config behavior relied on by
+/// the API client and the Batch 1 behavior tests.
 /// Returns `None` if the identity cannot be determined.
-fn resolve_git_identity() -> Option<String> {
-    let args = vec!["var".to_string(), "GIT_COMMITTER_IDENT".to_string()];
-    if let Ok(output) = exec_git(&args)
-        && let Ok(stdout) = String::from_utf8(output.stdout)
-    {
-        let identity = parse_git_var_identity(&stdout);
-        if let Some(formatted) = identity.formatted() {
-            return Some(formatted);
-        }
+fn format_identity(name: Option<String>, email: Option<String>) -> Option<String> {
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{} <{}>", name.trim(), email.trim())),
+        (Some(name), None) => Some(name.trim().to_string()),
+        (None, Some(email)) => Some(format!("<{}>", email.trim())),
+        (None, None) => None,
     }
-    None
+}
+
+fn resolve_git_identity() -> Option<String> {
+    // Migrated from: git var GIT_COMMITTER_IDENT
+    // Backend: gix
+    let env_name = env::var("GIT_COMMITTER_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let env_email = env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match (env_name, env_email) {
+        (Some(name), Some(email)) => return Some(format!("{} <{}>", name, email)),
+        (Some(name), None) => return Some(name),
+        (None, Some(email)) => return Some(format!("<{}>", email)),
+        (None, None) => {}
+    }
+
+    let repo_name = config_get_str_for_path_no_git_exec(Path::new("."), "user.name")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let repo_email = config_get_str_for_path_no_git_exec(Path::new("."), "user.email")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(formatted) = format_identity(repo_name, repo_email) {
+        return Some(formatted);
+    }
+
+    let config = gix_config::File::from_globals().ok().map(|mut config| {
+        let _ = config.resolve_includes(gix_config::file::init::Options::default());
+        if let Ok(env_overrides) = gix_config::File::from_environment_overrides() {
+            config.append(env_overrides);
+        }
+        config
+    })?;
+    let name = config
+        .string_by("user", None, "name")
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+    let email = config
+        .string_by("user", None, "email")
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+
+    format_identity(name, email)
 }
 
 /// API client context with optional authentication
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiContext {
     /// Base URL for the API (e.g., `https://app.com`)
     pub base_url: String,
@@ -93,38 +148,63 @@ pub struct ApiContext {
     pub timeout_secs: Option<u64>,
 }
 
+impl std::fmt::Debug for ApiContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiContext")
+            .field("base_url", &self.base_url)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("author_identity", &self.author_identity)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
 impl ApiContext {
     /// Get the default API base URL from config
+    /// Uses Config::fresh() to support runtime config updates (daemon mode)
     fn default_base_url() -> String {
-        config::Config::get().api_base_url().to_string()
+        config::Config::fresh().api_base_url().to_string()
     }
 
     /// Create a GET request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP GET requests to ensure consistent headers.
-    pub fn http_get(url: &str) -> minreq::Request {
-        minreq::get(url)
-            .with_header(
+    /// The returned (Agent, Request) pair uses the system's native certificate store.
+    pub fn http_get(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+        let agent = http::build_agent(timeout_secs);
+        let request = agent
+            .get(url)
+            .set(
                 "User-Agent",
-                format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .with_header("X-Distinct-ID", config::get_or_create_distinct_id())
+            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+        (agent, request)
     }
 
     /// Create a POST request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP POST requests to ensure consistent headers.
-    pub fn http_post(url: &str) -> minreq::Request {
-        minreq::post(url)
-            .with_header(
+    /// The returned (Agent, Request) pair uses the system's native certificate store.
+    pub fn http_post(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+        let agent = http::build_agent(timeout_secs);
+        let request = agent
+            .post(url)
+            .set(
                 "User-Agent",
-                format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .with_header("X-Distinct-ID", config::get_or_create_distinct_id())
+            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+        (agent, request)
     }
 
     /// Create a new API context, automatically using stored credentials if available
     /// If base_url is None, uses api_base_url from config (which can be set via config file, env var, or defaults)
+    /// Uses Config::fresh() to support runtime config updates (daemon mode)
     pub fn new(base_url: Option<String>) -> Self {
-        let cfg = config::Config::get();
+        let cfg = config::Config::fresh();
         let api_key = cfg.api_key().map(|s| s.to_string());
         let author_identity = if api_key.is_some() {
             resolve_git_identity()
@@ -142,9 +222,10 @@ impl ApiContext {
 
     /// Create a new API context explicitly without authentication
     /// Use this when you need to ensure no auth token is sent
+    /// Uses Config::fresh() to support runtime config updates (daemon mode)
     #[allow(dead_code)]
     pub fn without_auth(base_url: Option<String>) -> Self {
-        let cfg = config::Config::get();
+        let cfg = config::Config::fresh();
         let api_key = cfg.api_key().map(|s| s.to_string());
         let author_identity = if api_key.is_some() {
             resolve_git_identity()
@@ -162,9 +243,10 @@ impl ApiContext {
 
     /// Create a new API context with authentication
     /// If base_url is None, uses api_base_url from config (which can be set via config file, env var, or defaults)
+    /// Uses Config::fresh() to support runtime config updates (daemon mode)
     #[allow(dead_code)]
     pub fn with_auth(base_url: Option<String>, auth_token: String) -> Self {
-        let cfg = config::Config::get();
+        let cfg = config::Config::fresh();
         let api_key = cfg.api_key().map(|s| s.to_string());
         let author_identity = if api_key.is_some() {
             resolve_git_identity()
@@ -201,62 +283,44 @@ impl ApiContext {
         &self,
         endpoint: &str,
         body: &T,
-    ) -> Result<minreq::Response, GitAiError> {
+    ) -> Result<http::Response, GitAiError> {
         let url = self.build_url(endpoint)?;
         let body_json = serde_json::to_string(body).map_err(GitAiError::JsonError)?;
 
-        let mut request = Self::http_post(&url)
-            .with_header("Content-Type", "application/json")
-            .with_body(body_json);
+        let (_agent, mut request) = Self::http_post(&url, self.timeout_secs);
+        request = request.set("Content-Type", "application/json");
 
         if let Some(api_key) = &self.api_key {
-            request = request.with_header("X-API-Key", api_key);
+            request = request.set("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.with_header("X-Author-Identity", identity);
+                request = request.set("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.with_header("Authorization", format!("Bearer {}", token));
+            request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        // Set timeout if specified
-        if let Some(timeout) = self.timeout_secs {
-            request = request.with_timeout(timeout);
-        }
-
-        let response = request
-            .send()
-            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))?;
-
-        Ok(response)
+        http::send_with_body(request, &body_json)
+            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))
     }
 
     /// Make a GET request
-    pub fn get(&self, endpoint: &str) -> Result<minreq::Response, GitAiError> {
+    pub fn get(&self, endpoint: &str) -> Result<http::Response, GitAiError> {
         let url = self.build_url(endpoint)?;
 
-        let mut request = Self::http_get(&url);
+        let (_agent, mut request) = Self::http_get(&url, self.timeout_secs);
 
         if let Some(api_key) = &self.api_key {
-            request = request.with_header("X-API-Key", api_key);
+            request = request.set("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.with_header("X-Author-Identity", identity);
+                request = request.set("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.with_header("Authorization", format!("Bearer {}", token));
+            request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        // Set timeout if specified
-        if let Some(timeout) = self.timeout_secs {
-            request = request.with_timeout(timeout);
-        }
-
-        let response = request
-            .send()
-            .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))?;
-
-        Ok(response)
+        http::send(request).map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))
     }
 }
 

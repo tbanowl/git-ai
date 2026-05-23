@@ -65,6 +65,7 @@ impl CheckpointKind {
     pub fn from_str(s: &str) -> Self {
         match s {
             "human" => CheckpointKind::Human,
+            "known_human" => CheckpointKind::Human,
             "ai_agent" => CheckpointKind::AiAgent,
             "ai_tab" => CheckpointKind::AiTab,
             _ => panic!("Invalid checkpoint kind: {}", s),
@@ -78,6 +79,11 @@ impl CheckpointKind {
             CheckpointKind::AiAgent => "ai_agent".to_string(),
             CheckpointKind::AiTab => "ai_tab".to_string(),
         }
+    }
+
+    /// Returns true if this checkpoint kind represents AI-generated content.
+    pub fn is_ai(self) -> bool {
+        matches!(self, CheckpointKind::AiAgent | CheckpointKind::AiTab)
     }
 
     /// Default value to prevent crashes on old versions
@@ -304,5 +310,11 @@ mod tests {
         let deserialized_agent = deserialized.agent_id.as_ref().unwrap();
         assert_eq!(deserialized_agent.tool, "cursor");
         assert_eq!(deserialized_agent.id, "session-abc123");
+    }
+
+    #[test]
+    fn test_is_ai_returns_true_for_ai_kinds() {
+        assert!(CheckpointKind::AiAgent.is_ai());
+        assert!(CheckpointKind::AiTab.is_ai());
     }
 }

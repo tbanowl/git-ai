@@ -5,7 +5,6 @@ use crate::commands::hooks::commit_hooks::get_commit_default_author;
 use crate::error::GitAiError;
 use crate::git::cli_parser::ParsedGitInvocation;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
-use crate::utils::debug_log;
 
 pub fn pre_stash_hook(
     parsed_args: &ParsedGitInvocation,
@@ -18,30 +17,36 @@ pub fn pre_stash_hook(
         None => return, // Implicit push, nothing to capture
     };
 
-    if subcommand == "pop" || subcommand == "apply" {
-        // Capture the stash SHA BEFORE git runs (pop will delete it)
-        let stash_ref = parsed_args
-            .pos_command(1)
-            .unwrap_or_else(|| "stash@{0}".to_string());
+    if subcommand == "pop" || subcommand == "apply" || subcommand == "branch" {
+        // Capture the stash SHA BEFORE git runs (pop/branch will delete it)
+        // For "branch", the stash ref is the second positional arg:
+        //   git stash branch <branchname> [<stash>]
+        let stash_ref = if subcommand == "branch" {
+            parsed_args
+                .pos_command(2)
+                .unwrap_or_else(|| "stash@{0}".to_string())
+        } else {
+            parsed_args
+                .pos_command(1)
+                .unwrap_or_else(|| "stash@{0}".to_string())
+        };
 
         if let Ok(stash_sha) = resolve_stash_to_sha(repository, &stash_ref) {
             command_hooks_context.stash_sha = Some(stash_sha);
-            debug_log(&format!("Pre-stash: captured stash SHA for {}", subcommand));
+            tracing::debug!("Pre-stash: captured stash SHA for {}", subcommand);
         }
     } else {
         let _ = match crate::commands::checkpoint::run(
             repository,
             &get_commit_default_author(repository, &parsed_args.command_args),
             CheckpointKind::Human,
-            false,
-            false,
             true,
             None,
             true, // same optimizations as pre_commit.rs
         ) {
             Ok(result) => result,
             Err(e) => {
-                debug_log(&format!("Failed to run checkpoint: {}", e));
+                tracing::debug!("Failed to run checkpoint: {}", e);
                 return;
             }
         };
@@ -54,11 +59,6 @@ pub fn post_stash_hook(
     repository: &mut Repository,
     exit_status: std::process::ExitStatus,
 ) {
-    if !exit_status.success() {
-        debug_log("Stash failed, skipping post-stash hook");
-        return;
-    }
-
     // Check what subcommand was used
     let subcommand = match parsed_args.pos_command(0) {
         Some(cmd) => cmd,
@@ -68,52 +68,108 @@ pub fn post_stash_hook(
         }
     };
 
-    debug_log(&format!("Post-stash: processing stash {}", subcommand));
+    // For pop/apply/branch, don't bail on exit code 1 if it's a conflict
+    // (stash was partially applied). For other subcommands, bail on any failure.
+    if !exit_status.success() {
+        let is_restore_subcommand =
+            subcommand == "pop" || subcommand == "apply" || subcommand == "branch";
+        if is_restore_subcommand && has_stash_conflict(repository) {
+            tracing::debug!(
+                "Stash {} had conflicts, but will still restore attributions",
+                subcommand
+            );
+        } else {
+            tracing::debug!(
+                "Stash {} failed (non-conflict), skipping post-stash hook",
+                subcommand
+            );
+            return;
+        }
+    }
+
+    tracing::debug!("Post-stash: processing stash {}", subcommand);
 
     // Handle different subcommands
     if subcommand == "push" || subcommand == "save" {
         // Extract pathspecs from command
         let pathspecs = extract_stash_pathspecs(parsed_args);
+        let head_sha = match repository.head().and_then(|head| head.target()) {
+            Ok(head_sha) => head_sha.to_string(),
+            Err(e) => {
+                tracing::debug!("Failed to resolve HEAD after stash {}: {}", subcommand, e);
+                return;
+            }
+        };
+        let stash_sha = match resolve_stash_to_sha(repository, "stash@{0}") {
+            Ok(stash_sha) => stash_sha,
+            Err(e) => {
+                tracing::debug!("Failed to resolve created stash SHA: {}", e);
+                return;
+            }
+        };
 
         // Stash was created - save authorship log as git note
-        if let Err(e) = save_stash_authorship_log(repository, &pathspecs) {
-            debug_log(&format!("Failed to save stash authorship log: {}", e));
+        if let Err(e) = save_stash_authorship_log(repository, &head_sha, &stash_sha, &pathspecs) {
+            tracing::debug!("Failed to save stash authorship log: {}", e);
         }
-    } else if subcommand == "pop" || subcommand == "apply" {
+    } else if subcommand == "pop" || subcommand == "apply" || subcommand == "branch" {
         // Stash was applied - restore attributions from git note
         // Use the stash SHA we captured in pre-hook (before Git deleted it)
         let stash_sha = match &command_hooks_context.stash_sha {
             Some(sha) => sha.clone(),
             None => {
-                debug_log("No stash SHA captured in pre-hook, cannot restore attributions");
+                tracing::debug!("No stash SHA captured in pre-hook, cannot restore attributions");
                 return;
             }
         };
 
-        debug_log(&format!(
-            "Restoring attributions from stash SHA: {}",
-            stash_sha
-        ));
+        tracing::debug!("Restoring attributions from stash SHA: {}", stash_sha);
+        let head_sha = match repository.head().and_then(|head| head.target()) {
+            Ok(head_sha) => head_sha.to_string(),
+            Err(e) => {
+                tracing::debug!("Failed to resolve HEAD after stash {}: {}", subcommand, e);
+                return;
+            }
+        };
 
-        let human_author = get_commit_default_author(repository, &parsed_args.command_args);
-
-        if let Err(e) = restore_stash_attributions(repository, &stash_sha, &human_author) {
-            debug_log(&format!("Failed to restore stash attributions: {}", e));
+        if let Err(e) = restore_stash_attributions(repository, &head_sha, &stash_sha) {
+            tracing::debug!("Failed to restore stash attributions: {}", e);
         }
     }
 }
 
-/// Save the current working log as an authorship log in git notes (refs/notes/ai-stash)
-fn save_stash_authorship_log(repo: &Repository, pathspecs: &[String]) -> Result<(), GitAiError> {
-    let head_sha = repo.head()?.target()?.to_string();
+/// Detect whether a stash pop/apply failure was due to a merge conflict.
+/// When `git stash pop` encounters a conflict, the working tree has unmerged entries.
+/// We check for this by looking at `git status --porcelain=v2` for unmerged ('u') entries.
+/// A conflict means the stash was partially applied (with conflict markers) and attribution
+/// should still be restored. A non-conflict failure means the stash was not applied at all.
+fn has_stash_conflict(repo: &Repository) -> bool {
+    let mut args = repo.global_args_for_exec();
+    args.push("status".to_string());
+    args.push("--porcelain=v2".to_string());
 
-    // Get the stash SHA that was just created (stash@{0})
-    let stash_sha = resolve_stash_to_sha(repo, "stash@{0}")?;
-    debug_log(&format!("Stash created with SHA: {}", stash_sha));
+    match exec_git(&args) {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Unmerged entries start with 'u' in porcelain v2 format
+            stdout.lines().any(|line| line.starts_with("u "))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Save the current working log as an authorship log in git notes (refs/notes/ai-stash)
+pub(crate) fn save_stash_authorship_log(
+    repo: &Repository,
+    head_sha: &str,
+    stash_sha: &str,
+    pathspecs: &[String],
+) -> Result<(), GitAiError> {
+    tracing::debug!("Stash created with SHA: {}", stash_sha);
 
     // Build VirtualAttributions from the working log before it was cleared
     let working_log_va =
-        VirtualAttributions::from_just_working_log(repo.clone(), head_sha.clone(), None)?;
+        VirtualAttributions::from_just_working_log(repo.clone(), head_sha.to_string(), None)?;
 
     // Filter attributions to only include files that match the pathspecs
     let filtered_files: Vec<String> = if pathspecs.is_empty() {
@@ -134,16 +190,16 @@ fn save_stash_authorship_log(repo: &Repository, pathspecs: &[String]) -> Result<
 
     // If there are no attributions, just clean up working log for filtered files
     if filtered_files.is_empty() {
-        debug_log("No attributions to save for stash");
-        delete_working_log_for_files(repo, &head_sha, &filtered_files)?;
+        tracing::debug!("No attributions to save for stash");
+        delete_working_log_for_files(repo, head_sha, &filtered_files)?;
         return Ok(());
     }
 
-    debug_log(&format!(
+    tracing::debug!(
         "Saving attributions for {} files (pathspecs: {:?})",
         filtered_files.len(),
         pathspecs
-    ));
+    );
 
     // Convert to authorship log, filtering to only include matched files
     let mut authorship_log = working_log_va.to_authorship_log()?;
@@ -155,41 +211,36 @@ fn save_stash_authorship_log(repo: &Repository, pathspecs: &[String]) -> Result<
     let json = authorship_log
         .serialize_to_string()
         .map_err(|e| GitAiError::Generic(format!("Failed to serialize authorship log: {}", e)))?;
-    save_stash_note(repo, &stash_sha, &json)?;
+    save_stash_note(repo, stash_sha, &json)?;
 
-    debug_log(&format!(
+    tracing::debug!(
         "Saved authorship log to refs/notes/ai-stash for stash {}",
         stash_sha
-    ));
+    );
 
     // Delete the working log entries for files that were stashed
-    delete_working_log_for_files(repo, &head_sha, &filtered_files)?;
-    debug_log(&format!(
+    delete_working_log_for_files(repo, head_sha, &filtered_files)?;
+    tracing::debug!(
         "Deleted working log entries for {} files",
         filtered_files.len()
-    ));
+    );
 
     Ok(())
 }
 
 /// Restore attributions from a stash by reading the git note and converting to INITIAL attributions
-fn restore_stash_attributions(
+pub(crate) fn restore_stash_attributions(
     repo: &Repository,
+    head_sha: &str,
     stash_sha: &str,
-    _human_author: &str,
 ) -> Result<(), GitAiError> {
-    debug_log(&format!(
-        "Restoring stash attributions from SHA: {}",
-        stash_sha
-    ));
-
-    let head_sha = repo.head()?.target()?.to_string();
+    tracing::debug!("Restoring stash attributions from SHA: {}", stash_sha);
 
     // Try to read authorship log from git note (refs/notes/ai-stash)
     let note_content = match read_stash_note(repo, stash_sha) {
         Ok(content) => content,
         Err(_) => {
-            debug_log("No authorship log found in refs/notes/ai-stash for this stash");
+            tracing::debug!("No authorship log found in refs/notes/ai-stash for this stash");
             return Ok(());
         }
     };
@@ -198,16 +249,16 @@ fn restore_stash_attributions(
     let authorship_log = match crate::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(&note_content) {
         Ok(log) => log,
         Err(e) => {
-            debug_log(&format!("Failed to parse stash authorship log: {}", e));
+            tracing::debug!("Failed to parse stash authorship log: {}", e);
             return Ok(());
         }
     };
 
-    debug_log(&format!(
+    tracing::debug!(
         "Loaded authorship log from stash: {} files, {} prompts",
         authorship_log.attestations.len(),
         authorship_log.metadata.prompts.len()
-    ));
+    );
 
     // Convert authorship log to INITIAL attributions
     let mut initial_files = std::collections::HashMap::new();
@@ -243,16 +294,51 @@ fn restore_stash_attributions(
 
     // Write INITIAL attributions to working log
     if !initial_files.is_empty() || !initial_prompts.is_empty() {
-        let working_log = repo.storage.working_log_for_base_commit(&head_sha);
-        working_log.write_initial_attributions(initial_files.clone(), initial_prompts.clone())?;
+        let working_log = repo.storage.working_log_for_base_commit(head_sha)?;
+        let initial_file_contents =
+            load_stashed_file_contents(repo, stash_sha, initial_files.keys())?;
+        working_log.write_initial_attributions_with_contents(
+            initial_files.clone(),
+            initial_prompts.clone(),
+            initial_file_contents,
+        )?;
 
-        debug_log(&format!(
+        tracing::debug!(
             "✓ Wrote INITIAL attributions to working log for {}",
             head_sha
-        ));
+        );
     }
 
     Ok(())
+}
+
+fn load_stashed_file_contents<'a, I>(
+    repo: &Repository,
+    stash_sha: &str,
+    file_paths: I,
+) -> Result<std::collections::HashMap<String, String>, GitAiError>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let stash_commit = repo.find_commit(stash_sha.to_string())?;
+    let untracked_parent_sha = stash_commit.parent(2).ok().map(|commit| commit.id());
+    let mut file_contents = std::collections::HashMap::new();
+
+    for file_path in file_paths {
+        let content = repo
+            .get_file_content(file_path, stash_sha)
+            .ok()
+            .or_else(|| {
+                untracked_parent_sha
+                    .as_ref()
+                    .and_then(|parent_sha| repo.get_file_content(file_path, parent_sha).ok())
+            })
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default();
+        file_contents.insert(file_path.clone(), content);
+    }
+
+    Ok(file_contents)
 }
 
 /// Save a note to refs/notes/ai-stash
@@ -315,7 +401,7 @@ fn resolve_stash_to_sha(repo: &Repository, stash_ref: &str) -> Result<String, Gi
 
 /// Extract pathspecs from stash push/save command
 /// Format: git stash push [options] [--] [<pathspec>...]
-fn extract_stash_pathspecs(parsed_args: &ParsedGitInvocation) -> Vec<String> {
+pub(crate) fn extract_stash_pathspecs(parsed_args: &ParsedGitInvocation) -> Vec<String> {
     let mut pathspecs = Vec::new();
     let mut found_separator = false;
     let mut skip_next = false;
@@ -362,7 +448,7 @@ fn extract_stash_pathspecs(parsed_args: &ParsedGitInvocation) -> Vec<String> {
         pathspecs.push(arg.clone());
     }
 
-    debug_log(&format!("Extracted pathspecs: {:?}", pathspecs));
+    tracing::debug!("Extracted pathspecs: {:?}", pathspecs);
     pathspecs
 }
 
@@ -417,7 +503,7 @@ fn delete_working_log_for_files(
         return Ok(());
     }
 
-    let working_log = repo.storage.working_log_for_base_commit(base_commit);
+    let working_log = repo.storage.working_log_for_base_commit(base_commit)?;
 
     // Read current initial attributions
     let mut initial_attrs = working_log.read_initial_attributions();
@@ -425,10 +511,11 @@ fn delete_working_log_for_files(
     // Remove entries for the specified files
     for file in files {
         initial_attrs.files.remove(file);
+        initial_attrs.file_blobs.remove(file);
     }
 
     // Write back the modified attributions
-    working_log.write_initial_attributions(initial_attrs.files, initial_attrs.prompts)?;
+    working_log.write_initial(initial_attrs)?;
 
     // Note: We're not modifying checkpoints here as they're historical records
     // The files were stashed, so we just remove them from the initial attributions

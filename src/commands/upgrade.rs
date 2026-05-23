@@ -16,6 +16,37 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+type WindowsHandle = *mut std::ffi::c_void;
+#[cfg(windows)]
+const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: WindowsHandle = (-1isize) as WindowsHandle;
+#[cfg(windows)]
+const WINDOWS_MAX_PATH: usize = 260;
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessEntry32W {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_process_id: u32,
+    th32_default_heap_id: usize,
+    th32_module_id: u32,
+    cnt_threads: u32,
+    th32_parent_process_id: u32,
+    pc_pri_class_base: i32,
+    dw_flags: u32,
+    sz_exe_file: [u16; WINDOWS_MAX_PATH],
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> WindowsHandle;
+    fn Process32FirstW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
+    fn CloseHandle(handle: WindowsHandle) -> i32;
+}
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
@@ -124,6 +155,115 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+#[cfg(windows)]
+fn exit_if_invoked_via_git_extension() {
+    if should_block_git_extension_upgrade(
+        parent_process_name().as_deref(),
+        std::env::var(ENV_BACKGROUND_UPGRADE_WORKER).as_deref() == Ok("1"),
+    ) {
+        eprintln!(
+            "error: `git ai upgrade` is not supported on Windows. Run `git-ai upgrade` instead."
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+fn should_block_git_extension_upgrade(
+    parent_process_name: Option<&str>,
+    is_background_worker: bool,
+) -> bool {
+    !is_background_worker && parent_process_name.is_some_and(is_git_process_name)
+}
+
+#[cfg(windows)]
+fn is_git_process_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| {
+            file_name.eq_ignore_ascii_case("git") || file_name.eq_ignore_ascii_case("git.exe")
+        })
+}
+
+#[cfg(windows)]
+fn parent_process_name() -> Option<String> {
+    struct SnapshotGuard(WindowsHandle);
+
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let _snapshot_guard = SnapshotGuard(snapshot);
+
+    let current_pid = std::process::id();
+    let parent_pid = find_parent_pid(snapshot, current_pid)?;
+    process_name_for_pid(snapshot, parent_pid)
+}
+
+#[cfg(windows)]
+fn find_parent_pid(snapshot: WindowsHandle, current_pid: u32) -> Option<u32> {
+    let mut entry = windows_process_entry_template();
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        return None;
+    }
+
+    loop {
+        if entry.th32_process_id == current_pid {
+            return Some(entry.th32_parent_process_id);
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            return None;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_name_for_pid(snapshot: WindowsHandle, pid: u32) -> Option<String> {
+    let mut entry = windows_process_entry_template();
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        return None;
+    }
+
+    loop {
+        if entry.th32_process_id == pid {
+            let len = entry
+                .sz_exe_file
+                .iter()
+                .position(|&ch| ch == 0)
+                .unwrap_or(entry.sz_exe_file.len());
+            return Some(String::from_utf16_lossy(&entry.sz_exe_file[..len]));
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            return None;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_entry_template() -> ProcessEntry32W {
+    ProcessEntry32W {
+        dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+        cnt_usage: 0,
+        th32_process_id: 0,
+        th32_default_heap_id: 0,
+        th32_module_id: 0,
+        cnt_threads: 0,
+        th32_parent_process_id: 0,
+        pc_pri_class_base: 0,
+        dw_flags: 0,
+        sz_exe_file: [0; WINDOWS_MAX_PATH],
+    }
+}
+
 fn should_check_for_updates(channel: UpdateChannel, cache: Option<&UpdateCache>) -> bool {
     let now = current_timestamp();
     match cache {
@@ -218,10 +358,10 @@ fn fetch_and_verify_checksums(
 ) -> Result<HashMap<String, String>, String> {
     let endpoint = format!("/worker/releases/{}/download/SHA256SUMS", channel);
 
-    let response = ApiContext::http_get(&format!("{}{}", api_base_url, endpoint))
-        .with_timeout(30)
-        .send()
-        .map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
+    let (_agent, request) =
+        ApiContext::http_get(&format!("{}{}", api_base_url, endpoint), Some(30));
+    let response =
+        crate::http::send(request).map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
 
     if response.status_code != 200 {
         return Err(format!(
@@ -258,9 +398,9 @@ fn fetch_and_verify_install_script(
 
     let endpoint = format!("/worker/releases/{}/download/{}", channel, script_name);
 
-    let response = ApiContext::http_get(&format!("{}{}", api_base_url, endpoint))
-        .with_timeout(30)
-        .send()
+    let (_agent, request) =
+        ApiContext::http_get(&format!("{}{}", api_base_url, endpoint), Some(30));
+    let response = crate::http::send(request)
         .map_err(|e| format!("Failed to fetch {}: {}", script_name, e))?;
 
     if response.status_code != 200 {
@@ -351,6 +491,13 @@ fn try_mock_releases(base: &str, channel: UpdateChannel) -> Option<Result<Channe
 fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
+        if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() {
+            // Best effort: stop the daemon before we hand off to the detached installer.
+            // The install script also has a fallback kill path so old released binaries
+            // can still recover, but stopping here makes upgrades complete sooner.
+            let _ = crate::commands::daemon::stop_daemon(&daemon_config, Duration::from_secs(10));
+        }
+
         // On Windows, we need to run the installer detached because the current git-ai
         // binary and shims are in use and need to be replaced. The installer will wait
         // for the files to be released before proceeding.
@@ -428,7 +575,7 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
                     );
                     println!("Check the log file for progress: {}", log_path_str);
                     println!(
-                        "The upgrade should complete shortly as long as there are no long-running git or git-ai processes in the background."
+                        "The installer will stop lingering git-ai background processes if needed, but active git commands can still delay completion."
                     );
                 }
                 Ok(())
@@ -492,6 +639,9 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
 }
 
 pub fn run_with_args(args: &[String]) {
+    #[cfg(windows)]
+    exit_if_invoked_via_git_extension();
+
     let mut force = false;
     let mut background = false;
 
@@ -726,6 +876,144 @@ fn spawn_background_upgrade_process() -> bool {
     )
 }
 
+/// Result of checking whether a daemon-initiated update is available.
+#[derive(Debug, PartialEq)]
+pub enum DaemonUpdateCheckResult {
+    /// No update is needed (already latest, checks disabled, or not yet time to check).
+    NoUpdate,
+    /// An update is available and auto-updates are enabled.
+    UpdateReady,
+}
+
+/// Install a previously-detected update.
+///
+/// Designed for use by the daemon process **after** a clean shutdown.  Reads
+/// the on-disk update cache (written earlier by `check_for_update_available`)
+/// to decide whether an update is pending, bypassing the 24-hour time guard.
+/// Uses `Config::fresh()` (not the `OnceLock` singleton) so the daemon
+/// respects runtime config changes (e.g. disabling auto-updates).
+///
+/// Returns `Ok(UpdateReady)` if the install script ran, `Ok(NoUpdate)` if
+/// no pending update was found or updates are disabled.
+pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult, String> {
+    let config = config::Config::fresh();
+    if config.version_checks_disabled() || config.auto_updates_disabled() {
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    let channel = config.update_channel();
+    let api_base_url = config.api_base_url();
+
+    // Read the cache that check_for_update_available() populated earlier.
+    // We intentionally skip should_check_for_updates() here because the
+    // hourly check loop already confirmed an update is available and
+    // persisted that fact — re-checking the 24h guard would always say
+    // "too soon" and the install would never run.
+    let cache = read_update_cache();
+    let has_pending_update = cache
+        .as_ref()
+        .is_some_and(|c| c.matches_channel(channel) && c.update_available());
+
+    if !has_pending_update {
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    // Re-fetch the release to get the tag needed for the installer.
+    let release = fetch_release_for_channel(api_base_url, channel)?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let action = determine_action(false, &release, current_version);
+
+    if action != UpgradeAction::UpgradeAvailable {
+        // Cache was stale or version changed between check and install.
+        persist_update_state(channel, None);
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    log_message(
+        "daemon_installing_update",
+        "info",
+        Some(serde_json::json!({
+            "current_version": current_version,
+            "release_tag": release.tag,
+            "api_base_url": api_base_url,
+            "channel": channel.as_str()
+        })),
+    );
+
+    // Fetch, verify, and run the install script silently.
+    let checksums = fetch_and_verify_checksums(api_base_url, channel.as_str(), &release.checksum)?;
+    let script_content =
+        fetch_and_verify_install_script(api_base_url, channel.as_str(), &checksums)?;
+    run_install_script(&script_content, &release.tag, true)?;
+
+    // Clear the cached update now that we've installed it.
+    persist_update_state(channel, None);
+
+    log_message(
+        "daemon_upgraded",
+        "info",
+        Some(serde_json::json!({
+            "release_tag": release.tag,
+            "current_version": current_version,
+            "api_base_url": api_base_url,
+            "channel": channel.as_str()
+        })),
+    );
+
+    Ok(DaemonUpdateCheckResult::UpdateReady)
+}
+
+/// Check whether a newer version is available without installing it.
+///
+/// Like `check_and_install_update_if_available` but only queries the releases API
+/// and updates the local cache. Returns `DaemonUpdateCheckResult::UpdateReady` when
+/// the channel has a newer version than the running binary.
+pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
+    let config = config::Config::fresh();
+    if config.version_checks_disabled() {
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    let channel = config.update_channel();
+    let api_base_url = config.api_base_url();
+    let cache = read_update_cache();
+
+    if !should_check_for_updates(channel, cache.as_ref()) {
+        // Even if it's not time to re-check, an earlier check may have found an update.
+        if let Some(ref c) = cache
+            && c.matches_channel(channel)
+            && c.update_available()
+            && !config.auto_updates_disabled()
+        {
+            return Ok(DaemonUpdateCheckResult::UpdateReady);
+        }
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    let release = fetch_release_for_channel(api_base_url, channel)?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let action = determine_action(false, &release, current_version);
+    let cache_release = matches!(action, UpgradeAction::UpgradeAvailable);
+    persist_update_state(channel, cache_release.then_some(&release));
+
+    log_message(
+        "checked_for_update",
+        "info",
+        Some(serde_json::json!({
+            "current_version": current_version,
+            "api_base_url": api_base_url,
+            "channel": channel.as_str(),
+            "result": action.to_string()
+        })),
+    );
+
+    if action == UpgradeAction::UpgradeAvailable && !config.auto_updates_disabled() {
+        Ok(DaemonUpdateCheckResult::UpdateReady)
+    } else {
+        Ok(DaemonUpdateCheckResult::NoUpdate)
+    }
+}
+
 fn is_newer_version(latest: &str, current: &str) -> bool {
     let parse_version =
         |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse::<u32>().ok()).collect() };
@@ -750,6 +1038,7 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn set_test_cache_dir(dir: &tempfile::TempDir) {
         unsafe {
@@ -761,6 +1050,32 @@ mod tests {
         unsafe {
             std::env::remove_var("GIT_AI_TEST_CACHE_DIR");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_git_process_name() {
+        assert!(is_git_process_name("git"));
+        assert!(is_git_process_name("git.exe"));
+        assert!(is_git_process_name(r"C:\Program Files\Git\cmd\git.exe"));
+        assert!(!is_git_process_name("git-ai.exe"));
+        assert!(!is_git_process_name("powershell.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_should_block_git_extension_upgrade() {
+        assert!(should_block_git_extension_upgrade(Some("git.exe"), false));
+        assert!(should_block_git_extension_upgrade(
+            Some(r"C:\Program Files\Git\cmd\git.exe"),
+            false
+        ));
+        assert!(!should_block_git_extension_upgrade(Some("git.exe"), true));
+        assert!(!should_block_git_extension_upgrade(
+            Some("powershell.exe"),
+            false
+        ));
+        assert!(!should_block_git_extension_upgrade(None, false));
     }
 
     #[test]
@@ -798,6 +1113,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_run_impl_with_url() {
         let temp_dir = tempfile::tempdir().unwrap();
         set_test_cache_dir(&temp_dir);
@@ -868,6 +1184,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_run_impl_with_url_enterprise_channels() {
         let temp_dir = tempfile::tempdir().unwrap();
         set_test_cache_dir(&temp_dir);
@@ -1379,5 +1696,88 @@ mod tests {
         assert!(cache.available_semver.is_none());
         assert_eq!(cache.channel, "latest");
         assert!(cache.last_checked_at > 0);
+    }
+
+    #[test]
+    fn test_daemon_update_check_result_debug() {
+        // Verify that DaemonUpdateCheckResult derives Debug and PartialEq correctly.
+        assert_eq!(
+            DaemonUpdateCheckResult::NoUpdate,
+            DaemonUpdateCheckResult::NoUpdate
+        );
+        assert_eq!(
+            DaemonUpdateCheckResult::UpdateReady,
+            DaemonUpdateCheckResult::UpdateReady
+        );
+        assert_ne!(
+            DaemonUpdateCheckResult::NoUpdate,
+            DaemonUpdateCheckResult::UpdateReady
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_for_update_available_no_cache_newer_version() {
+        // When the cache is empty and a newer version is available, the function should
+        // report UpdateReady (assuming version checks and auto-updates are enabled,
+        // which is the default in debug/test builds).
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+
+        let test_checksum = "a".repeat(64);
+        let mock_payload = format!(
+            r#"{{"channels":{{"latest":{{"version":"v999.0.0","checksum":"{}"}}}}}}"#,
+            test_checksum
+        );
+        // check_for_update_available uses Config::fresh() which reads the real config,
+        // but fetch_release_for_channel respects mock:// URLs only in tests.
+        // We can't easily inject a mock URL into Config::fresh(), so we test the
+        // underlying building blocks instead:
+        let release =
+            fetch_release_for_channel(&format!("mock://{}", mock_payload), UpdateChannel::Latest)
+                .unwrap();
+        let action = determine_action(false, &release, env!("CARGO_PKG_VERSION"));
+        assert_eq!(action, UpgradeAction::UpgradeAvailable);
+
+        // Persist and verify the cache reflects the available update.
+        persist_update_state(UpdateChannel::Latest, Some(&release));
+        let cache = read_update_cache().unwrap();
+        assert!(cache.update_available());
+        assert_eq!(cache.available_semver.as_deref(), Some("999.0.0"));
+
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    fn test_check_for_update_available_same_version() {
+        let current = env!("CARGO_PKG_VERSION");
+        let test_checksum = "a".repeat(64);
+        let mock_payload = format!(
+            r#"{{"channels":{{"latest":{{"version":"v{}","checksum":"{}"}}}}}}"#,
+            current, test_checksum
+        );
+        let release =
+            fetch_release_for_channel(&format!("mock://{}", mock_payload), UpdateChannel::Latest)
+                .unwrap();
+        let action = determine_action(false, &release, current);
+        assert_eq!(action, UpgradeAction::AlreadyLatest);
+
+        // When the action is AlreadyLatest, persist_update_state is called with None.
+        // Verify that such a cache does NOT mark an update as available.
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.last_checked_at = current_timestamp();
+        // No available_tag/semver set — mirrors what persist_update_state(channel, None) does.
+        assert!(!cache.update_available());
+    }
+
+    #[test]
+    fn test_should_check_for_updates_skips_when_recently_checked() {
+        // When the cache was recently written, should_check_for_updates returns false.
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.last_checked_at = current_timestamp();
+        assert!(!should_check_for_updates(
+            UpdateChannel::Latest,
+            Some(&cache)
+        ));
     }
 }

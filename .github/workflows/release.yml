@@ -28,32 +28,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            artifact_name: git-ai-linux-x64
-            use_docker: true
-            docker_image: ubuntu:20.04
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact_name: git-ai-linux-arm64
-            use_docker: true
-            docker_image: ubuntu:20.04
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: git-ai-windows-x64
             use_docker: false
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            artifact_name: git-ai-windows-arm64
-            use_docker: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: git-ai-macos-arm64
-            use_docker: false
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Get version from Cargo.toml
         id: get-version
@@ -75,7 +57,7 @@ jobs:
             ${{ matrix.docker_image }} \
             bash -c "
               apt-get update && \
-              apt-get install -y curl build-essential pkg-config libssl-dev && \
+              apt-get install -y curl build-essential pkg-config musl-tools && \
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }} && \
               . \$HOME/.cargo/env && \
               cargo build --release --target ${{ matrix.target }} && \
@@ -125,9 +107,14 @@ jobs:
         if: contains(matrix.os, 'ubuntu')
         run: |
           file target/${{ matrix.target }}/release/git-ai
-          ldd target/${{ matrix.target }}/release/git-ai || true
-          echo "Required GLIBC version:"
-          objdump -T target/${{ matrix.target }}/release/git-ai | grep GLIBC | sed 's/.*GLIBC_/GLIBC_/' | sort -V | uniq | tail -1
+          # Verify the binary is statically linked (musl)
+          if ldd target/${{ matrix.target }}/release/git-ai 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            echo "Binary is statically linked (musl) - no GLIBC dependency"
+          else
+            echo "::error::Binary is dynamically linked - expected static musl binary"
+            ldd target/${{ matrix.target }}/release/git-ai || true
+            exit 1
+          fi
 
       - name: Verify binary architecture (Windows)
         if: contains(matrix.os, 'windows')
@@ -161,7 +148,7 @@ jobs:
 
       - name: Upload artifact (Windows)
         if: contains(matrix.os, 'windows')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact_name }}
           path: release/${{ matrix.artifact_name }}.exe
@@ -169,81 +156,15 @@ jobs:
 
       - name: Upload artifact (non-Windows)
         if: ${{ !contains(matrix.os, 'windows') }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact_name }}
           path: release/${{ matrix.artifact_name }}
           retention-days: 30
 
-  build-macos-intel:
-    name: Build for macOS Intel
-    runs-on: macos-15-intel
-    outputs:
-      version: ${{ steps.get-version.outputs.version }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Get version from Cargo.toml
-        id: get-version
-        shell: bash
-        run: |
-          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
-          echo "version=v$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
-        with:
-          toolchain: stable
-          targets: x86_64-apple-darwin
-
-      - name: Cache dependencies
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-x86_64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-x86_64-apple-darwin-
-
-      - name: Build release binary
-        run: |
-          cargo build --release --target x86_64-apple-darwin
-        env:
-          CARGO_INCREMENTAL: 0
-          SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
-          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-          OSS_BUILD: "1"
-
-      - name: Verify binary architecture
-        run: |
-          file target/x86_64-apple-darwin/release/git-ai
-          lipo -info target/x86_64-apple-darwin/release/git-ai
-
-      - name: Strip binary
-        run: |
-          strip target/x86_64-apple-darwin/release/git-ai
-
-      - name: Create release directory
-        run: |
-          mkdir -p release
-
-      - name: Copy binary to release directory
-        run: |
-          cp target/x86_64-apple-darwin/release/git-ai release/git-ai-macos-x64
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: git-ai-macos-x64
-          path: release/git-ai-macos-x64
-          retention-days: 30
-
   create-release:
     name: Create Release
-    needs: [build, build-macos-intel]
+    needs: [build]
     runs-on: ubuntu-latest
     if: success() && inputs.dry_run != true
 
@@ -301,7 +222,7 @@ jobs:
           fi
 
       - name: Checkout code for install script
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: repo
 
@@ -349,7 +270,7 @@ jobs:
           sha256sum install.sh install.ps1 >> SHA256SUMS
 
       - name: Generate attestations for release artifacts
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
             release/git-ai-*
@@ -358,7 +279,7 @@ jobs:
             release/SHA256SUMS
 
       - name: Create Release
-        uses: softprops/action-gh-release@26e8ad27a09a225049a7075d7ec1caa2df6ff332 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ steps.release-meta.outputs.tag_name }}
           name: ${{ steps.release-meta.outputs.release_name }}
@@ -378,23 +299,13 @@ jobs:
             ### Installation
             Install this specific version with checksum verification:
 
-            **macOS/Linux:**
-            ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.sh | bash
-            ```
-
             **Windows (PowerShell):**
             ```powershell
             irm https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.ps1 | iex
             ```
 
             ### Downloads
-            - **Linux (x64)**: `git-ai-linux-x64`
-            - **Linux (ARM64)**: `git-ai-linux-arm64`
             - **Windows (x64)**: `git-ai-windows-x64.exe`
-            - **Windows (ARM64)**: `git-ai-windows-arm64.exe`
-            - **macOS (Intel)**: `git-ai-macos-x64`
-            - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
 
             ### SHA256 Checksums
             ```
@@ -419,7 +330,7 @@ jobs:
 
       - name: Checkout code for version bump
         if: inputs.release_production == true
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -473,7 +384,7 @@ jobs:
           curl -X POST \
             -H "Authorization: token ${{ secrets.RELEASE_CHANNEL_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/git-ai-project/monorepo/actions/workflows/update-release-version.yaml/dispatches \
+            https://api.github.com/repos/next-element-inc/monorepo/actions/workflows/update-release-version.yaml/dispatches \
             -d '{
               "ref": "dev",
               "inputs": {

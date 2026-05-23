@@ -7,7 +7,6 @@ use crate::git::cli_parser::{ParsedGitInvocation, is_dry_run};
 use crate::git::repository::{Repository, exec_git, find_repository};
 use crate::git::rewrite_log::RewriteLogEvent;
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
-use crate::utils::debug_log;
 
 pub fn fetch_pull_pre_command_hook(
     parsed_args: &ParsedGitInvocation,
@@ -26,7 +25,7 @@ pub fn fetch_pull_pre_command_hook(
     let remote = match fetch_remote_from_args(repository, parsed_args) {
         Ok(remote) => remote,
         Err(_) => {
-            debug_log("failed to extract remote for authorship fetch; skipping");
+            tracing::debug!("failed to extract remote for authorship fetch; skipping");
             return None;
         }
     };
@@ -36,17 +35,14 @@ pub fn fetch_pull_pre_command_hook(
 
     // Spawn background thread to fetch authorship notes in parallel with main fetch
     Some(std::thread::spawn(move || {
-        debug_log(&format!(
-            "started fetching authorship notes from remote: {}",
-            remote
-        ));
+        tracing::debug!("started fetching authorship notes from remote: {}", remote);
         // Recreate repository in the background thread
         if let Ok(repo) = find_repository(&global_args) {
             if let Err(e) = fetch_authorship_notes(&repo, &remote) {
-                debug_log(&format!("authorship fetch failed: {}", e));
+                tracing::debug!("authorship fetch failed: {}", e);
             }
         } else {
-            debug_log("failed to open repository for authorship fetch");
+            tracing::debug!("failed to open repository for authorship fetch");
         }
     }))
 }
@@ -70,14 +66,32 @@ pub fn pull_pre_command_hook(
     let config = get_pull_rebase_autostash_config(parsed_args, repository);
     let has_changes = has_uncommitted_changes(repository);
 
-    debug_log(&format!(
+    tracing::debug!(
         "pull pre-hook: rebase={}, autostash={}, has_changes={}",
-        config.is_rebase, config.is_autostash, has_changes
-    ));
+        config.is_rebase,
+        config.is_autostash,
+        has_changes
+    );
+
+    // Write RebaseStart so that `git rebase --continue` (after conflict)
+    // can recover the correct original_head from the rewrite log.
+    // This is needed for daemon/async mode where the post-hook conflict
+    // path does not run. If the pull completes without conflict, the
+    // post-hook writes a RebaseAbort to cancel this speculative event.
+    if config.is_rebase
+        && let Some(head_sha) = repository.head().ok().and_then(|h| h.target().ok())
+    {
+        let start_event = RewriteLogEvent::rebase_start(
+            crate::git::rewrite_log::RebaseStartEvent::new_with_onto(head_sha, false, None),
+        );
+        if let Err(e) = repository.storage.append_rewrite_event(start_event) {
+            tracing::debug!("pull pre-hook: failed to write RebaseStart: {}", e);
+        }
+    }
 
     // Only capture VA if we're in rebase+autostash mode AND have uncommitted changes
     if config.is_rebase && config.is_autostash && has_changes {
-        debug_log(
+        tracing::debug!(
             "Detected pull --rebase --autostash with uncommitted changes, capturing VirtualAttributions",
         );
 
@@ -85,7 +99,7 @@ pub fn pull_pre_command_hook(
         let head_sha = match repository.head().ok().and_then(|h| h.target().ok()) {
             Some(sha) => sha,
             None => {
-                debug_log("Failed to get HEAD for VA capture");
+                tracing::debug!("Failed to get HEAD for VA capture");
                 return;
             }
         };
@@ -99,17 +113,17 @@ pub fn pull_pre_command_hook(
         ) {
             Ok(va) => {
                 if !va.attributions.is_empty() {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Captured VA with {} files for autostash preservation",
                         va.attributions.len()
-                    ));
+                    );
                     command_hooks_context.stashed_va = Some(va);
                 } else {
-                    debug_log("No attributions in working log to preserve");
+                    tracing::debug!("No attributions in working log to preserve");
                 }
             }
             Err(e) => {
-                debug_log(&format!("Failed to build VirtualAttributions: {}", e));
+                tracing::debug!("Failed to build VirtualAttributions: {}", e);
             }
         }
     }
@@ -144,25 +158,73 @@ pub fn pull_post_command_hook(
         let _ = handle.join();
     }
 
+    // Check if this was a rebase pull so we can clean up the speculative
+    // RebaseStart written in the pre-hook when it is not needed.
+    let config = get_pull_rebase_autostash_config(parsed_args, repository);
+
     if !exit_status.success() {
-        debug_log("Pull failed, skipping post-pull authorship restoration");
+        // If pull --rebase hit a conflict, a rebase is paused. The pre-hook
+        // already wrote a speculative RebaseStart; cancel it first, then write
+        // a new one carrying the resolved onto_head so `git rebase --continue`
+        // has full info.
+        let rebase_dir = repository.path().join("rebase-merge");
+        let rebase_apply_dir = repository.path().join("rebase-apply");
+        if config.is_rebase
+            && (rebase_dir.exists() || rebase_apply_dir.exists())
+            && let Some(original_head) = &repository.pre_command_base_commit
+        {
+            // Cancel the speculative RebaseStart so we don't end up with two
+            // consecutive RebaseStart events (find_rebase_start_event would
+            // return the stale one with onto_head=None).
+            cancel_speculative_rebase_start(repository);
+            tracing::debug!(
+                "Pull --rebase paused (conflict); logging RebaseStart with original_head={}",
+                original_head
+            );
+            let onto_head = resolve_pull_rebase_onto_head(repository);
+            let start_event = RewriteLogEvent::rebase_start(
+                crate::git::rewrite_log::RebaseStartEvent::new_with_onto(
+                    original_head.clone(),
+                    false,
+                    onto_head,
+                ),
+            );
+            let _ = repository.storage.append_rewrite_event(start_event);
+        } else if config.is_rebase {
+            // Pull --rebase failed but no conflict dir exists (e.g. network
+            // error). Cancel the speculative RebaseStart from the pre-hook.
+            cancel_speculative_rebase_start(repository);
+        }
         return;
     }
 
     // Get old HEAD from pre-command capture
     let old_head = match &repository.pre_command_base_commit {
         Some(sha) => sha.clone(),
-        None => return,
+        None => {
+            if config.is_rebase {
+                cancel_speculative_rebase_start(repository);
+            }
+            return;
+        }
     };
 
     // Get new HEAD
     let new_head = match repository.head().ok().and_then(|h| h.target().ok()) {
         Some(sha) => sha,
-        None => return,
+        None => {
+            if config.is_rebase {
+                cancel_speculative_rebase_start(repository);
+            }
+            return;
+        }
     };
 
     if old_head == new_head {
-        debug_log("HEAD unchanged, skipping post-pull authorship handling");
+        tracing::debug!("HEAD unchanged, skipping post-pull authorship handling");
+        if config.is_rebase {
+            cancel_speculative_rebase_start(repository);
+        }
         return;
     }
 
@@ -171,18 +233,21 @@ pub fn pull_post_command_hook(
         restore_stashed_va(repository, &old_head, &new_head, stashed_va);
     }
 
+    // The pull succeeded — the speculative RebaseStart from the pre-hook
+    // is no longer needed (process_completed_pull_rebase writes its own
+    // RebaseComplete, and non-rebase / ff paths don't need it at all).
+    if config.is_rebase {
+        cancel_speculative_rebase_start(repository);
+    }
+
     // Check for fast-forward pull and rename working log if applicable
     if was_fast_forward_pull(repository, &new_head) {
-        debug_log(&format!(
-            "Fast-forward detected: {} -> {}",
-            old_head, new_head
-        ));
+        tracing::debug!("Fast-forward detected: {} -> {}", old_head, new_head);
         let _ = repository.storage.rename_working_log(&old_head, &new_head);
         return;
     }
 
     // Handle committed authorship rewriting for pull --rebase
-    let config = get_pull_rebase_autostash_config(parsed_args, repository);
     if config.is_rebase {
         process_completed_pull_rebase(repository, &old_head, &new_head);
     }
@@ -215,10 +280,11 @@ fn was_fast_forward_pull(repository: &Repository, expected_new_head: &str) -> bo
 
             // Verify the SHA matches our expected new HEAD
             if sha != expected_new_head {
-                debug_log(&format!(
+                tracing::debug!(
                     "Reflog SHA {} doesn't match expected HEAD {}",
-                    sha, expected_new_head
-                ));
+                    sha,
+                    expected_new_head
+                );
                 return false;
             }
 
@@ -309,10 +375,11 @@ fn has_uncommitted_changes(repository: &Repository) -> bool {
 /// Rewrite authorship for committed local changes that were rebased by `git pull --rebase`.
 /// Uses the same commit-mapping and rewrite logic as `rebase_hooks::process_completed_rebase`.
 fn process_completed_pull_rebase(repository: &mut Repository, original_head: &str, new_head: &str) {
-    debug_log(&format!(
+    tracing::debug!(
         "Processing pull --rebase authorship: {} -> {}",
-        original_head, new_head
-    ));
+        original_head,
+        new_head
+    );
 
     let onto_head = resolve_pull_rebase_onto_head(repository);
     let (original_commits, new_commits) = match build_rebase_commit_mappings(
@@ -322,25 +389,25 @@ fn process_completed_pull_rebase(repository: &mut Repository, original_head: &st
         onto_head.as_deref(),
     ) {
         Ok(mappings) => {
-            debug_log(&format!(
+            tracing::debug!(
                 "Pull rebase mappings: {} original -> {} new commits",
                 mappings.0.len(),
                 mappings.1.len()
-            ));
+            );
             mappings
         }
         Err(e) => {
-            debug_log(&format!("Failed to build pull rebase mappings: {}", e));
+            tracing::debug!("Failed to build pull rebase mappings: {}", e);
             return;
         }
     };
 
     if original_commits.is_empty() {
-        debug_log("No committed changes to rewrite authorship for after pull --rebase");
+        tracing::debug!("No committed changes to rewrite authorship for after pull --rebase");
         return;
     }
     if new_commits.is_empty() {
-        debug_log("No newly rebased commits to rewrite authorship for after pull --rebase");
+        tracing::debug!("No newly rebased commits to rewrite authorship for after pull --rebase");
         return;
     }
 
@@ -361,7 +428,20 @@ fn process_completed_pull_rebase(repository: &mut Repository, original_head: &st
         true,  // save to log
     );
 
-    debug_log("Pull --rebase authorship rewrite complete");
+    tracing::debug!("Pull --rebase authorship rewrite complete");
+}
+
+/// Cancel the speculative `RebaseStart` written by the pre-hook by appending
+/// a `RebaseAbort` event.  This prevents a stale start from corrupting the
+/// next standalone `git rebase` operation.
+fn cancel_speculative_rebase_start(repository: &Repository) {
+    if let Some(original_head) = &repository.pre_command_base_commit {
+        tracing::debug!("pull post-hook: cancelling speculative RebaseStart (no conflict)");
+        let abort_event = RewriteLogEvent::rebase_abort(
+            crate::git::rewrite_log::RebaseAbortEvent::new(original_head.clone()),
+        );
+        let _ = repository.storage.append_rewrite_event(abort_event);
+    }
 }
 
 fn resolve_pull_rebase_onto_head(repository: &Repository) -> Option<String> {

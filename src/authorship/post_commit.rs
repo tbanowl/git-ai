@@ -3,7 +3,9 @@ use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::{
     build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::prompt_utils::{PromptUpdateResult, update_prompt_from_tool};
+use crate::authorship::prompt_utils::{
+    PromptUpdateResult, find_prompt_with_db_fallback, update_prompt_from_tool,
+};
 use crate::authorship::secrets::{redact_secrets_from_prompts, strip_prompt_messages};
 use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
@@ -12,7 +14,6 @@ use crate::config::{Config, PromptStorageMode};
 use crate::error::GitAiError;
 use crate::git::refs::notes_add;
 use crate::git::repository::Repository;
-use crate::utils::debug_log;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
@@ -23,12 +24,18 @@ const STATS_SKIP_MAX_HUNKS: usize = 1000;
 const STATS_SKIP_MAX_ADDED_LINES: usize = 6000;
 /// Skip expensive stats for extremely wide commits touching many added-line files.
 const STATS_SKIP_MAX_FILES_WITH_ADDITIONS: usize = 200;
+/// Skip expensive stats for commits that delete a large number of lines.
+/// Deletion-heavy commits (e.g. removing many files) trigger the same expensive
+/// diff-parsing path as large addition commits, but the added-lines estimate is
+/// near zero, so the cost was previously invisible to the estimator.
+const STATS_SKIP_MAX_DELETED_LINES: usize = 6000;
 
 #[derive(Debug, Clone, Copy)]
 struct StatsCostEstimate {
     files_with_additions: usize,
     added_lines: usize,
     hunk_ranges: usize,
+    deleted_lines: usize,
 }
 
 fn checkpoint_entry_requires_post_processing(
@@ -56,33 +63,45 @@ pub fn post_commit(
     human_author: String,
     supress_output: bool,
 ) -> Result<(String, AuthorshipLog), GitAiError> {
+    post_commit_with_final_state(
+        repo,
+        base_commit,
+        commit_sha,
+        human_author,
+        supress_output,
+        None,
+    )
+}
+
+pub fn post_commit_with_final_state(
+    repo: &Repository,
+    base_commit: Option<String>,
+    commit_sha: String,
+    human_author: String,
+    supress_output: bool,
+    final_state_override: Option<&HashMap<String, String>>,
+) -> Result<(String, AuthorshipLog), GitAiError> {
     // Use base_commit parameter if provided, otherwise use "initial" for empty repos
     // This matches the convention in checkpoint.rs
     let parent_sha = base_commit.unwrap_or_else(|| "initial".to_string());
 
     // Initialize the new storage system
     let repo_storage = &repo.storage;
-    let working_log = repo_storage.working_log_for_base_commit(&parent_sha);
+    let working_log = repo_storage.working_log_for_base_commit(&parent_sha)?;
 
-    // Pull all working log entries from the parent commit
-
-    let mut parent_working_log = working_log.read_all_checkpoints()?;
-
-    // debug_log(&format!(
-    //     "edited files: {:?}",
-    //     parent_working_log.edited_files
-    // ));
-
-    // Update prompts/transcripts to their latest versions and persist to disk
-    // Do this BEFORE filtering so that all checkpoints (including untracked files) are updated
-    update_prompts_to_latest(&mut parent_working_log)?;
+    // Refresh prompts/transcripts under the same checkpoints lock used by append_checkpoint so
+    // concurrent checkpoint appends cannot be lost between a read and rewrite of the JSONL file.
+    let parent_working_log = working_log.mutate_all_checkpoints(|checkpoints| {
+        update_prompts_to_latest(checkpoints)?;
+        Ok(())
+    })?;
 
     // Batch upsert all prompts to database after refreshing (non-fatal if it fails)
     if let Err(e) = batch_upsert_prompts_to_db(&parent_working_log, &working_log, &commit_sha) {
-        debug_log(&format!(
+        tracing::debug!(
             "[Warning] Failed to batch upsert prompts to database: {}",
             e
-        ));
+        );
         crate::observability::log_error(
             &e,
             Some(serde_json::json!({
@@ -91,17 +110,6 @@ pub fn post_commit(
             })),
         );
     }
-
-    working_log.write_all_checkpoints(&parent_working_log)?;
-
-    // Create VirtualAttributions from working log (fast path - no blame)
-    // We don't need to run blame because we only care about the working log data
-    // that was accumulated since the parent commit
-    let working_va = VirtualAttributions::from_just_working_log(
-        repo.clone(),
-        parent_sha.clone(),
-        Some(human_author.clone()),
-    )?;
 
     // Build pathspecs from AI-relevant checkpoint entries only.
     // Human-only entries with no AI attribution do not affect authorship output and should not
@@ -123,28 +131,107 @@ pub fn post_commit(
         pathspecs.insert(file_path.clone());
     }
 
-    // Split VirtualAttributions into committed (authorship log) and uncommitted (INITIAL)
+    let working_log_pathspecs = pathspecs.clone();
+
+    // Files changed without an explicit checkpoint still need post-processing: a
+    // human can make a non-substantive formatting edit to previously committed AI
+    // lines, and the base-commit blame is the only source that can preserve that
+    // attribution through the new commit.
+    let mut whitespace_only_uncheckpointed_pathspecs: HashSet<String> = HashSet::new();
+    if let Ok(changed_files) = repo.diff_changed_files(&parent_sha, &commit_sha) {
+        for file_path in changed_files {
+            if !working_log_pathspecs.contains(&file_path) {
+                match repo.diff_has_changes_ignoring_whitespace(
+                    &parent_sha,
+                    &commit_sha,
+                    &file_path,
+                ) {
+                    Ok(false) => {
+                        whitespace_only_uncheckpointed_pathspecs.insert(file_path.clone());
+                    }
+                    Ok(true) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to check whitespace-only diff for {}: {}",
+                            file_path,
+                            e
+                        );
+                    }
+                }
+            }
+            pathspecs.insert(file_path);
+        }
+    }
+
+    let working_va = if whitespace_only_uncheckpointed_pathspecs.is_empty() {
+        if let Some(snapshot) = final_state_override {
+            VirtualAttributions::from_working_log_snapshot(
+                repo.clone(),
+                parent_sha.clone(),
+                Some(human_author.clone()),
+                snapshot,
+            )?
+        } else {
+            VirtualAttributions::from_just_working_log(
+                repo.clone(),
+                parent_sha.clone(),
+                Some(human_author.clone()),
+            )?
+        }
+    } else {
+        let mut blame_backed_pathspecs = working_log_pathspecs.clone();
+        blame_backed_pathspecs.extend(whitespace_only_uncheckpointed_pathspecs);
+        let mut pathspec_vec: Vec<String> = blame_backed_pathspecs.into_iter().collect();
+        pathspec_vec.sort();
+
+        if let Some(snapshot) = final_state_override {
+            smol::block_on(VirtualAttributions::from_working_log_for_commit_snapshot(
+                repo.clone(),
+                parent_sha.clone(),
+                &pathspec_vec,
+                Some(human_author.clone()),
+                None,
+                snapshot,
+            ))?
+        } else {
+            smol::block_on(VirtualAttributions::from_working_log_for_commit(
+                repo.clone(),
+                parent_sha.clone(),
+                &pathspec_vec,
+                Some(human_author.clone()),
+                None,
+            ))?
+        }
+    };
+
     let (mut authorship_log, initial_attributions) = working_va
         .to_authorship_log_and_initial_working_log(
             repo,
             &parent_sha,
             &commit_sha,
             Some(&pathspecs),
+            final_state_override,
         )?;
 
     authorship_log.metadata.base_commit_sha = commit_sha.clone();
+    hydrate_missing_prompt_metadata(repo, &mut authorship_log);
 
-    // Inject custom attributes into all PromptRecords
-    let custom_attrs = Config::get().custom_attributes();
+    // Long-lived daemon processes should read a fresh config snapshot.
+    // Always use Config::fresh() to support runtime config updates
+    // (especially important for daemon mode, but also good for consistency)
+    let config = Config::fresh();
+    let (effective_storage, using_custom_api, custom_attrs) = (
+        config.effective_prompt_storage(&Some(repo.clone())),
+        config.api_base_url() != crate::config::DEFAULT_API_BASE_URL,
+        config.custom_attributes().clone(),
+    );
+
+    // Inject custom attributes into all PromptRecords.
     if !custom_attrs.is_empty() {
         for pr in authorship_log.metadata.prompts.values_mut() {
             pr.custom_attributes = Some(custom_attrs.clone());
         }
     }
-
-    // Handle prompts based on effective prompt storage mode for this repository
-    // The effective mode considers include/exclude lists and fallback settings
-    let effective_storage = Config::get().effective_prompt_storage(&Some(repo.clone()));
 
     match effective_storage {
         PromptStorageMode::Local => {
@@ -155,7 +242,7 @@ pub fn post_commit(
             // Store in notes: redact secrets but keep messages in notes
             let count = redact_secrets_from_prompts(&mut authorship_log.metadata.prompts);
             if count > 0 {
-                debug_log(&format!("Redacted {} secrets from prompts", count));
+                tracing::debug!("Redacted {} secrets from prompts", count);
             }
         }
         PromptStorageMode::Default => {
@@ -164,8 +251,6 @@ pub fn post_commit(
             // - user is logged in OR has API key OR using custom API URL
             let context = ApiContext::new(None);
             let client = ApiClient::new(context);
-            let using_custom_api =
-                Config::get().api_base_url() != crate::config::DEFAULT_API_BASE_URL;
             let should_enqueue_cas =
                 client.is_logged_in() || client.has_api_key() || using_custom_api;
 
@@ -174,19 +259,16 @@ pub fn post_commit(
                 let redaction_count =
                     redact_secrets_from_prompts(&mut authorship_log.metadata.prompts);
                 if redaction_count > 0 {
-                    debug_log(&format!(
+                    tracing::debug!(
                         "Redacted {} secrets from prompts before CAS upload",
                         redaction_count
-                    ));
+                    );
                 }
 
                 if let Err(e) =
                     enqueue_prompt_messages_to_cas(repo, &mut authorship_log.metadata.prompts)
                 {
-                    debug_log(&format!(
-                        "[Warning] Failed to enqueue prompt messages to CAS: {}",
-                        e
-                    ));
+                    tracing::debug!("[Warning] Failed to enqueue prompt messages to CAS: {}", e);
                     // Enqueue failed - still strip messages (never keep in notes for "default")
                     strip_prompt_messages(&mut authorship_log.metadata.prompts);
                 }
@@ -243,19 +325,17 @@ pub fn post_commit(
     } else {
         match skip_reason.as_ref() {
             Some(StatsSkipReason::MergeCommit) => {
-                debug_log(&format!(
-                    "Skipping post-commit stats for merge commit {}",
-                    commit_sha
-                ));
+                tracing::debug!("Skipping post-commit stats for merge commit {}", commit_sha);
             }
             Some(StatsSkipReason::Expensive(estimate)) => {
-                debug_log(&format!(
-                    "Skipping expensive post-commit stats for {} (files_with_additions={}, added_lines={}, hunks={})",
+                tracing::debug!(
+                    "Skipping expensive post-commit stats for {} (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={})",
                     commit_sha,
                     estimate.files_with_additions,
                     estimate.added_lines,
+                    estimate.deleted_lines,
                     estimate.hunk_ranges
-                ));
+                );
             }
             None => {}
         }
@@ -263,15 +343,21 @@ pub fn post_commit(
 
     // Write INITIAL file for uncommitted AI attributions (if any)
     if !initial_attributions.files.is_empty() {
-        let new_working_log = repo_storage.working_log_for_base_commit(&commit_sha);
-        new_working_log
-            .write_initial_attributions(initial_attributions.files, initial_attributions.prompts)?;
+        let new_working_log = repo_storage.working_log_for_base_commit(&commit_sha)?;
+        let initial_file_contents =
+            working_va.snapshot_contents_for_files(initial_attributions.files.keys());
+        new_working_log.write_initial_attributions_with_contents(
+            initial_attributions.files,
+            initial_attributions.prompts,
+            initial_file_contents,
+        )?;
     }
 
     // // Clean up old working log
     repo_storage.delete_working_log_for_base_commit(&parent_sha)?;
 
-    if !supress_output && !Config::get().is_quiet() {
+    // Use Config::fresh() to support runtime config updates
+    if !supress_output && !Config::fresh().is_quiet() {
         // Only print stats if we're in an interactive terminal and quiet mode is disabled
         let is_interactive = std::io::stdout().is_terminal();
         if let Some(stats) = stats.as_ref() {
@@ -286,9 +372,10 @@ pub fn post_commit(
                 }
                 Some(StatsSkipReason::Expensive(estimate)) => {
                     eprintln!(
-                        "[git-ai] Skipped git-ai stats for large commit (files_with_additions={}, added_lines={}, hunks={}). Run `git-ai stats {}` to compute stats on demand.",
+                        "[git-ai] Skipped git-ai stats for large commit (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={}). Run `git-ai stats {}` to compute stats on demand.",
                         estimate.files_with_additions,
                         estimate.added_lines,
+                        estimate.deleted_lines,
                         estimate.hunk_ranges,
                         commit_sha
                     );
@@ -298,6 +385,36 @@ pub fn post_commit(
         }
     }
     Ok((commit_sha.to_string(), authorship_log))
+}
+
+fn hydrate_missing_prompt_metadata(repo: &Repository, authorship_log: &mut AuthorshipLog) {
+    let missing_prompt_ids: Vec<String> = authorship_log
+        .attestations
+        .iter()
+        .flat_map(|file| file.entries.iter())
+        .map(|entry| entry.hash.clone())
+        .filter(|hash| {
+            !hash.starts_with("h_") && !authorship_log.metadata.prompts.contains_key(hash)
+        })
+        .collect();
+
+    for prompt_id in missing_prompt_ids {
+        match find_prompt_with_db_fallback(&prompt_id, Some(repo)) {
+            Ok((_commit_sha, prompt_record)) => {
+                authorship_log
+                    .metadata
+                    .prompts
+                    .insert(prompt_id, prompt_record);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to hydrate prompt metadata for committed attestation {}: {}",
+                    prompt_id,
+                    error
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +427,42 @@ fn should_skip_expensive_post_commit_stats(estimate: &StatsCostEstimate) -> bool
     estimate.hunk_ranges >= STATS_SKIP_MAX_HUNKS
         || estimate.added_lines >= STATS_SKIP_MAX_ADDED_LINES
         || estimate.files_with_additions >= STATS_SKIP_MAX_FILES_WITH_ADDITIONS
+        || estimate.deleted_lines >= STATS_SKIP_MAX_DELETED_LINES
+}
+
+/// Public result of the stats cost estimate for a commit, used by the async
+/// wrapper path to decide whether to skip expensive stats computation.
+pub struct StatsSkipEstimate {
+    should_skip: bool,
+}
+
+impl StatsSkipEstimate {
+    pub fn should_skip(&self) -> bool {
+        self.should_skip
+    }
+}
+
+/// Estimate whether stats computation for `commit_sha` would be too expensive.
+/// Resolves the parent commit automatically. Intended for callers outside the
+/// normal post-commit flow (e.g. the async wrapper path).
+pub fn estimate_stats_cost_for_head(
+    repo: &Repository,
+    commit_sha: &str,
+    ignore_patterns: &[String],
+) -> Result<StatsSkipEstimate, GitAiError> {
+    let commit = repo.find_commit(commit_sha.to_string())?;
+    let parent_sha = if commit.parent_count().unwrap_or(0) > 0 {
+        commit
+            .parent(0)
+            .map(|p| p.id())
+            .unwrap_or_else(|_| "initial".to_string())
+    } else {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+    };
+    let estimate = estimate_stats_cost(repo, &parent_sha, commit_sha, ignore_patterns)?;
+    Ok(StatsSkipEstimate {
+        should_skip: should_skip_expensive_post_commit_stats(&estimate),
+    })
 }
 
 fn estimate_stats_cost(
@@ -318,7 +471,8 @@ fn estimate_stats_cost(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<StatsCostEstimate, GitAiError> {
-    let mut added_lines_by_file = repo.diff_added_lines(parent_sha, commit_sha, None)?;
+    let (mut added_lines_by_file, total_deleted_lines) =
+        repo.diff_added_lines_with_deleted_count(parent_sha, commit_sha)?;
     let ignore_matcher = build_ignore_matcher(ignore_patterns);
     added_lines_by_file
         .retain(|file_path, _| !should_ignore_file_with_matcher(file_path, &ignore_matcher));
@@ -343,6 +497,7 @@ fn estimate_stats_cost(
         files_with_additions,
         added_lines,
         hunk_ranges,
+        deleted_lines: total_deleted_lines,
     })
 }
 
@@ -525,7 +680,8 @@ fn enqueue_prompt_messages_to_cas(
     }
 
     // Get API base URL for constructing messages_url
-    let api_base_url = Config::get().api_base_url();
+    // Always use Config::fresh() to support runtime config updates
+    let api_base_url = Config::fresh().api_base_url().to_string();
 
     for (_key, prompt) in prompts.iter_mut() {
         if !prompt.messages.is_empty() {
@@ -538,6 +694,25 @@ fn enqueue_prompt_messages_to_cas(
 
             // Enqueue to CAS (returns hash)
             let hash = db_lock.enqueue_cas_object(&messages_json, Some(&metadata))?;
+
+            let metadata_json = serde_json::to_string(&metadata).ok();
+            let canonical = serde_json_canonicalizer::to_string(&messages_json)
+                .unwrap_or_else(|_| messages_json.to_string());
+            let cas_payload = crate::daemon::control_api::CasSyncPayload {
+                hash: hash.clone(),
+                data: canonical,
+                metadata: metadata_json,
+            };
+
+            // In daemon mode, submit directly to the in-process telemetry worker.
+            // In wrapper-daemon mode, forward over the control socket so the
+            // background daemon can upload it immediately.
+            if crate::daemon::daemon_process_active() {
+                let _ =
+                    crate::daemon::telemetry_worker::submit_daemon_internal_cas(vec![cas_payload]);
+            } else if crate::daemon::telemetry_handle::daemon_telemetry_available() {
+                crate::daemon::telemetry_handle::submit_cas(vec![cas_payload]);
+            }
 
             // Set full URL and clear messages
             prompt.messages_url = Some(format!("{}/cas/{}", api_base_url, hash));
@@ -561,17 +736,50 @@ fn record_commit_metrics(
 ) {
     use crate::metrics::{CommittedValues, EventAttributes, record};
 
+    // Never emit telemetry for mock_ai (test preset).  If every tool in the
+    // breakdown is mock_ai the entire committed event is test data.
+    let only_mock_ai = !stats.tool_model_breakdown.is_empty()
+        && stats
+            .tool_model_breakdown
+            .keys()
+            .all(|k| k.starts_with("mock_ai::"));
+    if only_mock_ai {
+        return;
+    }
+
+    // Subtract mock_ai contributions from the aggregates so the "all" entry
+    // only reflects real tools.
+    let mut agg_mixed = stats.mixed_additions;
+    let mut agg_ai = stats.ai_additions;
+    let mut agg_accepted = stats.ai_accepted;
+    let mut agg_total_add = stats.total_ai_additions;
+    let mut agg_total_del = stats.total_ai_deletions;
+    let mut agg_waiting: u64 = stats.time_waiting_for_ai;
+    for (key, ts) in &stats.tool_model_breakdown {
+        if key.starts_with("mock_ai::") {
+            agg_mixed = agg_mixed.saturating_sub(ts.mixed_additions);
+            agg_ai = agg_ai.saturating_sub(ts.ai_additions);
+            agg_accepted = agg_accepted.saturating_sub(ts.ai_accepted);
+            agg_total_add = agg_total_add.saturating_sub(ts.total_ai_additions);
+            agg_total_del = agg_total_del.saturating_sub(ts.total_ai_deletions);
+            agg_waiting = agg_waiting.saturating_sub(ts.time_waiting_for_ai);
+        }
+    }
+
     // Build parallel arrays: index 0 = "all" (aggregate), index 1+ = per tool/model
     let mut tool_model_pairs: Vec<String> = vec!["all".to_string()];
-    let mut mixed_additions: Vec<u32> = vec![stats.mixed_additions];
-    let mut ai_additions: Vec<u32> = vec![stats.ai_additions];
-    let mut ai_accepted: Vec<u32> = vec![stats.ai_accepted];
-    let mut total_ai_additions: Vec<u32> = vec![stats.total_ai_additions];
-    let mut total_ai_deletions: Vec<u32> = vec![stats.total_ai_deletions];
-    let mut time_waiting_for_ai: Vec<u64> = vec![stats.time_waiting_for_ai];
+    let mut mixed_additions: Vec<u32> = vec![agg_mixed];
+    let mut ai_additions: Vec<u32> = vec![agg_ai];
+    let mut ai_accepted: Vec<u32> = vec![agg_accepted];
+    let mut total_ai_additions: Vec<u32> = vec![agg_total_add];
+    let mut total_ai_deletions: Vec<u32> = vec![agg_total_del];
+    let mut time_waiting_for_ai: Vec<u64> = vec![agg_waiting];
 
-    // Add per-tool/model breakdown
+    // Add per-tool/model breakdown, skipping mock_ai (test preset)
     for (tool_model, tool_stats) in &stats.tool_model_breakdown {
+        if tool_model.starts_with("mock_ai::") {
+            continue;
+        }
         tool_model_pairs.push(tool_model.clone());
         mixed_additions.push(tool_stats.mixed_additions);
         ai_additions.push(tool_stats.ai_additions);
@@ -639,8 +847,8 @@ fn record_commit_metrics(
         attrs = attrs.branch(short_branch);
     }
 
-    // Attach custom attributes
-    attrs = attrs.custom_attributes_map(Config::get().custom_attributes());
+    // Attach custom attributes using Config::fresh() to support runtime config updates
+    attrs = attrs.custom_attributes_map(Config::fresh().custom_attributes());
 
     // Record the metric
     record(values, attrs);
@@ -649,8 +857,9 @@ fn record_commit_metrics(
 #[cfg(test)]
 mod tests {
     use super::{
-        STATS_SKIP_MAX_ADDED_LINES, STATS_SKIP_MAX_FILES_WITH_ADDITIONS, STATS_SKIP_MAX_HUNKS,
-        StatsCostEstimate, count_line_ranges, should_skip_expensive_post_commit_stats,
+        STATS_SKIP_MAX_ADDED_LINES, STATS_SKIP_MAX_DELETED_LINES,
+        STATS_SKIP_MAX_FILES_WITH_ADDITIONS, STATS_SKIP_MAX_HUNKS, StatsCostEstimate,
+        count_line_ranges, should_skip_expensive_post_commit_stats,
     };
     use crate::git::test_utils::TmpRepo;
 
@@ -670,6 +879,7 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS - 1,
             added_lines: STATS_SKIP_MAX_ADDED_LINES - 1,
             hunk_ranges: STATS_SKIP_MAX_HUNKS - 1,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES - 1,
         };
         assert!(!should_skip_expensive_post_commit_stats(&below_threshold));
 
@@ -677,6 +887,7 @@ mod tests {
             files_with_additions: 1,
             added_lines: 1,
             hunk_ranges: STATS_SKIP_MAX_HUNKS,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_hunks));
 
@@ -684,6 +895,7 @@ mod tests {
             files_with_additions: 1,
             added_lines: STATS_SKIP_MAX_ADDED_LINES,
             hunk_ranges: 1,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_added_lines));
 
@@ -691,8 +903,17 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS,
             added_lines: 1,
             hunk_ranges: 1,
+            deleted_lines: 0,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_files));
+
+        let by_deleted_lines = StatsCostEstimate {
+            files_with_additions: 0,
+            added_lines: 0,
+            hunk_ranges: 0,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES,
+        };
+        assert!(should_skip_expensive_post_commit_stats(&by_deleted_lines));
     }
 
     #[test]
@@ -795,6 +1016,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: 0,
             hunk_ranges: STATS_SKIP_MAX_HUNKS,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_hunks),
@@ -806,6 +1028,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: STATS_SKIP_MAX_ADDED_LINES,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_added),
@@ -817,10 +1040,23 @@ mod tests {
             files_with_additions: STATS_SKIP_MAX_FILES_WITH_ADDITIONS,
             added_lines: 0,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             should_skip_expensive_post_commit_stats(&at_files),
             "Exactly at files-with-additions threshold should skip"
+        );
+
+        // Exactly at deleted-lines threshold alone should trigger skip.
+        let at_deleted = StatsCostEstimate {
+            files_with_additions: 0,
+            added_lines: 0,
+            hunk_ranges: 0,
+            deleted_lines: STATS_SKIP_MAX_DELETED_LINES,
+        };
+        assert!(
+            should_skip_expensive_post_commit_stats(&at_deleted),
+            "Exactly at deleted-lines threshold should skip"
         );
 
         // All at zero should NOT skip.
@@ -828,6 +1064,7 @@ mod tests {
             files_with_additions: 0,
             added_lines: 0,
             hunk_ranges: 0,
+            deleted_lines: 0,
         };
         assert!(
             !should_skip_expensive_post_commit_stats(&all_zero),

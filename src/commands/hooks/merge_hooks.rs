@@ -33,6 +33,13 @@ pub fn post_merge_hook(
                 return;
             }
         };
+        let staged_file_blobs = match repository.get_all_staged_file_blob_oids() {
+            Ok(staged_file_blobs) => staged_file_blobs,
+            Err(error) => {
+                tracing::debug!("Failed to snapshot merge --squash staged blobs: {}", error);
+                return;
+            }
+        };
 
         repository.handle_rewrite_log_event(
             RewriteLogEvent::merge_squash(MergeSquashEvent::new(
@@ -40,6 +47,7 @@ pub fn post_merge_hook(
                 source_head_sha,
                 base_branch,
                 base_head,
+                staged_file_blobs,
             )),
             commit_author,
             false,

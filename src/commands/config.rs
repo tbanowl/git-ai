@@ -1,5 +1,6 @@
 use dirs;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::git::repository::find_repository_in_path;
 
@@ -110,6 +111,7 @@ fn print_config_help() {
     eprintln!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
     eprintln!("  default_prompt_storage       Fallback storage mode for non-included repos");
     eprintln!("  quiet                        Suppress chart output after commits (bool)");
+    eprintln!("  git_ai_hooks                 Hook name -> shell commands map (object)");
     eprintln!();
     eprintln!("Repository Patterns:");
     eprintln!("  For exclude/allow/exclude_prompts_in_repositories, you can provide:");
@@ -125,6 +127,7 @@ fn print_config_help() {
     eprintln!("  git-ai config --add exclude_repositories \"temp/*\"");
     eprintln!("  git-ai config --add allow_repositories ~/projects/my-repo");
     eprintln!("  git-ai config --add feature_flags.my_flag true");
+    eprintln!("  git-ai config --add git_ai_hooks.post_notes_updated \"./my-hook.sh\"");
     eprintln!("  git-ai config unset exclude_repositories");
     eprintln!();
     std::process::exit(0);
@@ -304,6 +307,12 @@ fn show_all_config() -> Result<(), String> {
 
     effective_config.insert("quiet".to_string(), Value::Bool(runtime_config.is_quiet()));
 
+    effective_config.insert(
+        "git_ai_hooks".to_string(),
+        serde_json::to_value(runtime_config.git_ai_hooks())
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+    );
+
     // Feature flags - show effective flags with defaults applied
     let flags_value = serde_json::to_value(runtime_config.get_feature_flags())
         .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
@@ -377,6 +386,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "prompt_storage" => Value::String(runtime_config.prompt_storage().to_string()),
+            "notes_store" => Value::String(runtime_config.notes_store().to_string()),
             "include_prompts_in_repositories" => {
                 if let Some(ref repos) = file_config.include_prompts_in_repositories {
                     serde_json::to_value(repos).unwrap()
@@ -392,6 +402,8 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "quiet" => Value::Bool(runtime_config.is_quiet()),
+            "git_ai_hooks" => serde_json::to_value(runtime_config.git_ai_hooks())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
             _ => return Err(format!("Unknown config key: {}", key)),
         };
 
@@ -402,12 +414,16 @@ fn get_config_value(key: &str) -> Result<(), String> {
     }
 
     // Handle nested keys (dot notation)
-    if key_path[0] == "feature_flags" {
-        // Get effective flags with defaults applied
-        let feature_flags = serde_json::to_value(runtime_config.get_feature_flags())
-            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    if key_path[0] == "feature_flags" || key_path[0] == "git_ai_hooks" {
+        let root = if key_path[0] == "feature_flags" {
+            serde_json::to_value(runtime_config.get_feature_flags())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+        } else {
+            serde_json::to_value(runtime_config.git_ai_hooks())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+        };
 
-        let mut current = &feature_flags;
+        let mut current = &root;
         for segment in &key_path[1..] {
             current = current
                 .get(segment)
@@ -420,7 +436,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags".to_string())
+    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
 }
 
 fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String> {
@@ -521,6 +537,12 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 crate::config::save_file_config(&file_config)?;
                 eprintln!("[prompt_storage]: {}", value);
             }
+            "notes_store" => {
+                validate_notes_store_value(value)?;
+                file_config.notes_store = Some(value.to_string());
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[notes_store]: {}", value);
+            }
             "include_prompts_in_repositories" => {
                 let resolved = resolve_repository_value(value)?;
                 if add_mode {
@@ -552,6 +574,14 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.quiet = Some(bool_value);
                 crate::config::save_file_config(&file_config)?;
                 eprintln!("[quiet]: {}", bool_value);
+            }
+            "git_ai_hooks" => {
+                if add_mode {
+                    return Err("Cannot use --add with git_ai_hooks at top level. Use dot notation: git_ai_hooks.post_notes_updated".to_string());
+                }
+                file_config.git_ai_hooks = Some(parse_git_ai_hooks_object(value)?);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[git_ai_hooks]: {}", value);
             }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
@@ -609,7 +639,41 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags".to_string())
+    if key_path[0] == "git_ai_hooks" {
+        if key_path.len() != 2 {
+            return Err(
+                "git_ai_hooks requires a hook name (e.g., git_ai_hooks.post_notes_updated)"
+                    .to_string(),
+            );
+        }
+
+        let hook_name = key_path[1].clone();
+        let mut hooks = file_config.git_ai_hooks.unwrap_or_default();
+
+        if add_mode {
+            let mut existing_commands = hooks.get(&hook_name).cloned().unwrap_or_default();
+            let commands_to_add = parse_hook_command_values(value)?;
+            existing_commands.extend(commands_to_add.clone());
+            hooks.insert(hook_name.clone(), existing_commands);
+            file_config.git_ai_hooks = Some(hooks);
+            crate::config::save_file_config(&file_config)?;
+            for command in commands_to_add {
+                eprintln!("+ [{}.{}]: {}", key_path[0], hook_name, command);
+            }
+        } else {
+            let commands = parse_hook_command_values(value)?;
+            hooks.insert(hook_name.clone(), commands.clone());
+            file_config.git_ai_hooks = Some(hooks);
+            crate::config::save_file_config(&file_config)?;
+            for command in commands {
+                eprintln!("[{}.{}]: {}", key_path[0], hook_name, command);
+            }
+        }
+
+        return Ok(());
+    }
+
+    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
 }
 
 fn unset_config_value(key: &str) -> Result<(), String> {
@@ -703,6 +767,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                     eprintln!("- [prompt_storage]: {}", v);
                 }
             }
+            "notes_store" => {
+                let old_value = file_config.notes_store.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [notes_store]: {}", v);
+                }
+            }
             "include_prompts_in_repositories" => {
                 let old_value = file_config.include_prompts_in_repositories.take();
                 crate::config::save_file_config(&file_config)?;
@@ -722,6 +793,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
                     eprintln!("- [quiet]: {}", v);
+                }
+            }
+            "git_ai_hooks" => {
+                let old_value = file_config.git_ai_hooks.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [git_ai_hooks]: {:?}", v);
                 }
             }
             _ => return Err(format!("Unknown config key: {}", key)),
@@ -784,7 +862,35 @@ fn unset_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags".to_string())
+    if key_path[0] == "git_ai_hooks" {
+        if key_path.len() != 2 {
+            return Err(
+                "git_ai_hooks requires a hook name (e.g., git_ai_hooks.post_notes_updated)"
+                    .to_string(),
+            );
+        }
+
+        let hook_name = &key_path[1];
+        let mut hooks = file_config
+            .git_ai_hooks
+            .ok_or_else(|| format!("Config key not found: {}", key))?;
+        let old_value = hooks.remove(hook_name);
+        if old_value.is_none() {
+            return Err(format!("Config key not found: {}", key));
+        }
+
+        file_config.git_ai_hooks = if hooks.is_empty() { None } else { Some(hooks) };
+        crate::config::save_file_config(&file_config)?;
+
+        if let Some(commands) = old_value {
+            for command in commands {
+                eprintln!("- [{}]: {}", key, command);
+            }
+        }
+        return Ok(());
+    }
+
+    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
 }
 
 fn parse_key_path(key: &str) -> Vec<String> {
@@ -881,6 +987,69 @@ fn log_array_removals(items: &[String]) {
     }
 }
 
+fn parse_git_ai_hooks_object(value: &str) -> Result<HashMap<String, Vec<String>>, String> {
+    let parsed: Value =
+        serde_json::from_str(value).map_err(|e| format!("Invalid JSON for git_ai_hooks: {}", e))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "git_ai_hooks must be a JSON object".to_string())?;
+
+    let mut hooks = HashMap::new();
+    for (hook_name, commands_value) in obj {
+        let name = hook_name.trim();
+        if name.is_empty() {
+            return Err("git_ai_hooks contains an empty hook name".to_string());
+        }
+        let commands = parse_hook_commands_value(commands_value)?;
+        hooks.insert(name.to_string(), commands);
+    }
+    Ok(hooks)
+}
+
+fn parse_hook_command_values(value: &str) -> Result<Vec<String>, String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(value)
+        && (parsed.is_string() || parsed.is_array())
+    {
+        return parse_hook_commands_value(&parsed);
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Hook command cannot be empty".to_string());
+    }
+    Ok(vec![trimmed.to_string()])
+}
+
+fn parse_hook_commands_value(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::String(command) => {
+            let trimmed = command.trim();
+            if trimmed.is_empty() {
+                return Err("Hook command cannot be empty".to_string());
+            }
+            Ok(vec![trimmed.to_string()])
+        }
+        Value::Array(items) => {
+            let mut commands = Vec::new();
+            for item in items {
+                let command = item.as_str().ok_or_else(|| {
+                    "git_ai_hooks hook values must be a string or an array of strings".to_string()
+                })?;
+                let trimmed = command.trim();
+                if trimmed.is_empty() {
+                    return Err("Hook command cannot be empty".to_string());
+                }
+                commands.push(trimmed.to_string());
+            }
+            if commands.is_empty() {
+                return Err("Hook command array cannot be empty".to_string());
+            }
+            Ok(commands)
+        }
+        _ => Err("git_ai_hooks hook values must be a string or an array of strings".to_string()),
+    }
+}
+
 fn parse_bool(value: &str) -> Result<bool, String> {
     match value.to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
@@ -916,6 +1085,16 @@ fn validate_prompt_storage_value(value: &str) -> Result<(), String> {
     if value != "default" && value != "notes" && value != "local" {
         return Err(format!(
             "Invalid prompt_storage value '{}'. Expected 'default', 'notes', or 'local'",
+            value
+        ));
+    }
+    Ok(())
+}
+
+fn validate_notes_store_value(value: &str) -> Result<(), String> {
+    if value != "git" && value != "rest" {
+        return Err(format!(
+            "Invalid notes_store value '{}'. Expected 'git' or 'rest'",
             value
         ));
     }
@@ -978,6 +1157,35 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("Invalid boolean value"));
         assert!(err.contains("invalid"));
+    }
+
+    #[test]
+    fn test_parse_hook_command_values_supports_plain_string() {
+        let commands = parse_hook_command_values("./hooks/post-notes.sh").unwrap();
+        assert_eq!(commands, vec!["./hooks/post-notes.sh"]);
+    }
+
+    #[test]
+    fn test_parse_hook_command_values_supports_json_array() {
+        let commands = parse_hook_command_values(r#"["a","b"]"#).unwrap();
+        assert_eq!(commands, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_parse_hook_command_values_json_primitive_falls_back_to_string() {
+        let commands = parse_hook_command_values("true").unwrap();
+        assert_eq!(commands, vec!["true"]);
+    }
+
+    #[test]
+    fn test_parse_git_ai_hooks_object() {
+        let hooks =
+            parse_git_ai_hooks_object(r#"{"post_notes_updated":["./hook-a.sh","./hook-b.sh"]}"#)
+                .unwrap();
+        assert_eq!(
+            hooks.get("post_notes_updated"),
+            Some(&vec!["./hook-a.sh".to_string(), "./hook-b.sh".to_string()])
+        );
     }
 
     // --- Additional comprehensive tests ---

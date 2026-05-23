@@ -2,7 +2,7 @@ use crate::authorship::authorship_log_serialization::{AUTHORSHIP_LOG_VERSION, Au
 use crate::authorship::working_log::Checkpoint;
 use crate::error::GitAiError;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
-use crate::utils::debug_log;
+use git2::Oid;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 
@@ -15,18 +15,11 @@ pub fn notes_add(
     commit_sha: &str,
     note_content: &str,
 ) -> Result<(), GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("notes".to_string());
-    args.push("--ref=ai".to_string());
-    args.push("add".to_string());
-    args.push("-f".to_string()); // Always force overwrite
-    args.push("-F".to_string());
-    args.push("-".to_string()); // Read note content from stdin
-    args.push(commit_sha.to_string());
-
-    // Use stdin to provide the note content to avoid command line length limits
-    exec_git_stdin(&args, note_content.as_bytes())?;
-    Ok(())
+    // Route through notes_add_batch to ensure consistent fanout tree format.
+    // Using git's native `notes add` can produce flat entries for small trees,
+    // leading to mixed-fanout trees that trigger assertion failures in
+    // `git notes merge` (notes-merge.c diff_tree_remote).
+    notes_add_batch(repo, &[(commit_sha.to_string(), note_content.to_string())])
 }
 
 fn notes_path_for_object(oid: &str) -> String {
@@ -58,6 +51,77 @@ fn parse_batch_check_blob_oid(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn parse_cat_file_batch_output_with_oids(
+    data: &[u8],
+) -> Result<HashMap<String, String>, GitAiError> {
+    let mut results = HashMap::new();
+    let mut pos = 0usize;
+
+    while pos < data.len() {
+        let header_end = match data[pos..].iter().position(|&b| b == b'\n') {
+            Some(idx) => pos + idx,
+            None => break,
+        };
+
+        let header = std::str::from_utf8(&data[pos..header_end])?;
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() < 2 {
+            pos = header_end + 1;
+            continue;
+        }
+
+        let oid = parts[0].to_string();
+        if parts[1] == "missing" {
+            pos = header_end + 1;
+            continue;
+        }
+
+        if parts.len() < 3 {
+            pos = header_end + 1;
+            continue;
+        }
+
+        let size: usize = parts[2]
+            .parse()
+            .map_err(|e| GitAiError::Generic(format!("Invalid size in cat-file output: {}", e)))?;
+
+        let content_start = header_end + 1;
+        let content_end = content_start + size;
+        if content_end > data.len() {
+            return Err(GitAiError::Generic(
+                "Malformed cat-file --batch output: truncated content".to_string(),
+            ));
+        }
+
+        let content = String::from_utf8_lossy(&data[content_start..content_end]).to_string();
+        results.insert(oid, content);
+
+        pos = content_end;
+        if pos < data.len() && data[pos] == b'\n' {
+            pos += 1;
+        }
+    }
+
+    Ok(results)
+}
+
+fn batch_read_blob_contents(
+    repo: &Repository,
+    blob_oids: &[String],
+) -> Result<HashMap<String, String>, GitAiError> {
+    if blob_oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut args = repo.global_args_for_exec();
+    args.push("cat-file".to_string());
+    args.push("--batch".to_string());
+
+    let stdin_data = blob_oids.join("\n") + "\n";
+    let output = exec_git_stdin(&args, stdin_data.as_bytes())?;
+    parse_cat_file_batch_output_with_oids(&output.stdout)
 }
 
 /// Resolve authorship note blob OIDs for a set of commits using one batched cat-file call.
@@ -170,6 +234,7 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
     fast_import_args.push("fast-import".to_string());
     fast_import_args.push("--quiet".to_string());
     exec_git_stdin(&fast_import_args, &script)?;
+    crate::authorship::git_ai_hooks::post_notes_updated(repo, &deduped_entries);
 
     Ok(())
 }
@@ -237,6 +302,41 @@ pub fn notes_add_blob_batch(
     fast_import_args.push("--quiet".to_string());
     exec_git_stdin(&fast_import_args, &script)?;
 
+    let has_post_notes_updated_hooks = crate::config::Config::get()
+        .git_ai_hook_commands("post_notes_updated")
+        .is_some_and(|commands| !commands.is_empty());
+    if has_post_notes_updated_hooks {
+        let hook_entries = (|| -> Result<Vec<(String, String)>, GitAiError> {
+            let mut unique_blob_oids: Vec<String> = deduped_entries
+                .iter()
+                .map(|(_commit_sha, blob_oid)| blob_oid.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            unique_blob_oids.sort();
+            let blob_contents = batch_read_blob_contents(repo, &unique_blob_oids)?;
+
+            Ok(deduped_entries
+                .iter()
+                .filter_map(|(commit_sha, blob_oid)| {
+                    blob_contents
+                        .get(blob_oid)
+                        .map(|note_content| (commit_sha.clone(), note_content.clone()))
+                })
+                .collect())
+        })();
+        match hook_entries {
+            Ok(entries) if !entries.is_empty() => {
+                crate::authorship::git_ai_hooks::post_notes_updated(repo, &entries)
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
+                "Failed to prepare post_notes_updated payload for notes_add_blob_batch: {}",
+                e
+            ),
+        }
+    }
+
     Ok(())
 }
 
@@ -249,10 +349,12 @@ pub enum CommitAuthorship {
     NoLog {
         sha: String,
         git_author: String,
+        commit_time: i64,
     },
     Log {
         sha: String,
         git_author: String,
+        commit_time: i64,
         authorship_log: AuthorshipLog,
     },
 }
@@ -269,7 +371,7 @@ pub fn get_commits_with_notes_from_list(
     let mut args = repo.global_args_for_exec();
     args.push("rev-list".to_string());
     args.push("--no-walk".to_string());
-    args.push("--pretty=format:%H%n%an%n%ae".to_string());
+    args.push("--pretty=format:%H%n%an%n%ae%n%ct".to_string());
     for sha in commit_shas {
         args.push(sha.clone());
     }
@@ -278,7 +380,7 @@ pub fn get_commits_with_notes_from_list(
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| GitAiError::Generic("Failed to parse git rev-list output".to_string()))?;
 
-    let mut commit_authors = HashMap::new();
+    let mut commit_authors: HashMap<String, (String, i64)> = HashMap::new();
     let lines: Vec<&str> = stdout.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -286,13 +388,14 @@ pub fn get_commits_with_notes_from_list(
         // Skip commit headers (start with "commit ")
         if line.starts_with("commit ") {
             i += 1;
-            if i + 2 < lines.len() {
+            if i + 3 < lines.len() {
                 let sha = lines[i].to_string();
                 let name = lines[i + 1].to_string();
                 let email = lines[i + 2].to_string();
+                let commit_time: i64 = lines[i + 3].parse().unwrap_or(0);
                 let author = format!("{} <{}>", name, email);
-                commit_authors.insert(sha, author);
-                i += 3;
+                commit_authors.insert(sha, (author, commit_time));
+                i += 4;
             } else {
                 break;
             }
@@ -304,22 +407,24 @@ pub fn get_commits_with_notes_from_list(
     // Build the result Vec
     let mut result = Vec::new();
     for sha in commit_shas {
-        let git_author = commit_authors
+        let (git_author, commit_time) = commit_authors
             .get(sha)
             .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
+            .unwrap_or_else(|| ("Unknown".to_string(), 0));
 
         // Check if this commit has a note by trying to show it
         if let Some(authorship_log) = get_authorship(repo, sha) {
             result.push(CommitAuthorship::Log {
                 sha: sha.clone(),
                 git_author,
+                commit_time,
                 authorship_log,
             });
         } else {
             result.push(CommitAuthorship::NoLog {
                 sha: sha.clone(),
                 git_author,
+                commit_time,
             });
         }
     }
@@ -439,13 +544,9 @@ pub fn tracking_ref_for_remote(remote_name: &str) -> String {
 
 /// Check if a ref exists in the repository
 pub fn ref_exists(repo: &Repository, ref_name: &str) -> bool {
-    let mut args = repo.global_args_for_exec();
-    args.push("show-ref".to_string());
-    args.push("--verify".to_string());
-    args.push("--quiet".to_string());
-    args.push(ref_name.to_string());
-
-    exec_git(&args).is_ok()
+    git2::Repository::open(repo.path())
+        .ok()
+        .is_some_and(|g2repo| g2repo.find_reference(ref_name).is_ok())
 }
 
 /// Merge notes from a source ref into refs/notes/ai
@@ -460,23 +561,141 @@ pub fn merge_notes_from_ref(repo: &Repository, source_ref: &str) -> Result<(), G
     args.push("--quiet".to_string());
     args.push(source_ref.to_string());
 
-    debug_log(&format!(
-        "Merging notes from {} into refs/notes/ai",
-        source_ref
-    ));
+    tracing::debug!("Merging notes from {} into refs/notes/ai", source_ref);
     exec_git(&args)?;
     Ok(())
 }
 
+/// Fallback merge when `git notes merge -s ours` fails (e.g., due to git assertion
+/// failures on corrupted/mixed-fanout notes trees). Implements the "ours" strategy
+/// using a single `git fast-import` invocation that:
+///   1. Creates a merge commit with both local and source as parents
+///   2. Emits all notes via `N <blob> <object>` commands (source first, then local —
+///      last writer wins, so local takes precedence on conflicts = "ours" strategy)
+///   3. Produces a clean notes tree with correct fanout regardless of input tree format
+///
+/// This is O(1) git process invocations regardless of note count, which matters on
+/// large monorepos with thousands of notes.
+pub fn fallback_merge_notes_ours(repo: &Repository, source_ref: &str) -> Result<(), GitAiError> {
+    let local_ref = format!("refs/notes/{}", AI_AUTHORSHIP_REFNAME);
+
+    // 1. List notes from both refs
+    let source_notes = list_all_notes(repo, source_ref)?;
+    let local_notes = list_all_notes(repo, &local_ref)?;
+
+    // 2. Resolve parent commit SHAs for the merge commit
+    let local_commit = rev_parse(repo, &local_ref)?;
+    let source_commit = rev_parse(repo, source_ref)?;
+
+    // Nothing to merge if both refs point to the same commit.
+    if local_commit == source_commit {
+        tracing::debug!("notes refs already at same commit, nothing to merge");
+        return Ok(());
+    }
+
+    // 3. Build the fast-import stream.
+    //    Use explicit `M` (filemodify) commands instead of `N` (notemodify) because
+    //    `N` validates that the annotated object exists locally, which fails when
+    //    merging notes from a remote that annotates commits not yet fetched to this
+    //    repo (e.g., notes from another developer's push on a monorepo).
+    //
+    //    Emit source (remote) notes first, then local notes. fast-import uses
+    //    last-writer-wins for duplicate paths, so local notes take precedence —
+    //    this implements the "ours" merge strategy.
+    let mut stream = String::new();
+    stream.push_str(&format!("commit {}\n", local_ref));
+    stream.push_str("committer git-ai <git-ai@noreply> 0 +0000\n");
+    stream.push_str("data 23\nMerge notes (fallback)\n");
+    stream.push_str(&format!("from {}\n", local_commit));
+    stream.push_str(&format!("merge {}\n", source_commit));
+    // Start with a clean tree to avoid mixed-fanout issues
+    stream.push_str("deleteall\n");
+
+    // Source notes first (will be overwritten by local on conflict)
+    for (blob, object) in &source_notes {
+        let path = notes_path_for_object(object);
+        stream.push_str(&format!("M 100644 {} {}\n", blob, path));
+    }
+    // Local notes second (wins on conflict)
+    for (blob, object) in &local_notes {
+        let path = notes_path_for_object(object);
+        stream.push_str(&format!("M 100644 {} {}\n", blob, path));
+    }
+    stream.push_str("done\n");
+
+    // 4. Run fast-import
+    let mut args = repo.global_args_for_exec();
+    args.extend_from_slice(&[
+        "fast-import".to_string(),
+        "--quiet".to_string(),
+        "--done".to_string(),
+    ]);
+    exec_git_stdin(&args, stream.as_bytes())?;
+
+    tracing::debug!("fallback merge via fast-import completed successfully");
+    Ok(())
+}
+
+/// List all notes on a given ref. Returns Vec<(note_blob_sha, annotated_object_sha)>.
+fn list_all_notes(repo: &Repository, notes_ref: &str) -> Result<Vec<(String, String)>, GitAiError> {
+    // `git notes list` uses --ref to specify which notes ref.
+    // The --ref option prepends "refs/notes/" automatically, so for full refs
+    // like "refs/notes/ai-remote/origin" we need to strip the prefix.
+    let ref_arg = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
+
+    let mut args = repo.global_args_for_exec();
+    args.extend_from_slice(&[
+        "notes".to_string(),
+        format!("--ref={}", ref_arg),
+        "list".to_string(),
+    ]);
+
+    let output = exec_git(&args)?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| GitAiError::Generic("Failed to parse notes list output".to_string()))?;
+
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// Parse a revision to its SHA
+fn rev_parse(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
+    let mut args = repo.global_args_for_exec();
+    args.extend_from_slice(&["rev-parse".to_string(), rev.to_string()]);
+    let output = exec_git(&args)?;
+    String::from_utf8(output.stdout)
+        .map_err(|_| GitAiError::Generic("Failed to parse rev-parse output".to_string()))
+        .map(|s| s.trim().to_string())
+}
+
 /// Copy a ref to another location (used for initial setup of local notes from tracking ref)
 pub fn copy_ref(repo: &Repository, source_ref: &str, dest_ref: &str) -> Result<(), GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("update-ref".to_string());
-    args.push(dest_ref.to_string());
-    args.push(source_ref.to_string());
+    let g2repo =
+        git2::Repository::open(repo.path()).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let source_oid = g2repo
+        .revparse_single(source_ref)
+        .map_err(|e| GitAiError::Generic(e.to_string()))?
+        .id();
 
-    debug_log(&format!("Copying ref {} to {}", source_ref, dest_ref));
-    exec_git(&args)?;
+    tracing::debug!("Copying ref {} to {}", source_ref, dest_ref);
+    g2repo
+        .reference(
+            dest_ref,
+            Oid::from_str(&source_oid.to_string())
+                .map_err(|e| GitAiError::Generic(e.to_string()))?,
+            true,
+            &format!("git-ai copy_ref from {source_ref}"),
+        )
+        .map_err(|e| GitAiError::Generic(e.to_string()))?;
     Ok(())
 }
 
@@ -719,17 +938,45 @@ mod tests {
     }
 
     #[test]
+    fn test_rev_parse_resolves_existing_and_missing_refs() {
+        let tmp_repo = TmpRepo::new().expect("Failed to create tmp repo");
+
+        tmp_repo
+            .write_file("test.txt", "content\n", true)
+            .expect("write file");
+        tmp_repo
+            .commit_with_message("Initial commit")
+            .expect("commit");
+
+        let head_sha = tmp_repo.get_head_commit_sha().expect("head sha");
+        let parsed_head = rev_parse(tmp_repo.gitai_repo(), "HEAD").expect("rev_parse HEAD");
+        assert_eq!(parsed_head, head_sha);
+
+        let missing_ref = rev_parse(tmp_repo.gitai_repo(), "refs/heads/does-not-exist");
+        assert!(missing_ref.is_err(), "missing ref should fail rev_parse");
+
+        let missing_object = rev_parse(
+            tmp_repo.gitai_repo(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef^{commit}",
+        );
+        assert!(
+            missing_object.is_err(),
+            "missing object should fail rev_parse"
+        );
+    }
+
+    #[test]
     fn test_merge_notes_from_ref() {
         let tmp_repo = TmpRepo::new().expect("Failed to create tmp repo");
 
         // Create commits - they will auto-create notes on refs/notes/ai
         tmp_repo.write_file("a.txt", "a\n", true).expect("write a");
         tmp_repo.commit_with_message("Commit A").expect("commit A");
-        let commit_a = tmp_repo.get_head_commit_sha().expect("head A");
+        let _commit_a = tmp_repo.get_head_commit_sha().expect("head A");
 
         tmp_repo.write_file("b.txt", "b\n", true).expect("write b");
         tmp_repo.commit_with_message("Commit B").expect("commit B");
-        let commit_b = tmp_repo.get_head_commit_sha().expect("head B");
+        let _commit_b = tmp_repo.get_head_commit_sha().expect("head B");
 
         // Create a third commit without checkpoint to ensure we have a commit without notes
         tmp_repo.write_file("c.txt", "c\n", true).expect("write c");
@@ -910,10 +1157,10 @@ mod tests {
         // Search for non-existent pattern
         let results = grep_ai_notes(tmp_repo.gitai_repo(), "vscode");
         // grep may return empty or error if no matches, both are acceptable
-        match results {
-            Ok(refs) => assert_eq!(refs.len(), 0),
-            Err(_) => {} // Also acceptable - git grep returns non-zero when no matches
+        if let Ok(refs) = results {
+            assert_eq!(refs.len(), 0);
         }
+        // Err is also acceptable - git grep returns non-zero when no matches
     }
 
     #[test]
@@ -928,10 +1175,10 @@ mod tests {
         // No notes exist, search should return empty or error
         let results = grep_ai_notes(tmp_repo.gitai_repo(), "cursor");
         // grep may return empty or error if refs/notes/ai doesn't exist
-        match results {
-            Ok(refs) => assert_eq!(refs.len(), 0),
-            Err(_) => {} // Also acceptable - refs/notes/ai may not exist yet
+        if let Ok(refs) = results {
+            assert_eq!(refs.len(), 0);
         }
+        // Err is also acceptable - refs/notes/ai may not exist yet
     }
 
     #[test]
@@ -966,6 +1213,7 @@ mod tests {
                     sha,
                     git_author: _,
                     authorship_log: _,
+                    commit_time: _,
                 } => {
                     // This is expected - verify SHA matches
                     let expected_sha = &commit_list[idx];
@@ -1071,7 +1319,7 @@ mod tests {
         // Commit B may or may not have a note depending on checkpoint system
         // Just verify we got at least 1 result (commit A)
         assert!(
-            result.len() >= 1,
+            !result.is_empty(),
             "Should have at least 1 commit with notes"
         );
     }

@@ -1,0 +1,1055 @@
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# $API_PATH = 'http://localhost:8888'
+# $SENTRY_ENTERPRISE = "http://key@localhost:8888/git-ai/dsn"
+$API_PATH = 'http://10.251.12.24:30939'
+$SENTRY_ENTERPRISE = "http://dsn-key@10.251.12.24:30939/git-ai/dsn"
+# [Environment]::SetEnvironmentVariable('SENTRY_ENTERPRISE', "http://key@localhost:8888/git-ai/dsn")
+[Environment]::SetEnvironmentVariable('INSTALL_NONCE', "INSTALL_GIT_AI")
+[Environment]::SetEnvironmentVariable('API_BASE', $API_PATH)
+# [Environment]::SetEnvironmentVariable('GIT_AI_API_BASE_URL', $API_PATH, "User")
+# [Environment]::SetEnvironmentVariable('GIT_AI_DEBUG', 1, 'User')
+# [Environment]::SetEnvironmentVariable('GIT_AI_DEBUG_PERFORMANCE', 2, 'User')
+
+# $gitAiDaemonHome = [Environment]::GetEnvironmentVariable('GIT_AI_DAEMON_HOME', 'User')
+# if ([string]::IsNullOrWhiteSpace($gitAiDaemonHome)) {
+#     try {
+#         if (Test-Path "Q:\") {
+#             $daemonHomePath = "Q:\ProgramData\git-ai"
+
+#             if (-not (Test-Path $daemonHomePath)) {
+#                 Write-Host "Warning: path does not exist: $daemonHomePath"
+#             }
+
+#             [Environment]::SetEnvironmentVariable('GIT_AI_DAEMON_HOME', $daemonHomePath, 'User')
+#             $env:GIT_AI_DAEMON_HOME = $daemonHomePath
+
+#             Write-Host "Set Environment Variable: GIT_AI_DAEMON_HOME=$daemonHomePath"
+#         }
+#     } catch {
+#         Write-Host "Set Environment Variable 'GIT_AI_DAEMON_HOME' failed: $($_.Exception.Message)"
+#     }
+# }
+# else {
+#     Write-Host "Skip Set Existed Environment Variable GIT_AI_DAEMON_HOME"
+# }
+
+function Write-ErrorAndExit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    Write-Host "Error: $Message" -ForegroundColor Red
+    exit 1
+}
+
+function Write-Success {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    Write-Host $Message -ForegroundColor Green
+}
+
+function Write-Warning {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    Write-Host $Message -ForegroundColor Yellow
+}
+
+function Normalize-PathString {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    try {
+        return ([IO.Path]::GetFullPath($Path.Trim())).TrimEnd('\').ToLowerInvariant()
+    } catch {
+        return ($Path.Trim()).TrimEnd('\').ToLowerInvariant()
+    }
+}
+
+function Test-FileAvailable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    try {
+        $stream = [System.IO.File]::Open($Path, 'Open', 'Write', 'None')
+        $stream.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Stop-GitAiBackgroundService {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitAiExe,
+        [Parameter(Mandatory = $false)][switch]$Hard
+    )
+
+    if (-not (Test-Path -LiteralPath $GitAiExe)) {
+        return $false
+    }
+
+    $args = @('bg', 'shutdown')
+    if ($Hard) {
+        $args += '--hard'
+    }
+
+    try {
+        & $GitAiExe @args *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Get-GitAiManagedProcesses {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    $targetPaths = @(
+        (Normalize-PathString (Join-Path $InstallDir 'git-ai.exe')),
+        (Normalize-PathString (Join-Path $InstallDir 'git.exe'))
+    )
+
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and
+            $_.ExecutablePath -and
+            ($targetPaths -contains (Normalize-PathString $_.ExecutablePath))
+        })
+
+    return $processes
+}
+
+function Stop-GitAiManagedProcesses {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    $processes = @(Get-GitAiManagedProcesses -InstallDir $InstallDir)
+    if ($processes.Count -eq 0) {
+        return $false
+    }
+
+    $pids = @($processes | Sort-Object ProcessId -Unique | Select-Object -ExpandProperty ProcessId)
+    Write-Warning ("Stopping lingering git-ai processes: {0}" -f ($pids -join ', '))
+
+    foreach ($processId in $pids) {
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+        } catch { }
+    }
+
+    return $true
+}
+
+function Wait-ForFileAvailable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $false)][int]$MaxWaitSeconds = 300,
+        [Parameter(Mandatory = $false)][int]$RetryIntervalSeconds = 5,
+        [Parameter(Mandatory = $false)][int]$ForceKillAfterSeconds = 20
+    )
+    
+    $elapsed = 0
+    $gitAiExe = Join-Path $InstallDir 'git-ai.exe'
+
+    [void](Stop-GitAiBackgroundService -GitAiExe $gitAiExe)
+
+    while ($elapsed -lt $MaxWaitSeconds) {
+        if (Test-FileAvailable -Path $Path) {
+            return $true
+        }
+
+        if ($elapsed -ge $ForceKillAfterSeconds) {
+            [void](Stop-GitAiBackgroundService -GitAiExe $gitAiExe -Hard)
+            [void](Stop-GitAiManagedProcesses -InstallDir $InstallDir)
+        }
+
+        if (-not (Test-FileAvailable -Path $Path)) {
+            if ($elapsed -eq 0) {
+                Write-Host "Waiting for file to be available: $Path" -ForegroundColor Yellow
+            }
+            Start-Sleep -Seconds $RetryIntervalSeconds
+            $elapsed += $RetryIntervalSeconds
+        }
+    }
+    return $false
+}
+
+function Verify-Checksum {
+    param(
+        [Parameter(Mandatory = $true)][string]$File,
+        [Parameter(Mandatory = $true)][string]$BinaryName
+    )
+
+    # Skip verification if no checksums are embedded
+    if ($EmbeddedChecksums -eq '__CHECKSUMS_PLACEHOLDER__') {
+        return
+    }
+
+    # Extract expected checksum for this binary
+    $expected = $null
+    $entries = $EmbeddedChecksums -split '\|'
+    foreach ($entry in $entries) {
+        if ($entry -match "^([0-9a-fA-F]+)\s+$([regex]::Escape($BinaryName))$") {
+            $expected = $Matches[1]
+            break
+        }
+    }
+
+    if (-not $expected) {
+        Write-ErrorAndExit "No checksum found for $BinaryName"
+    }
+
+    # Calculate actual checksum
+    $hashCommand = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($null -ne $hashCommand) {
+        $actual = (Get-FileHash -Path $File -Algorithm SHA256).Hash.ToLower()
+    } else {
+        $stream = [System.IO.File]::OpenRead($File)
+        try {
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            $hashBytes = $sha256.ComputeHash($stream)
+            $actual = ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLower()
+        } finally {
+            $stream.Dispose()
+            if ($sha256) {
+                $sha256.Dispose()
+            }
+        }
+    }
+
+    if ($expected -ne $actual) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $File
+        Write-ErrorAndExit "Checksum verification failed for $BinaryName`nExpected: $expected`nActual:   $actual"
+    }
+
+    Write-Success "Checksum verified for $BinaryName"
+}
+
+function Resolve-ServiceExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathName
+    )
+
+    $trimmed = $PathName.Trim()
+    if ($trimmed -match '^\"([^\"]+\.exe)\"') {
+        return $Matches[1]
+    }
+
+    $exeIndex = $trimmed.IndexOf('.exe', [StringComparison]::OrdinalIgnoreCase)
+    if ($exeIndex -ge 0) {
+        return $trimmed.Substring(0, $exeIndex + 4).Trim()
+    }
+
+    return $trimmed
+}
+
+function Find-AnyShareHookinfoIni {
+    $serviceCandidates = @()
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='SyncClientService'" -ErrorAction SilentlyContinue
+        if ($service -and $service.PathName) {
+            $serviceExe = Resolve-ServiceExecutablePath -PathName $service.PathName
+            if ($serviceExe -and (Test-Path -LiteralPath $serviceExe)) {
+                $serviceDir = Split-Path -Path $serviceExe -Parent
+                $serviceCandidates += (Join-Path $serviceDir 'Hookinfo.ini')
+            }
+        }
+    } catch {
+        Write-Warning "Warning: Failed to inspect AnyShare SyncClientService: $($_.Exception.Message)"
+    }
+
+    $candidates = @(
+        'C:\Program Files (x86)\AISHU\Sync\Hookinfo.ini',
+        'C:\Program Files\AISHU\Sync\Hookinfo.ini'
+    )
+
+    foreach ($serviceCandidate in $serviceCandidates) {
+        if ($serviceCandidate -and ($candidates -notcontains $serviceCandidate)) {
+            $candidates = @($serviceCandidate) + $candidates
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    $roots = @(
+        'C:\Program Files (x86)\AISHU',
+        'C:\Program Files\AISHU'
+    )
+
+    foreach ($root in $roots) {
+        if (Test-Path -LiteralPath $root) {
+            try {
+                $found = Get-ChildItem -LiteralPath $root -Filter 'Hookinfo.ini' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) {
+                    return $found.FullName
+                }
+            } catch {
+                Write-Warning "Warning: Failed to search AnyShare Hookinfo.ini under ${root}: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return $null
+}
+
+function Read-TextFilePreservingEncoding {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $reader = New-Object System.IO.StreamReader($Path, [System.Text.Encoding]::Default, $true)
+    try {
+        $content = $reader.ReadToEnd()
+        $encoding = $reader.CurrentEncoding
+    } finally {
+        $reader.Dispose()
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $normalizedContent = $content -replace "`r`n", "`n" -replace "`r", "`n"
+    if ($normalizedContent.Length -gt 0) {
+        $lines.AddRange([string[]]($normalizedContent -split "`n"))
+        if ($normalizedContent.EndsWith("`n")) {
+            $lines.RemoveAt($lines.Count - 1)
+        }
+    }
+
+    return [PSCustomObject]@{
+        Lines    = $lines
+        Encoding = $encoding
+    }
+}
+
+function Get-IniSectionRange {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory = $true)][string]$Section
+    )
+
+    $start = -1
+    $sectionPattern = '^\s*\[' + [regex]::Escape($Section) + '\]\s*$'
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match $sectionPattern) {
+            $start = $i
+            break
+        }
+    }
+
+    if ($start -eq -1) {
+        return [PSCustomObject]@{
+            Exists = $false
+            Start  = -1
+            End    = -1
+        }
+    }
+
+    $end = $Lines.Count - 1
+    for ($j = $start + 1; $j -lt $Lines.Count; $j++) {
+        if ($Lines[$j] -match '^\s*\[[^\]]+\]\s*$') {
+            $end = $j - 1
+            break
+        }
+    }
+
+    return [PSCustomObject]@{
+        Exists = $true
+        Start  = $start
+        End    = $end
+    }
+}
+
+function Ensure-IniSection {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory = $true)][string]$Section
+    )
+
+    $range = Get-IniSectionRange -Lines $Lines -Section $Section
+    if (-not $range.Exists) {
+        if ($Lines.Count -gt 0 -and $Lines[$Lines.Count - 1].Trim() -ne '') {
+            [void]$Lines.Add('')
+        }
+        [void]$Lines.Add("[$Section]")
+    }
+}
+
+function Set-IniValue {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory = $true)][string]$Section,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    Ensure-IniSection -Lines $Lines -Section $Section
+    $range = Get-IniSectionRange -Lines $Lines -Section $Section
+    $keyPattern = '^\s*' + [regex]::Escape($Key) + '\s*='
+
+    for ($i = $range.Start + 1; $i -le $range.End; $i++) {
+        if ($Lines[$i] -match $keyPattern) {
+            if ($Lines[$i] -ne "$Key=$Value") {
+                $Lines[$i] = "$Key=$Value"
+                return $true
+            }
+            return $false
+        }
+    }
+
+    $Lines.Insert($range.End + 1, "$Key=$Value")
+    return $true
+}
+
+function Normalize-IniValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    return $Value.Trim().Trim('"').Trim("'").TrimEnd('\').ToLowerInvariant()
+}
+
+function Add-AnyShareExcludeItems {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory = $true)][string[]]$Paths,
+        [Parameter(Mandatory = $true)][string[]]$Processes
+    )
+
+    Ensure-IniSection -Lines $Lines -Section 'Exclude'
+    $range = Get-IniSectionRange -Lines $Lines -Section 'Exclude'
+
+    $existingPaths = @{}
+    $existingProcesses = @{}
+    $maxPathIndex = -1
+    $maxProcessIndex = -1
+
+    for ($i = $range.Start + 1; $i -le $range.End; $i++) {
+        $line = $Lines[$i]
+        if ($line -match '^\s*Path(\d+)\s*=\s*(.+?)\s*$') {
+            $index = [int]$Matches[1]
+            $existingPaths[(Normalize-IniValue -Value $Matches[2])] = $true
+            if ($index -gt $maxPathIndex) {
+                $maxPathIndex = $index
+            }
+        } elseif ($line -match '^\s*Process(\d+)\s*=\s*(.+?)\s*$') {
+            $index = [int]$Matches[1]
+            $existingProcesses[(Normalize-IniValue -Value $Matches[2])] = $true
+            if ($index -gt $maxProcessIndex) {
+                $maxProcessIndex = $index
+            }
+        }
+    }
+
+    $changed = $false
+    $insertIndex = $range.End + 1
+
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            continue
+        }
+
+        $normalized = Normalize-IniValue -Value $path
+        if (-not $existingPaths.ContainsKey($normalized)) {
+            $maxPathIndex++
+            $Lines.Insert($insertIndex, "Path$maxPathIndex=$path")
+            $insertIndex++
+            $existingPaths[$normalized] = $true
+            $changed = $true
+        }
+    }
+
+    foreach ($process in $Processes) {
+        if ([string]::IsNullOrWhiteSpace($process)) {
+            continue
+        }
+
+        $normalized = Normalize-IniValue -Value $process
+        if (-not $existingProcesses.ContainsKey($normalized)) {
+            $maxProcessIndex++
+            $Lines.Insert($insertIndex, "Process$maxProcessIndex=$process")
+            $insertIndex++
+            $existingProcesses[$normalized] = $true
+            $changed = $true
+        }
+    }
+
+    return $changed
+}
+
+function Restart-AnyShareSyncClientServiceIfRunning {
+    try {
+        $service = Get-Service -Name 'SyncClientService' -ErrorAction SilentlyContinue
+        if (-not $service) {
+            return
+        }
+
+        if ($service.Status -ne 'Running') {
+            Write-Host 'AnyShare SyncClientService is not running; Hookinfo.ini changes will apply next time it starts.'
+            return
+        }
+
+        Write-Host 'Restarting AnyShare SyncClientService to apply Hookinfo.ini...'
+        Stop-Service -Name 'SyncClientService' -Force -ErrorAction Stop
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+        Start-Service -Name 'SyncClientService' -ErrorAction Stop
+        $service.Refresh()
+        $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+    } catch {
+        Write-Warning "Warning: Failed to restart AnyShare SyncClientService: $($_.Exception.Message)"
+    }
+}
+
+function Configure-AnyShareHookinfo {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $true)][string]$StdGitPath
+    )
+
+    $hookinfoPath = Find-AnyShareHookinfoIni
+    if (-not $hookinfoPath) {
+        Write-Host 'AnyShare Hookinfo.ini not found; skipping AnyShare hook exclusion config.'
+        return
+    }
+
+    Write-Host "Configuring AnyShare hook exclusions: $hookinfoPath"
+
+    try {
+        $gitDir = Split-Path -Path $StdGitPath -Parent
+        $gitDirLeaf = Split-Path -Path $gitDir -Leaf
+        if ($gitDirLeaf -ieq 'cmd' -or $gitDirLeaf -ieq 'bin') {
+            $gitDir = Split-Path -Path $gitDir -Parent
+        }
+
+        $excludePaths = @(
+            (([IO.Path]::GetFullPath($gitDir)).TrimEnd('\') + '\'),
+            (([IO.Path]::GetFullPath($InstallDir)).TrimEnd('\') + '\')
+        )
+
+        $excludeProcesses = @(
+            'git.exe',
+            'git-ai.exe',
+            'ssh.exe',
+            'git-remote-https.exe',
+            'git-credential-manager.exe',
+            'git-lfs.exe'
+        )
+
+        $iniFile = Read-TextFilePreservingEncoding -Path $hookinfoPath
+        $lines = $iniFile.Lines
+        $encoding = $iniFile.Encoding
+
+        $changed = $false
+        $changed = (Set-IniValue -Lines $lines -Section 'Global' -Key 'Mode' -Value '0') -or $changed
+        $changed = (Add-AnyShareExcludeItems -Lines $lines -Paths $excludePaths -Processes $excludeProcesses) -or $changed
+
+        if ($changed) {
+            $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $backupPath = "$hookinfoPath.bak.$timestamp"
+            Copy-Item -LiteralPath $hookinfoPath -Destination $backupPath -Force
+            [System.IO.File]::WriteAllLines($hookinfoPath, $lines.ToArray(), $encoding)
+            Restart-AnyShareSyncClientServiceIfRunning
+            Write-Success "Successfully configured AnyShare Hookinfo.ini. Backup: $backupPath"
+        } else {
+            Write-Success 'AnyShare Hookinfo.ini already contains git-ai hook exclusions.'
+        }
+    } catch {
+        Write-Warning "Warning: Failed to configure AnyShare Hookinfo.ini: $($_.Exception.Message)"
+    }
+}
+
+# GitHub repository details
+# Replaced during release builds with the actual repository (e.g., "git-ai-project/git-ai")
+# When set to __REPO_PLACEHOLDER__, defaults to "git-ai-project/git-ai"
+$Repo = '__REPO_PLACEHOLDER__'
+if ($Repo -eq '__REPO_PLACEHOLDER__') {
+    $Repo = 'git-ai-project/git-ai'
+}
+
+# Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
+# When set to __VERSION_PLACEHOLDER__, defaults to "latest"
+$PinnedVersion = '__VERSION_PLACEHOLDER__'
+
+# Embedded checksums - replaced during release builds with actual SHA256 checksums
+# Format: "hash  filename|hash  filename|..." (pipe-separated)
+# When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
+$EmbeddedChecksums = '__CHECKSUMS_PLACEHOLDER__'
+
+# Ensure TLS 1.2 for GitHub downloads on older PowerShell versions
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+} catch { }
+
+function Get-Architecture {
+    try {
+        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+        switch ($arch) {
+            'X64' { return 'x64' }
+            'Arm64' { return 'arm64' }
+            default { return $null }
+        }
+    } catch {
+        $pa = $env:PROCESSOR_ARCHITECTURE
+        if ($pa -match 'ARM64') { return 'arm64' }
+        elseif ($pa -match '64') { return 'x64' }
+        else { return $null }
+    }
+}
+
+function Get-StdGitPath {
+    $cmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    $gitPath = $null
+    if ($cmd -and $cmd.Path) {
+        # Ensure we never return a path for git that contains git-ai (recursive)
+        if ($cmd.Path -notmatch "git-ai") {
+            $gitPath = $cmd.Path
+        }
+    }
+
+    # If detection failed or was our own shim, try to recover from saved config
+    if (-not $gitPath) {
+        try {
+            $cfgPath = Join-Path $HOME ".git-ai\config.json"
+            if (Test-Path -LiteralPath $cfgPath) {
+                $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+                if ($cfg -and $cfg.git_path -and ($cfg.git_path -notmatch 'git-ai') -and (Test-Path -LiteralPath $cfg.git_path)) {
+                    $gitPath = $cfg.git_path
+                }
+            }
+        } catch { }
+    }
+
+    if (-not $gitPath) {
+        try {
+            $gitPath = Convert-Path (git-ai git-path)
+        } catch {
+
+        }
+    }
+
+    # If still not found, fail with a clear message
+    if (-not $gitPath) {
+        Write-ErrorAndExit "Could not detect a standard git binary on PATH. Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
+    }
+
+    try {
+        & $gitPath --version
+        if ($LASTEXITCODE -ne 0) { throw 'bad' }
+    } catch {
+        Write-ErrorAndExit "Detected git at $gitPath is not usable (--version failed). Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
+    }
+
+    return $gitPath
+}
+
+# Ensure $PathToAdd is inserted before any PATH entry that contains "git" (case-insensitive)
+# Updates Machine (system) PATH; if not elevated, emits a prominent error with instructions
+function Set-PathPrependBeforeGit {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathToAdd
+    )
+
+    $sep = ';'
+
+    function NormalizePath([string]$p) {
+        try { return ([IO.Path]::GetFullPath($p.Trim())).TrimEnd('\\').ToLowerInvariant() }
+        catch { return ($p.Trim()).TrimEnd('\\').ToLowerInvariant() }
+    }
+
+    $normalizedAdd = NormalizePath $PathToAdd
+
+    # Helper to build new PATH string with PathToAdd inserted before first 'git' entry
+    function BuildPathWithInsert([string]$existingPath, [string]$toInsert) {
+        $entries = @()
+        if ($existingPath) { $entries = ($existingPath -split $sep) | Where-Object { $_ -and $_.Trim() -ne '' } }
+
+        # De-duplicate and remove any existing instance of $toInsert
+        $list = New-Object System.Collections.Generic.List[string]
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($e in $entries) {
+            $n = NormalizePath $e
+            if (-not $seen.Contains($n) -and $n -ne $normalizedAdd) {
+                $seen.Add($n)
+                $list.Add($e)
+            }
+        }
+
+        # Find first index that matches 'git' anywhere (case-insensitive)
+        $insertIndex = 0
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            if ($list[$i] -match '(?i)git') { $insertIndex = $i; break }
+        }
+
+        $list.Insert($insertIndex, $toInsert)
+        return ($list -join $sep)
+    }
+
+    $userStatus = 'Skipped'
+    try {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $newUserPath = BuildPathWithInsert -existingPath $userPath -toInsert $PathToAdd
+        if ($newUserPath -ne $userPath) {
+            [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+            $userStatus = 'Updated'
+        } else {
+            $userStatus = 'AlreadyPresent'
+        }
+    } catch {
+        $userStatus = 'Error'
+    }
+
+    # Try to update Machine PATH
+    $machineStatus = 'Skipped'
+    try {
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $newMachinePath = BuildPathWithInsert -existingPath $machinePath -toInsert $PathToAdd
+        if ($newMachinePath -ne $machinePath) {
+            [Environment]::SetEnvironmentVariable('Path', $newMachinePath, 'Machine')
+            $machineStatus = 'Updated'
+        } else {
+            # Nothing changed at Machine scope; still treat as Machine for reporting
+            $machineStatus = 'AlreadyPresent'
+        }
+    } catch {
+        # Access denied or not elevated; do NOT modify User PATH. Print big red error with instructions.
+        $origGit = $null
+        try { $origGit = Get-StdGitPath } catch { }
+        $origGitDir = if ($origGit) { (Split-Path $origGit -Parent) } else { 'your Git installation directory' }
+        Write-Host ''
+        Write-Host 'ERROR: Unable to update the SYSTEM PATH (administrator rights required).' -ForegroundColor Red
+        Write-Host 'Your PATH was NOT changed. To ensure git-ai takes precedence over Git:' -ForegroundColor Red
+        Write-Host ("  1) Run PowerShell as Administrator and re-run this installer; OR") -ForegroundColor Red
+        Write-Host ("  2) Manually edit the SYSTEM Path and move '{0}' before any entries containing 'Git' (e.g. '{1}')." -f $PathToAdd, $origGitDir) -ForegroundColor Red
+        Write-Host "     Steps: Start -> type 'Environment Variables' -> 'Edit the system environment variables' -> Environment Variables ->" -ForegroundColor Red
+        Write-Host ("            Under 'System variables', select 'Path' -> Edit -> Move '{0}' to the top (before Git) -> OK." -f $PathToAdd) -ForegroundColor Red
+        Write-Host ''
+        if ($userStatus -eq 'Updated' -or $userStatus -eq 'AlreadyPresent') {
+            Write-Host 'User PATH was updated successfully, so git-ai will still take precedence for this account.' -ForegroundColor Yellow
+        }
+        $machineStatus = 'Error'
+    }
+
+    # Update current process PATH immediately for this session
+    try {
+        $procPath = $env:PATH
+        $newProcPath = BuildPathWithInsert -existingPath $procPath -toInsert $PathToAdd
+        if ($newProcPath -ne $procPath) { $env:PATH = $newProcPath }
+    } catch { }
+
+    return [PSCustomObject]@{
+        UserStatus    = $userStatus
+        MachineStatus = $machineStatus
+    }
+}
+
+# Detect standard Git early and validate (fail-fast behavior)
+$stdGitPath = Get-StdGitPath
+
+# Detect architecture and OS
+$arch = Get-Architecture
+if (-not $arch) { Write-ErrorAndExit "Unsupported architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" }
+$os = 'windows'
+
+# Determine binary name and download URLs
+$binaryName = "git-ai"
+
+# Determine release tag
+# Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
+$abstractBinary = Join-Path (Get-Location) "target\release\$binaryName.exe"
+if (Test-Path -LiteralPath $abstractBinary) {
+    $releaseTag = 'local'
+} elseif (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
+    $releaseTag = 'local'
+} elseif ($PinnedVersion -ne '__VERSION_PLACEHOLDER__') {
+    # Version-pinned install script from a release
+    $releaseTag = $PinnedVersion
+    $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
+    $downloadUrlNoExt = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName"
+} elseif (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_RELEASE_TAG) -and $env:GIT_AI_RELEASE_TAG -ne 'latest') {
+    # Environment variable override
+    $releaseTag = $env:GIT_AI_RELEASE_TAG
+    $downloadUrlExe = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName.exe"
+    $downloadUrlNoExt = "https://github.com/$Repo/releases/download/$releaseTag/$binaryName"
+} else {
+    # Default to latest
+    $releaseTag = 'latest'
+    $downloadUrlExe = "https://github.com/$Repo/releases/latest/download/$binaryName.exe"
+    $downloadUrlNoExt = "https://github.com/$Repo/releases/latest/download/$binaryName"
+}
+
+# Install directory: %USERPROFILE%\.git-ai\bin
+$installDir = Join-Path $HOME ".git-ai\bin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+Write-Host ("Downloading git-ai (release: {0})..." -f $releaseTag)
+$tmpFile = Join-Path $installDir "git-ai.tmp.$PID.exe"
+
+function Try-Download {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+     try {
+        # Disable progress bar to avoid extreme slowdown caused by PowerShell's
+        # progress-stream rendering (can make downloads 10-50x slower).
+        $oldProgressPreference = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $tmpFile -UseBasicParsing -ErrorAction Stop
+        } finally {
+            $ProgressPreference = $oldProgressPreference
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Track which download URL succeeded for checksum verification
+$downloadedBinaryName = $null
+if (Test-Path -LiteralPath $abstractBinary) {
+    Copy-Item -Force -Path $abstractBinary -Destination $tmpFile
+    $downloadedBinaryName = "$binaryName.exe"
+} elseif (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
+    if (-not (Test-Path -LiteralPath $env:GIT_AI_LOCAL_BINARY)) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+        Write-ErrorAndExit "Local binary not found at $($env:GIT_AI_LOCAL_BINARY)"
+    }
+    Copy-Item -Force -Path $env:GIT_AI_LOCAL_BINARY -Destination $tmpFile
+    $downloadedBinaryName = "$binaryName.exe"
+} elseif (Try-Download -Url $downloadUrlExe) {
+    $downloadedBinaryName = "$binaryName.exe"
+} elseif (Try-Download -Url $downloadUrlNoExt) {
+    $downloadedBinaryName = $binaryName
+}
+
+if (-not $downloadedBinaryName) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+    Write-ErrorAndExit 'Failed to download binary (HTTP error)'
+}
+
+try {
+    if ((Get-Item $tmpFile).Length -le 0) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+        Write-ErrorAndExit 'Downloaded file is empty'
+    }
+} catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+    Write-ErrorAndExit 'Download failed'
+}
+
+# Verify checksum if embedded (release builds only)
+Verify-Checksum -File $tmpFile -BinaryName $downloadedBinaryName
+
+$finalExe = Join-Path $installDir 'git-ai.exe'
+
+# Wait for git-ai.exe to be available if it exists and is in use
+if (Test-Path -LiteralPath $finalExe) {
+    if (-not (Wait-ForFileAvailable -Path $finalExe -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
+        Write-ErrorAndExit "Timeout waiting for $finalExe to be available. Please close any running git-ai processes and try again."
+    }
+}
+
+Move-Item -Force -Path $tmpFile -Destination $finalExe
+try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
+
+# Create a shim so calling `git` goes through git-ai by PATH precedence
+$gitShim = Join-Path $installDir 'git.exe'
+
+# Wait for git.exe shim to be available if it exists and is in use
+if (Test-Path -LiteralPath $gitShim) {
+    if (-not (Wait-ForFileAvailable -Path $gitShim -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
+        Write-ErrorAndExit "Timeout waiting for $gitShim to be available. Please close any running git processes and try again."
+    }
+}
+
+Copy-Item -Force -Path $finalExe -Destination $gitShim
+try { Unblock-File -Path $gitShim -ErrorAction SilentlyContinue } catch { }
+
+# AnyShare SyncClientService may inject winhook DLLs into git/git-ai via sharetool.exe,
+# which can leave git commands hanging. Exclude Git and git-ai from AnyShare hooks when
+# Hookinfo.ini is present; skip silently on machines without AnyShare.
+Configure-AnyShareHookinfo -InstallDir $installDir -StdGitPath $stdGitPath
+
+# Create a shim so calling `git-og` invokes the standard Git
+$gitOgShim = Join-Path $installDir 'git-og.cmd'
+$gitOgShimContent = "@echo off$([Environment]::NewLine)`"$stdGitPath`" %*$([Environment]::NewLine)"
+Set-Content -Path $gitOgShim -Value $gitOgShimContent -Encoding ASCII -Force
+try { Unblock-File -Path $gitOgShim -ErrorAction SilentlyContinue } catch { }
+
+# Login user with install token if provided
+# $needLogin = $false
+# Write-Host "API_BASE: $env:API_BASE"
+# if ($env:INSTALL_NONCE -and $env:API_BASE) {
+#     try {
+#         # & $finalExe exchange-nonce | Out-Host
+#         & $finalExe exchange-nonce
+#         if ($LASTEXITCODE -ne 0) {
+#             $needLogin = $true
+#         }
+#     } catch {
+#         $needLogin = $true
+#     }
+# }
+
+Write-Host "Config notes_store to rest"
+try {
+    & $finalExe config set notes_store "rest"
+    & $finalExe config set api_key "git-ai123456789"
+    # & $finalExe config set feature_flags.async_mode "false"
+    Write-Success 'Successfully config notes_store to rest.'
+} catch {
+    Write-Success 'Warning: Failed config notes_store to rest.'
+}
+
+# Install hooks
+Write-Host 'Setting up IDE/agent hooks...'
+try {
+    & $finalExe uninstall-hooks
+    & $finalExe install-hooks
+    # & $finalExe install-hooks | Out-Host
+    Write-Success 'Successfully set up IDE/agent hooks'
+} catch {
+    Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
+}
+
+# Update PATH so our shim takes precedence over any Git entries
+$skipPathUpdate = $env:GIT_AI_SKIP_PATH_UPDATE -eq '1'
+if ($skipPathUpdate) {
+    Write-Warning 'Skipping PATH updates because GIT_AI_SKIP_PATH_UPDATE=1'
+    $pathUpdate = [PSCustomObject]@{
+        UserStatus    = 'Skipped'
+        MachineStatus = 'Skipped'
+    }
+} else {
+    $pathUpdate = Set-PathPrependBeforeGit -PathToAdd $installDir
+}
+if ($pathUpdate.UserStatus -eq 'Updated') {
+    Write-Success 'Successfully added git-ai to the user PATH.'
+} elseif ($pathUpdate.UserStatus -eq 'AlreadyPresent') {
+    Write-Success 'git-ai already present in the user PATH.'
+} elseif ($pathUpdate.UserStatus -eq 'Error') {
+    Write-Host 'Failed to update the user PATH.' -ForegroundColor Red
+}
+
+if ($pathUpdate.MachineStatus -eq 'Updated') {
+    Write-Success 'Successfully added git-ai to the system PATH.'
+} elseif ($pathUpdate.MachineStatus -eq 'AlreadyPresent') {
+    Write-Success 'git-ai already present in the system PATH.'
+} elseif ($pathUpdate.MachineStatus -eq 'Error') {
+    Write-Host 'PATH update failed: system PATH unchanged.' -ForegroundColor Red
+}
+
+Write-Success "Successfully installed git-ai into $installDir"
+Write-Success "You can now run 'git-ai' from your terminal"
+
+# Configure Git Bash shell profiles so git-ai takes precedence over /mingw64/bin/git
+# Git Bash (MSYS2/MinGW) prepends its own directories to PATH, which shadows
+# the Windows PATH entry we set above. Writing to ~/.bashrc ensures git-ai's
+# bin directory is prepended after Git Bash's own PATH setup.
+$gitBashConfigured = $false
+$gitBashAlreadyConfigured = $false
+try {
+    $bashrcPath = Join-Path $HOME '.bashrc'
+    $bashProfilePath = Join-Path $HOME '.bash_profile'
+    $pathCmd = 'export PATH="$HOME/.git-ai/bin:$PATH"'
+    $markerString = '.git-ai/bin'
+
+    # Detect if Git Bash is installed
+    $gitBashInstalled = $false
+    $gitForWindowsPaths = @()
+    if ($env:ProgramFiles) { $gitForWindowsPaths += Join-Path $env:ProgramFiles 'Git\bin\bash.exe' }
+    if (${env:ProgramFiles(x86)}) { $gitForWindowsPaths += Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe' }
+    if ($env:LOCALAPPDATA) { $gitForWindowsPaths += Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe' }
+    foreach ($p in $gitForWindowsPaths) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            $gitBashInstalled = $true
+            break
+        }
+    }
+
+    if ($gitBashInstalled) {
+        # Determine which config file to update (prefer .bashrc, fall back to .bash_profile)
+        $targetBashConfig = $null
+        if (Test-Path -LiteralPath $bashrcPath) {
+            $targetBashConfig = $bashrcPath
+        } elseif (Test-Path -LiteralPath $bashProfilePath) {
+            $targetBashConfig = $bashProfilePath
+    } else {
+            # No existing config; create .bashrc
+            $targetBashConfig = $bashrcPath
+        }
+
+        # Check if already configured
+        $alreadyPresent = $false
+        if (Test-Path -LiteralPath $targetBashConfig) {
+            $content = Get-Content -LiteralPath $targetBashConfig -Raw -ErrorAction SilentlyContinue
+            if ($content -and $content.Contains($markerString)) {
+                $alreadyPresent = $true
+            }
+        }
+
+        if ($alreadyPresent) {
+            $gitBashAlreadyConfigured = $true
+        } else {
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $appendContent = "`n# Added by git-ai installer on $timestamp`n$pathCmd`n"
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::AppendAllText($targetBashConfig, $appendContent, $utf8NoBom)
+            $gitBashConfigured = $true
+        }
+    }
+} catch {
+    Write-Host "Warning: Failed to configure Git Bash: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+if ($gitBashConfigured) {
+    Write-Success "Successfully configured Git Bash ($targetBashConfig)"
+} elseif ($gitBashAlreadyConfigured) {
+    Write-Success "Git Bash already configured ($targetBashConfig)"
+}
+
+# Write JSON config at %USERPROFILE%\.git-ai\config.json (only if it doesn't exist)
+try {
+    $configDir = Join-Path $HOME '.git-ai'
+    $configJsonPath = Join-Path $configDir 'config.json'
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+    if (-not (Test-Path -LiteralPath $configJsonPath)) {
+        $cfg = @{
+            git_path = $stdGitPath
+            feature_flags = @{
+                async_mode = $true
+            }
+        } | ConvertTo-Json -Depth 3 -Compress
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($configJsonPath, $cfg, $utf8NoBom)
+    }
+} catch {
+    Write-Host "Warning: Failed to write config.json: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Config Init
+try {
+    & $finalExe config set telemetry_enterprise_dsn "$SENTRY_ENTERPRISE"
+    Write-Success 'Successfully config telemetry_enterprise_dsn.'
+} catch {
+    Write-Success 'Warning: Failed config telemetry_enterprise_dsn.'
+}
+
+# If nonce exchange failed, run interactive login
+Write-Host ''
+Write-Host 'Launching login...'
+& $finalExe login
+
+Write-Host 'Close and reopen your terminal and IDE sessions to use git-ai.' -ForegroundColor Yellow

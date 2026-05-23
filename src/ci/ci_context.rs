@@ -128,14 +128,15 @@ impl CiContext {
                     "Rewriting authorship for {} -> {} (squash or rebase-like merge)",
                     head_sha, merge_commit_sha
                 );
-                if options.skip_fetch_base {
+                // merge_base() requires OIDs, not ref names — resolve upfront.
+                let base_ref_sha = if options.skip_fetch_base {
                     println!("Skipping base branch fetch for {}", base_ref);
                     self.repo.revparse_single(base_ref).map_err(|e| {
                         GitAiError::Generic(format!(
                             "Failed to resolve base ref '{}' locally while --skip-fetch-base is set: {}",
                             base_ref, e
                         ))
-                    })?;
+                    })?.id()
                 } else {
                     println!("Fetching base branch {}", base_ref);
                     // Ensure we have all the required commits from the base branch
@@ -146,25 +147,39 @@ impl CiContext {
                         ))
                     })?;
                     println!("Fetched base branch.");
-                }
+                    self.repo
+                        .revparse_single(base_ref)
+                        .map_err(|e| {
+                            GitAiError::Generic(format!(
+                                "Failed to resolve base ref '{}' after fetch: {}",
+                                base_ref, e
+                            ))
+                        })?
+                        .id()
+                };
 
                 // Detect squash vs rebase merge by counting commits
                 // For squash: N original commits → 1 merge commit
                 // For rebase: N original commits → N rebased commits
                 let merge_base = self
                     .repo
-                    .merge_base(head_sha.to_string(), base_ref.to_string())
+                    .merge_base(head_sha.to_string(), base_ref_sha)
                     .ok();
 
                 let original_commits = if let Some(ref base) = merge_base {
-                    CommitRange::new_infer_refname(
+                    let mut commits = CommitRange::new_infer_refname(
                         &self.repo,
                         base.clone(),
                         head_sha.to_string(),
                         None,
                     )
                     .map(|r| r.all_commits())
-                    .unwrap_or_else(|_| vec![head_sha.to_string()])
+                    .unwrap_or_else(|_| vec![head_sha.to_string()]);
+                    // CommitRange uses `git rev-list` which returns newest-first.
+                    // rewrite_authorship_after_rebase_v2 expects oldest-first (same as
+                    // the local rebase hook which calls .reverse() after rev-list).
+                    commits.reverse();
+                    commits
                 } else {
                     vec![head_sha.to_string()]
                 };
@@ -402,7 +417,7 @@ mod tests {
     #[test]
     fn test_get_rebased_commits_linear_history() {
         let test_repo = TmpRepo::new().unwrap();
-        let repo = test_repo.gitai_repo();
+        let _repo = test_repo.gitai_repo();
 
         // Create a linear commit history
         let file_path = test_repo.path().join("test.txt");
@@ -469,7 +484,7 @@ mod tests {
     #[test]
     fn test_get_rebased_commits_more_than_available() {
         let test_repo = TmpRepo::new().unwrap();
-        let repo = test_repo.gitai_repo();
+        let _repo = test_repo.gitai_repo();
 
         // Create single commit
         let file_path = test_repo.path().join("test.txt");
