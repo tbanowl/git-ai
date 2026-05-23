@@ -6,3 +6,5 @@
 prompts.db
 .benchmarks/
 __pycache__/
+.claude
+.vscode
