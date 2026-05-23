@@ -1858,6 +1858,333 @@ fn daemon_commit_without_human_checkpoint_marks_human_edit_after_ai_commit_as_hu
 
 #[test]
 #[serial]
+fn daemon_commit_with_autocrlf_marks_human_edit_after_ai_commit_as_human() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    repo.git(&["config", "core.autocrlf", "true"])
+        .expect("setting core.autocrlf should succeed");
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let file_rel = "daemon-autocrlf-human-after-ai.txt";
+    let file_path = repo.path().join(file_rel);
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(&file_path, "base line\r\n").expect("failed to write base contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\r\nai line unchanged\r\nai line to edit\r\n",
+    )
+    .expect("failed to write ai contents");
+    expected_top_level_completions += 1;
+    repo.git_ai_with_env(
+        &["checkpoint", "mock_ai", file_rel],
+        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+    )
+    .expect("delegated ai checkpoint should succeed");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "ai commit"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\r\nai line unchanged\r\nai line edited by human\r\nhuman line\r\n",
+    )
+    .expect("failed to write human edit contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit add should succeed");
+    traced_git_with_env(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "human edit without checkpoint under autocrlf",
+        ],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
+
+    let head = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("head should resolve")
+        .trim()
+        .to_string();
+    assert!(
+        repo.read_authorship_note(&head).is_some(),
+        "human edit commit should have an authorship note even under core.autocrlf=true"
+    );
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
+    ]);
+}
+
+#[test]
+#[serial]
+fn daemon_human_commit_with_ai_like_author_email_uses_authorship_note_not_agent_fallback() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let file_rel = "daemon-ai-like-email-human-edit.txt";
+    let file_path = repo.path().join(file_rel);
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(&file_path, "base line\n").expect("failed to write base contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line to edit\n",
+    )
+    .expect("failed to write ai contents");
+    expected_top_level_completions += 1;
+    repo.git_ai_with_env(
+        &["checkpoint", "mock_ai", file_rel],
+        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+    )
+    .expect("delegated ai checkpoint should succeed");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "ai commit"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line edited by human\nhuman line\n",
+    )
+    .expect("failed to write human edit contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit add should succeed");
+    traced_git_with_env(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "human edit with ai-like author email",
+            "--author",
+            "Human Using Agent Email <noreply@anthropic.com>",
+        ],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
+
+    let head = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("head should resolve")
+        .trim()
+        .to_string();
+    assert!(
+        repo.read_authorship_note(&head).is_some(),
+        "human edit commit needs an authorship note so blame does not fall back to AI email detection"
+    );
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
+    ]);
+}
+
+#[test]
+#[serial]
+#[cfg(windows)]
+fn windows_daemon_autocrlf_ai_like_author_email_keeps_human_edit_human() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    repo.git(&["config", "core.autocrlf", "true"])
+        .expect("setting core.autocrlf should succeed");
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let file_rel = "windows-daemon-autocrlf-ai-like-email.txt";
+    let file_path = repo.path().join(file_rel);
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(&file_path, "base line\r\n").expect("failed to write base contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\r\nai line unchanged\r\nai line to edit\r\n",
+    )
+    .expect("failed to write ai contents");
+    expected_top_level_completions += 1;
+    repo.git_ai_with_env(
+        &["checkpoint", "mock_ai", file_rel],
+        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+    )
+    .expect("delegated ai checkpoint should succeed");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "ai commit"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\r\nai line unchanged\r\nai line edited by human\r\nhuman line\r\n",
+    )
+    .expect("failed to write human edit contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit add should succeed");
+    traced_git_with_env(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "human edit under windows autocrlf",
+            "--author",
+            "Human Using Agent Email <noreply@anthropic.com>",
+        ],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
+
+    let head = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("head should resolve")
+        .trim()
+        .to_string();
+    assert!(
+        repo.read_authorship_note(&head).is_some(),
+        "Windows human edit commit should have an authorship note; without it blame can fall back to AI email detection"
+    );
+
+    let native_blame = repo
+        .git(&["blame", "--line-porcelain", file_rel])
+        .expect("native git blame should succeed");
+    assert!(
+        native_blame.contains("author-mail <noreply@anthropic.com>"),
+        "fixture should create a human edit commit whose git author email would trigger AI fallback if the note were missing:\n{}",
+        native_blame
+    );
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
+    ]);
+}
+
+#[test]
+#[serial]
 fn daemon_commit_with_stale_active_bash_context_does_not_mark_human_edit_as_ai() {
     let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
     let _daemon = DaemonGuard::start(&repo);

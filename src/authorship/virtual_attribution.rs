@@ -1190,6 +1190,11 @@ fn collect_unstaged_hunks_from_snapshot(
             .cloned()
             .unwrap_or_else(|| committed_content.clone());
 
+        let committed_content =
+            crate::authorship::imara_diff_utils::normalize_line_endings(&committed_content);
+        let final_content =
+            crate::authorship::imara_diff_utils::normalize_line_endings(&final_content);
+
         if committed_content == final_content {
             continue;
         }
@@ -2710,5 +2715,98 @@ mod tests {
         }
 
         assert!(!virtual_attributions.files().is_empty());
+    }
+
+    #[test]
+    fn snapshot_unstaged_hunks_ignore_line_ending_only_differences() {
+        let repo = TmpRepo::new().unwrap();
+        repo.write_file("example.txt", "AI line\nHuman line\n", true)
+            .unwrap();
+        repo.commit_with_message("Initial commit").unwrap();
+        let commit_sha = repo.head_commit_sha().unwrap();
+
+        let final_state_snapshot = HashMap::from([(
+            "example.txt".to_string(),
+            "AI line\r\nHuman line\r\n".to_string(),
+        )]);
+
+        let (unstaged_hunks, pure_insertion_hunks) = collect_unstaged_hunks_from_snapshot(
+            repo.gitai_repo(),
+            &commit_sha,
+            None,
+            &final_state_snapshot,
+        )
+        .unwrap();
+
+        assert!(
+            unstaged_hunks.is_empty(),
+            "CRLF-only snapshot differences should not mark committed lines as unstaged: {unstaged_hunks:?}"
+        );
+        assert!(
+            pure_insertion_hunks.is_empty(),
+            "CRLF-only snapshot differences should not create pure insertion hunks: {pure_insertion_hunks:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_unstaged_hunks_detect_real_insertions_with_crlf_snapshot() {
+        let repo = TmpRepo::new().unwrap();
+        repo.write_file("example.txt", "AI line\nHuman line\n", true)
+            .unwrap();
+        repo.commit_with_message("Initial commit").unwrap();
+        let commit_sha = repo.head_commit_sha().unwrap();
+
+        let final_state_snapshot = HashMap::from([(
+            "example.txt".to_string(),
+            "AI line\r\nInserted human line\r\nHuman line\r\n".to_string(),
+        )]);
+
+        let (unstaged_hunks, pure_insertion_hunks) = collect_unstaged_hunks_from_snapshot(
+            repo.gitai_repo(),
+            &commit_sha,
+            None,
+            &final_state_snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unstaged_hunks.get("example.txt"),
+            Some(&vec![LineRange::Single(2)])
+        );
+        assert_eq!(
+            pure_insertion_hunks.get("example.txt"),
+            Some(&vec![LineRange::Single(2)])
+        );
+    }
+
+    #[test]
+    fn snapshot_unstaged_hunks_detect_real_replacements_with_crlf_snapshot() {
+        let repo = TmpRepo::new().unwrap();
+        repo.write_file("example.txt", "AI line\nHuman line\n", true)
+            .unwrap();
+        repo.commit_with_message("Initial commit").unwrap();
+        let commit_sha = repo.head_commit_sha().unwrap();
+
+        let final_state_snapshot = HashMap::from([(
+            "example.txt".to_string(),
+            "AI line\r\nEdited human line\r\n".to_string(),
+        )]);
+
+        let (unstaged_hunks, pure_insertion_hunks) = collect_unstaged_hunks_from_snapshot(
+            repo.gitai_repo(),
+            &commit_sha,
+            None,
+            &final_state_snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unstaged_hunks.get("example.txt"),
+            Some(&vec![LineRange::Single(2)])
+        );
+        assert!(
+            pure_insertion_hunks.is_empty(),
+            "replacements are not pure insertions: {pure_insertion_hunks:?}"
+        );
     }
 }
