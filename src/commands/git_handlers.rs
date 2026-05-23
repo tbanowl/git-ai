@@ -1528,7 +1528,7 @@ mod tests {
 
     #[cfg(windows)]
     mod windows_retry_exempt {
-        use super::*;
+        use crate::commands::git_handlers::is_command_exempt_from_retry;
 
         #[test]
         fn exempt_commands_are_detected() {

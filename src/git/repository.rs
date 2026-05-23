@@ -4216,8 +4216,8 @@ mod tests {
 
         let stdout_raw = child.stdout.as_ref().map(|stdout| stdout.as_raw_handle());
         let stderr_raw = child.stderr.as_ref().map(|stderr| stderr.as_raw_handle());
-        let stdout_handle = read_pipe_in_background(child.stdout.take());
-        let stderr_handle = read_pipe_in_background(child.stderr.take());
+        let stdout_handle = read_pipe_in_background("stdout", child.stdout.take());
+        let stderr_handle = read_pipe_in_background("stderr", child.stderr.take());
 
         loop {
             if let Some(status) = child.try_wait().map_err(GitAiError::IoError)? {
