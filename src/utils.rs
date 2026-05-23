@@ -194,69 +194,40 @@ pub fn is_in_background_agent() -> bool {
 /// for the lifetime of the struct. The lock is automatically released when dropped
 /// or when the process exits.
 pub struct LockFile {
-    #[cfg(windows)]
-    handle: isize,
-    #[cfg(unix)]
-    fd: std::os::unix::io::RawFd,
+    _file: std::fs::File,
 }
 
 impl LockFile {
     /// Try to acquire an exclusive lock on the given path.
     /// Returns `Some(LockFile)` if successful, `None` if another process holds the lock.
     pub fn try_acquire(path: &std::path::Path) -> Option<Self> {
-        let lock = try_lock_exclusive(path)?;
-        Some(lock)
+        let file = try_lock_exclusive(path)?;
+        Some(Self { _file: file })
     }
 }
 
 #[cfg(unix)]
 impl Drop for LockFile {
     fn drop(&mut self) {
-        unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
 #[cfg(unix)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<LockFile> {
+#[allow(clippy::suspicious_open_options)]
+fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .truncate(true)
         .write(true)
         .open(path)
         .ok()?;
-    let fd = file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return None;
     }
-    // Transfer ownership: forget the File so its Drop doesn't close the fd.
-    std::mem::forget(file);
-    Some(LockFile { fd })
-}
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn UnlockFile(
-        hFile: isize,
-        dwFileOffsetLow: u32,
-        dwFileOffsetHigh: u32,
-        nNumberOfBytesToUnlockLow: u32,
-        nNumberOfBytesToUnlockHigh: u32,
-    );
-}
-
-#[cfg(windows)]
-unsafe impl Send for LockFile {}
-#[cfg(windows)]
-unsafe impl Sync for LockFile {}
-
-#[cfg(windows)]
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        // SAFETY: we own this handle and no other code uses it.
-        unsafe { UnlockFile(self.handle, 0, 0, u32::MAX, u32::MAX) };
-    }
+    Some(file)
 }
 
 #[cfg(windows)]
