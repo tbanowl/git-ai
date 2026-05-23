@@ -261,75 +261,14 @@ impl Drop for LockFile {
 
 #[cfg(windows)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<LockFile> {
-    use libloading::{Library, Symbol};
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    const GENERIC_READ: u32 = 0x80000000u32;
-    const GENERIC_WRITE: u32 = 0x40000000u32;
-    const FILE_SHARE_NONE: u32 = 0u32;
-    const OPEN_ALWAYS: u32 = 4u32;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000u32;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80u32;
-    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2u32;
-    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1u32;
-    const INVALID_HANDLE_VALUE: isize = -1isize;
-
-    let lib = unsafe { Library::new("kernel32.dll") }.ok()?;
-
-    type CreateFileWFn = unsafe extern "system" fn(
-        *const u16,
-        u32,
-        u32,
-        *mut std::ffi::c_void,
-        u32,
-        u32,
-        *mut std::ffi::c_void,
-    ) -> isize;
-    let create_file: Symbol<'_, CreateFileWFn> = unsafe { lib.get(b"CreateFileW") }.ok()?;
-
-    type LockFileExFn =
-        unsafe extern "system" fn(isize, u32, u32, u32, u32, *mut std::ffi::c_void) -> i32;
-    let lock_file: Symbol<'_, LockFileExFn> = unsafe { lib.get(b"LockFileEx") }.ok()?;
-
-    let wide_path: Vec<u16> = OsStr::new(path.as_os_str())
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
-    let handle = unsafe {
-        create_file(
-            wide_path.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_NONE,
-            std::ptr::null_mut(),
-            OPEN_ALWAYS,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let result = unsafe {
-        lock_file(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            u32::MAX,
-            u32::MAX,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if result == 0 {
-        return None;
-    }
-
-    Some(LockFile { handle })
+fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+        .ok()
 }
 
 /// Windows-specific flag to prevent console window creation

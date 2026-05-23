@@ -2,13 +2,18 @@
 #[path = "integration/repos/mod.rs"]
 mod repos;
 
-use git_ai::authorship::working_log::CheckpointKind;
-use git_ai::authorship::{transcript::AiTranscript, working_log::AgentId};
+use git_ai::authorship::{
+    transcript::AiTranscript,
+    working_log::{AgentId, CheckpointKind},
+};
 use git_ai::commands::checkpoint::{
     PreparedCheckpointFile, PreparedCheckpointFileSource, PreparedCheckpointManifest,
     PreparedPathRole, prepare_captured_checkpoint,
 };
 use git_ai::commands::checkpoint_agent::agent_presets::AgentRunResult;
+use git_ai::commands::checkpoint_agent::bash_tool::{
+    InflightBashAgentContext, StatSnapshot, has_active_bash_inflight, save_snapshot,
+};
 use git_ai::daemon::{
     CapturedCheckpointRunRequest, CheckpointRunRequest, ControlRequest, DaemonConfig, DaemonLock,
     local_socket_connects_with_timeout, open_local_socket_stream_with_timeout, read_daemon_pid,
@@ -1760,6 +1765,216 @@ fn daemon_pure_trace_socket_commit_after_ai_checkpoint_preserves_ai_replacement_
 
     let mut file = repo.filename("daemon-ai-replace.txt");
     file.assert_lines_and_blame(lines!["new line from ai".ai()]);
+}
+
+#[test]
+#[serial]
+fn daemon_commit_without_human_checkpoint_marks_human_edit_after_ai_commit_as_human() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let file_rel = "daemon-human-after-ai.txt";
+    let file_path = repo.path().join(file_rel);
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(&file_path, "base line\n").expect("failed to write base contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line to edit\n",
+    )
+    .expect("failed to write ai contents");
+    expected_top_level_completions += 1;
+    repo.git_ai_with_env(
+        &["checkpoint", "mock_ai", file_rel],
+        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+    )
+    .expect("delegated ai checkpoint should succeed");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "ai commit"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line edited by human\nhuman line\n",
+    )
+    .expect("failed to write human edit contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "human edit without checkpoint"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
+    ]);
+}
+
+#[test]
+#[serial]
+fn daemon_commit_with_stale_active_bash_context_does_not_mark_human_edit_as_ai() {
+    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+    let file_rel = "daemon-stale-bash-human-edit.txt";
+    let file_path = repo.path().join(file_rel);
+    let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
+
+    fs::write(&file_path, "base line\n").expect("failed to write base contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "base"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("base commit should succeed");
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line to edit\n",
+    )
+    .expect("failed to write ai contents");
+    expected_top_level_completions += 1;
+    repo.git_ai_with_env(
+        &["checkpoint", "mock_ai", file_rel],
+        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+    )
+    .expect("delegated ai checkpoint should succeed");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "ai commit"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("ai commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
+    let after_ai_completion_count = completion_baseline + expected_top_level_completions;
+    let completed_after_ai_commit = expected_top_level_completions;
+
+    let agent_id = AgentId {
+        tool: "test-agent".to_string(),
+        id: "stale-bash-context".to_string(),
+        model: "test-model".to_string(),
+    };
+    let snapshot = StatSnapshot {
+        entries: HashMap::new(),
+        taken_at: None,
+        invocation_key: "stale-bash-context:tool-use".to_string(),
+        repo_root: repo.path().clone(),
+        effective_worktree_wm: None,
+        per_file_wm: HashMap::new(),
+        inflight_agent_context: Some(InflightBashAgentContext {
+            session_id: "stale-bash-context".to_string(),
+            tool_use_id: "tool-use".to_string(),
+            agent_id,
+            agent_metadata: None,
+        }),
+    };
+    save_snapshot(&snapshot).expect("failed to save stale active bash snapshot");
+    assert!(
+        has_active_bash_inflight(repo.path()),
+        "test fixture should create an active bash context before the human commit"
+    );
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line edited by human\nhuman line\n",
+    )
+    .expect("failed to write human edit contents");
+    traced_git_with_env(
+        &repo,
+        &["add", file_rel],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit add should succeed");
+    traced_git_with_env(
+        &repo,
+        &["commit", "-m", "human edit while bash snapshot is stale"],
+        &env_refs,
+        &mut expected_top_level_completions,
+    )
+    .expect("human edit commit should succeed");
+    wait_for_expected_top_level_completions(
+        &repo,
+        after_ai_completion_count,
+        expected_top_level_completions - completed_after_ai_commit,
+    );
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
+    ]);
 }
 
 #[test]
