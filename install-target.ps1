@@ -251,59 +251,6 @@ function Resolve-ServiceExecutablePath {
     return $trimmed
 }
 
-function Find-AnyShareHookinfoIni {
-    $serviceCandidates = @()
-    try {
-        $service = Get-CimInstance Win32_Service -Filter "Name='SyncClientService'" -ErrorAction SilentlyContinue
-        if ($service -and $service.PathName) {
-            $serviceExe = Resolve-ServiceExecutablePath -PathName $service.PathName
-            if ($serviceExe -and (Test-Path -LiteralPath $serviceExe)) {
-                $serviceDir = Split-Path -Path $serviceExe -Parent
-                $serviceCandidates += (Join-Path $serviceDir 'Hookinfo.ini')
-            }
-        }
-    } catch {
-        Write-Warning "Warning: Failed to inspect AnyShare SyncClientService: $($_.Exception.Message)"
-    }
-
-    $candidates = @(
-        'C:\Program Files (x86)\AISHU\Sync\Hookinfo.ini',
-        'C:\Program Files\AISHU\Sync\Hookinfo.ini'
-    )
-
-    foreach ($serviceCandidate in $serviceCandidates) {
-        if ($serviceCandidate -and ($candidates -notcontains $serviceCandidate)) {
-            $candidates = @($serviceCandidate) + $candidates
-        }
-    }
-
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            return $candidate
-        }
-    }
-
-    $roots = @(
-        'C:\Program Files (x86)\AISHU',
-        'C:\Program Files\AISHU'
-    )
-
-    foreach ($root in $roots) {
-        if (Test-Path -LiteralPath $root) {
-            try {
-                $found = Get-ChildItem -LiteralPath $root -Filter 'Hookinfo.ini' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($found) {
-                    return $found.FullName
-                }
-            } catch {
-                Write-Warning "Warning: Failed to search AnyShare Hookinfo.ini under ${root}: $($_.Exception.Message)"
-            }
-        }
-    }
-
-    return $null
-}
-
 function Read-TextFilePreservingEncoding {
     param(
         [Parameter(Mandatory = $true)][string]$Path
@@ -417,155 +364,6 @@ function Normalize-IniValue {
     )
 
     return $Value.Trim().Trim('"').Trim("'").TrimEnd('\').ToLowerInvariant()
-}
-
-function Add-AnyShareExcludeItems {
-    param(
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines,
-        [Parameter(Mandatory = $true)][string[]]$Paths,
-        [Parameter(Mandatory = $true)][string[]]$Processes
-    )
-
-    Ensure-IniSection -Lines $Lines -Section 'Exclude'
-    $range = Get-IniSectionRange -Lines $Lines -Section 'Exclude'
-
-    $existingPaths = @{}
-    $existingProcesses = @{}
-    $maxPathIndex = -1
-    $maxProcessIndex = -1
-
-    for ($i = $range.Start + 1; $i -le $range.End; $i++) {
-        $line = $Lines[$i]
-        if ($line -match '^\s*Path(\d+)\s*=\s*(.+?)\s*$') {
-            $index = [int]$Matches[1]
-            $existingPaths[(Normalize-IniValue -Value $Matches[2])] = $true
-            if ($index -gt $maxPathIndex) {
-                $maxPathIndex = $index
-            }
-        } elseif ($line -match '^\s*Process(\d+)\s*=\s*(.+?)\s*$') {
-            $index = [int]$Matches[1]
-            $existingProcesses[(Normalize-IniValue -Value $Matches[2])] = $true
-            if ($index -gt $maxProcessIndex) {
-                $maxProcessIndex = $index
-            }
-        }
-    }
-
-    $changed = $false
-    $insertIndex = $range.End + 1
-
-    foreach ($path in $Paths) {
-        if ([string]::IsNullOrWhiteSpace($path)) {
-            continue
-        }
-
-        $normalized = Normalize-IniValue -Value $path
-        if (-not $existingPaths.ContainsKey($normalized)) {
-            $maxPathIndex++
-            $Lines.Insert($insertIndex, "Path$maxPathIndex=$path")
-            $insertIndex++
-            $existingPaths[$normalized] = $true
-            $changed = $true
-        }
-    }
-
-    foreach ($process in $Processes) {
-        if ([string]::IsNullOrWhiteSpace($process)) {
-            continue
-        }
-
-        $normalized = Normalize-IniValue -Value $process
-        if (-not $existingProcesses.ContainsKey($normalized)) {
-            $maxProcessIndex++
-            $Lines.Insert($insertIndex, "Process$maxProcessIndex=$process")
-            $insertIndex++
-            $existingProcesses[$normalized] = $true
-            $changed = $true
-        }
-    }
-
-    return $changed
-}
-
-function Restart-AnyShareSyncClientServiceIfRunning {
-    try {
-        $service = Get-Service -Name 'SyncClientService' -ErrorAction SilentlyContinue
-        if (-not $service) {
-            return
-        }
-
-        if ($service.Status -ne 'Running') {
-            Write-Host 'AnyShare SyncClientService is not running; Hookinfo.ini changes will apply next time it starts.'
-            return
-        }
-
-        Write-Host 'Restarting AnyShare SyncClientService to apply Hookinfo.ini...'
-        Stop-Service -Name 'SyncClientService' -Force -ErrorAction Stop
-        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
-        Start-Service -Name 'SyncClientService' -ErrorAction Stop
-        $service.Refresh()
-        $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
-    } catch {
-        Write-Warning "Warning: Failed to restart AnyShare SyncClientService: $($_.Exception.Message)"
-    }
-}
-
-function Configure-AnyShareHookinfo {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstallDir,
-        [Parameter(Mandatory = $true)][string]$StdGitPath
-    )
-
-    $hookinfoPath = Find-AnyShareHookinfoIni
-    if (-not $hookinfoPath) {
-        Write-Host 'AnyShare Hookinfo.ini not found; skipping AnyShare hook exclusion config.'
-        return
-    }
-
-    Write-Host "Configuring AnyShare hook exclusions: $hookinfoPath"
-
-    try {
-        $gitDir = Split-Path -Path $StdGitPath -Parent
-        $gitDirLeaf = Split-Path -Path $gitDir -Leaf
-        if ($gitDirLeaf -ieq 'cmd' -or $gitDirLeaf -ieq 'bin') {
-            $gitDir = Split-Path -Path $gitDir -Parent
-        }
-
-        $excludePaths = @(
-            (([IO.Path]::GetFullPath($gitDir)).TrimEnd('\') + '\'),
-            (([IO.Path]::GetFullPath($InstallDir)).TrimEnd('\') + '\')
-        )
-
-        $excludeProcesses = @(
-            'git.exe',
-            'git-ai.exe',
-            'ssh.exe',
-            'git-remote-https.exe',
-            'git-credential-manager.exe',
-            'git-lfs.exe'
-        )
-
-        $iniFile = Read-TextFilePreservingEncoding -Path $hookinfoPath
-        $lines = $iniFile.Lines
-        $encoding = $iniFile.Encoding
-
-        $changed = $false
-        $changed = (Set-IniValue -Lines $lines -Section 'Global' -Key 'Mode' -Value '0') -or $changed
-        $changed = (Add-AnyShareExcludeItems -Lines $lines -Paths $excludePaths -Processes $excludeProcesses) -or $changed
-
-        if ($changed) {
-            $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-            $backupPath = "$hookinfoPath.bak.$timestamp"
-            Copy-Item -LiteralPath $hookinfoPath -Destination $backupPath -Force
-            [System.IO.File]::WriteAllLines($hookinfoPath, $lines.ToArray(), $encoding)
-            Restart-AnyShareSyncClientServiceIfRunning
-            Write-Success "Successfully configured AnyShare Hookinfo.ini. Backup: $backupPath"
-        } else {
-            Write-Success 'AnyShare Hookinfo.ini already contains git-ai hook exclusions.'
-        }
-    } catch {
-        Write-Warning "Warning: Failed to configure AnyShare Hookinfo.ini: $($_.Exception.Message)"
-    }
 }
 
 # GitHub repository details
@@ -876,11 +674,6 @@ if (Test-Path -LiteralPath $gitShim) {
 Copy-Item -Force -Path $finalExe -Destination $gitShim
 try { Unblock-File -Path $gitShim -ErrorAction SilentlyContinue } catch { }
 
-# AnyShare SyncClientService may inject winhook DLLs into git/git-ai via sharetool.exe,
-# which can leave git commands hanging. Exclude Git and git-ai from AnyShare hooks when
-# Hookinfo.ini is present; skip silently on machines without AnyShare.
-Configure-AnyShareHookinfo -InstallDir $installDir -StdGitPath $stdGitPath
-
 # Create a shim so calling `git-og` invokes the standard Git
 $gitOgShim = Join-Path $installDir 'git-og.cmd'
 $gitOgShimContent = "@echo off$([Environment]::NewLine)`"$stdGitPath`" %*$([Environment]::NewLine)"
@@ -901,27 +694,6 @@ try { Unblock-File -Path $gitOgShim -ErrorAction SilentlyContinue } catch { }
 #         $needLogin = $true
 #     }
 # }
-
-Write-Host "Config notes_store to rest"
-try {
-    & $finalExe config set notes_store "rest"
-    & $finalExe config set api_key "git-ai123456789"
-    # & $finalExe config set feature_flags.async_mode "false"
-    Write-Success 'Successfully config notes_store to rest.'
-} catch {
-    Write-Success 'Warning: Failed config notes_store to rest.'
-}
-
-# Install hooks
-Write-Host 'Setting up IDE/agent hooks...'
-try {
-    & $finalExe uninstall-hooks
-    & $finalExe install-hooks
-    # & $finalExe install-hooks | Out-Host
-    Write-Success 'Successfully set up IDE/agent hooks'
-} catch {
-    Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
-}
 
 # Update PATH so our shim takes precedence over any Git entries
 $skipPathUpdate = $env:GIT_AI_SKIP_PATH_UPDATE -eq '1'
@@ -1050,6 +822,27 @@ try {
 # If nonce exchange failed, run interactive login
 Write-Host ''
 Write-Host 'Launching login...'
-& $finalExe login
+# & $finalExe login
+
+Write-Host "Config notes_store to rest"
+try {
+    & $finalExe config set notes_store "rest"
+    & $finalExe config set api_key "git-ai123456789"
+    # & $finalExe config set feature_flags.async_mode "false"
+    Write-Success 'Successfully config notes_store to rest.'
+} catch {
+    Write-Success 'Warning: Failed config notes_store to rest.'
+}
+
+# Install hooks
+Write-Host 'Setting up IDE/agent hooks...'
+try {
+    & $finalExe uninstall-hooks
+    & $finalExe install-hooks
+    # & $finalExe install-hooks | Out-Host
+    Write-Success 'Successfully set up IDE/agent hooks'
+} catch {
+    Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
+}
 
 Write-Host 'Close and reopen your terminal and IDE sessions to use git-ai.' -ForegroundColor Yellow
