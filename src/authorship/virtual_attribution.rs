@@ -2,9 +2,11 @@ use crate::authorship::attribution_tracker::{
     Attribution, LineAttribution, line_attributions_to_attributions,
 };
 use crate::authorship::authorship_log::{LineRange, PromptRecord};
+use crate::authorship::duplicate_parent_ai::DuplicateParentAiContext;
 use crate::authorship::working_log::CheckpointKind;
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::error::GitAiError;
+use crate::git::refs::get_reference_as_authorship_log_v3;
 use crate::git::repository::Repository;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -1314,6 +1316,17 @@ impl VirtualAttributions {
 
         let mut initial_files: StdHashMap<String, Vec<LineAttribution>> = StdHashMap::new();
         let mut referenced_prompts: HashSet<String> = HashSet::new();
+        let parent_authorship_log = if parent_sha == "initial" {
+            None
+        } else {
+            get_reference_as_authorship_log_v3(repo, parent_sha).ok()
+        };
+        let mut duplicate_parent_ai_context = DuplicateParentAiContext::new_exact(
+            repo,
+            commit_sha,
+            (parent_sha != "initial").then_some(parent_sha),
+            parent_authorship_log.as_ref(),
+        );
 
         // Get committed hunks (in commit coordinates) and unstaged hunks (in working directory coordinates)
         let committed_hunks = collect_committed_hunks(repo, parent_sha, commit_sha, pathspecs)?;
@@ -1527,6 +1540,13 @@ impl VirtualAttributions {
 
                     lines.sort();
                     lines.dedup();
+                    lines.retain(|line| {
+                        !duplicate_parent_ai_context.is_duplicate_parent_ai_line(
+                            &nfc_file_path,
+                            *line,
+                            &author_id,
+                        )
+                    });
 
                     if lines.is_empty() {
                         continue;

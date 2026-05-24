@@ -845,4 +845,9 @@ try {
     Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
 }
 
+try {
+    & $finalExe bg shutdown --hard
+} catch {
+
+}
 Write-Host 'Close and reopen your terminal and IDE sessions to use git-ai.' -ForegroundColor Yellow

@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::working_log::CheckpointKind;
 use git_ai::git::find_repository_in_path;
 
@@ -692,7 +693,8 @@ fn test_uncheckpointed_human_copy_after_ai_commit_stays_human() {
         "let generated = compute();\nlet generated = compute();\n",
     )
     .unwrap();
-    repo.stage_all_and_commit("Human copies committed AI line without checkpoint")
+    let human_copy_commit = repo
+        .stage_all_and_commit("Human copies committed AI line without checkpoint")
         .unwrap();
 
     let mut file = repo.filename("copy_after_commit.rs");
@@ -700,6 +702,101 @@ fn test_uncheckpointed_human_copy_after_ai_commit_stays_human() {
         "let generated = compute();".ai(),
         "let generated = compute();".human(),
     ]);
+
+    assert!(
+        human_copy_commit.authorship_log.attestations.is_empty(),
+        "human duplicate copy should not create an AI note attestation: {:#?}",
+        human_copy_commit.authorship_log
+    );
+    assert!(
+        human_copy_commit.authorship_log.metadata.prompts.is_empty(),
+        "human duplicate copy should not leave AI prompt metadata in the note: {:#?}",
+        human_copy_commit.authorship_log.metadata.prompts
+    );
+
+    let persisted_log = authorship_note_for_commit(&repo, &human_copy_commit.commit_sha);
+    assert!(
+        persisted_log.attestations.is_empty(),
+        "persisted note should not contain AI attestations: {persisted_log:#?}"
+    );
+    assert!(
+        persisted_log.metadata.prompts.is_empty(),
+        "persisted note should not contain AI prompt metadata: {:#?}",
+        persisted_log.metadata.prompts
+    );
+}
+
+#[test]
+fn test_human_duplicate_copy_of_parent_ai_line_does_not_write_ai_note() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("selection_sort.py");
+
+    let ai_content = "def selection_sort(arr):\n    for i in range(len(arr) - 1):\n        min_idx = i\n        for j in range(i + 1, len(arr)):\n            if arr[j] < arr[min_idx]:\n                min_idx = j\n        arr[i], arr[min_idx] = arr[min_idx], arr[i]\n    return arr\n\n\nif __name__ == \"__main__\":\n    data = [64, 34, 25, 12, 22, 11, 90]\n    print(\"Before:\", data)\n    print(\"After: \", selection_sort(data.copy()))\n";
+    std::fs::write(&file_path, ai_content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "selection_sort.py"])
+        .unwrap();
+    let ai_commit = repo
+        .stage_all_and_commit("Commit AI selection sort")
+        .unwrap();
+    assert_eq!(
+        ai_commit.authorship_log.attestations.len(),
+        1,
+        "precondition: AI commit should have one file attestation"
+    );
+
+    let human_copy_content = "def selection_sort(arr):\n    for i in range(len(arr) - 1):\n        min_idx = i\n        for j in range(i + 1, len(arr)):\n            if arr[j] < arr[min_idx]:\n                min_idx = j\n        arr[i], arr[min_idx] = arr[min_idx], arr[i]\n    return arr\n\n\nif __name__ == \"__main__\":\n    data = [64, 34, 25, 12, 22, 11, 90]\n    data = [64, 34, 25, 12, 22, 11, 90]\n    print(\"Before:\", data)\n    print(\"After: \", selection_sort(data.copy()))\n";
+    std::fs::write(&file_path, human_copy_content).unwrap();
+    let human_copy_commit = repo
+        .stage_all_and_commit("Human copies AI data line")
+        .unwrap();
+
+    let mut file = repo.filename("selection_sort.py");
+    file.assert_lines_and_blame(crate::lines![
+        "def selection_sort(arr):".ai(),
+        "    for i in range(len(arr) - 1):".ai(),
+        "        min_idx = i".ai(),
+        "        for j in range(i + 1, len(arr)):".ai(),
+        "            if arr[j] < arr[min_idx]:".ai(),
+        "                min_idx = j".ai(),
+        "        arr[i], arr[min_idx] = arr[min_idx], arr[i]".ai(),
+        "    return arr".ai(),
+        "".ai(),
+        "".ai(),
+        "if __name__ == \"__main__\":".ai(),
+        "    data = [64, 34, 25, 12, 22, 11, 90]".human(),
+        "    data = [64, 34, 25, 12, 22, 11, 90]".ai(),
+        "    print(\"Before:\", data)".ai(),
+        "    print(\"After: \", selection_sort(data.copy()))".ai(),
+    ]);
+
+    assert!(
+        human_copy_commit.authorship_log.attestations.is_empty(),
+        "human duplicate copy should not create an AI note attestation: {:#?}",
+        human_copy_commit.authorship_log
+    );
+    assert!(
+        human_copy_commit.authorship_log.metadata.prompts.is_empty(),
+        "human duplicate copy should not leave AI prompt metadata in the note: {:#?}",
+        human_copy_commit.authorship_log.metadata.prompts
+    );
+
+    let persisted_log = authorship_note_for_commit(&repo, &human_copy_commit.commit_sha);
+    assert!(
+        persisted_log.attestations.is_empty(),
+        "persisted note should not contain AI attestations: {persisted_log:#?}"
+    );
+    assert!(
+        persisted_log.metadata.prompts.is_empty(),
+        "persisted note should not contain AI prompt metadata: {:#?}",
+        persisted_log.metadata.prompts
+    );
+}
+
+fn authorship_note_for_commit(repo: &TestRepo, commit_sha: &str) -> AuthorshipLog {
+    let note = repo
+        .read_authorship_note(commit_sha)
+        .expect("commit should have an authorship note");
+    AuthorshipLog::deserialize_from_string(&note).expect("authorship note should parse")
 }
 
 #[test]
@@ -827,6 +924,7 @@ crate::reuse_tests_in_worktree!(
     test_uncheckpointed_human_token_change_on_ai_line_reclaims_attribution,
     test_uncheckpointed_human_copy_after_ai_checkpoint_before_commit_stays_human,
     test_uncheckpointed_human_copy_after_ai_commit_stays_human,
+    test_human_duplicate_copy_of_parent_ai_line_does_not_write_ai_note,
     test_uncheckpointed_human_token_change_after_ai_checkpoint_before_commit_reclaims_attribution,
     test_human_token_change_on_ai_line_reclaims_attribution,
     test_known_human_aliases_serialize_as_canonical_human_checkpoint,
