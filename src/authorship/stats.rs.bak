@@ -1,10 +1,11 @@
+use crate::authorship::authorship_log::LineRange;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::authorship::transcript::Message;
 use crate::error::GitAiError;
 use crate::git::refs::get_authorship;
 use crate::git::repository::Repository;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolModelHeadlineStats {
@@ -554,17 +555,14 @@ pub fn stats_for_commit_stats(
     // This keeps accepted stats scoped to the target commit while avoiding expensive blame traversal.
     let parent_count = commit_obj.parent_count()?;
     let is_merge_commit = parent_count > 1;
-    let parent_commit_sha = if parent_count == 1 {
-        Some(commit_obj.parent(0)?.id())
-    } else {
-        None
-    };
     let mut added_lines_by_file: HashMap<String, Vec<u32>> = if is_merge_commit {
         HashMap::new()
     } else {
-        let from_ref = parent_commit_sha
-            .clone()
-            .unwrap_or_else(|| "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string());
+        let from_ref = if parent_count == 0 {
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+        } else {
+            commit_obj.parent(0)?.id()
+        };
         repo.diff_added_lines(&from_ref, commit_sha, None)?
     };
     let ignore_matcher = build_ignore_matcher(ignore_patterns);
@@ -576,20 +574,10 @@ pub fn stats_for_commit_stats(
     }
 
     // Step 4: derive accepted lines directly from note attestations for lines added in this commit.
-    let parent_authorship_log = parent_commit_sha
-        .as_deref()
-        .and_then(|parent_sha| get_authorship(repo, parent_sha));
-    let mut duplicate_context = ParentAiDuplicateContext::new(
-        repo,
-        commit_sha,
-        parent_commit_sha.as_deref(),
-        parent_authorship_log.as_ref(),
-    );
-    let (ai_accepted, ai_accepted_by_tool) = accepted_lines_from_attestations_with_duplicate_filter(
+    let (ai_accepted, ai_accepted_by_tool) = accepted_lines_from_attestations(
         authorship_log.as_ref(),
         &added_lines_by_file,
         is_merge_commit,
-        Some(&mut duplicate_context),
     );
 
     // Step 5: Calculate stats from authorship log
@@ -602,25 +590,10 @@ pub fn stats_for_commit_stats(
     ))
 }
 
-#[cfg(test)]
 fn accepted_lines_from_attestations(
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
     added_lines_by_file: &HashMap<String, Vec<u32>>,
     is_merge_commit: bool,
-) -> (u32, BTreeMap<String, u32>) {
-    accepted_lines_from_attestations_with_duplicate_filter(
-        authorship_log,
-        added_lines_by_file,
-        is_merge_commit,
-        None,
-    )
-}
-
-fn accepted_lines_from_attestations_with_duplicate_filter(
-    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
-    added_lines_by_file: &HashMap<String, Vec<u32>>,
-    is_merge_commit: bool,
-    mut duplicate_context: Option<&mut ParentAiDuplicateContext<'_>>,
 ) -> (u32, BTreeMap<String, u32>) {
     if is_merge_commit {
         return (0, BTreeMap::new());
@@ -639,31 +612,11 @@ fn accepted_lines_from_attestations_with_duplicate_filter(
         };
 
         for entry in &file_attestation.entries {
-            let mut accepted = 0u32;
-            for line in added_lines {
-                if !entry
-                    .line_ranges
-                    .iter()
-                    .any(|line_range| line_range.contains(*line))
-                {
-                    continue;
-                }
-
-                let duplicate_parent_ai_line =
-                    duplicate_context.as_deref_mut().is_some_and(|context| {
-                        context.is_duplicate_parent_ai_line(
-                            &file_attestation.file_path,
-                            *line,
-                            &entry.hash,
-                        )
-                    });
-
-                if duplicate_parent_ai_line {
-                    continue;
-                }
-
-                accepted += 1;
-            }
+            let accepted = entry
+                .line_ranges
+                .iter()
+                .map(|line_range| line_range_overlap_len(line_range, added_lines))
+                .sum::<u32>();
 
             if accepted == 0 {
                 continue;
@@ -684,140 +637,6 @@ fn accepted_lines_from_attestations_with_duplicate_filter(
     (total_ai_accepted, per_tool_model)
 }
 
-struct ParentAiDuplicateContext<'a> {
-    repo: &'a Repository,
-    commit_sha: &'a str,
-    parent_sha: Option<&'a str>,
-    parent_authorship_log:
-        Option<&'a crate::authorship::authorship_log_serialization::AuthorshipLog>,
-    current_file_lines: HashMap<String, Option<Vec<String>>>,
-    parent_file_lines: HashMap<String, Option<Vec<String>>>,
-    parent_prompt_lines: HashMap<(String, String), HashSet<String>>,
-}
-
-impl<'a> ParentAiDuplicateContext<'a> {
-    fn new(
-        repo: &'a Repository,
-        commit_sha: &'a str,
-        parent_sha: Option<&'a str>,
-        parent_authorship_log: Option<
-            &'a crate::authorship::authorship_log_serialization::AuthorshipLog,
-        >,
-    ) -> Self {
-        Self {
-            repo,
-            commit_sha,
-            parent_sha,
-            parent_authorship_log,
-            current_file_lines: HashMap::new(),
-            parent_file_lines: HashMap::new(),
-            parent_prompt_lines: HashMap::new(),
-        }
-    }
-
-    fn is_duplicate_parent_ai_line(
-        &mut self,
-        file_path: &str,
-        current_line: u32,
-        prompt_hash: &str,
-    ) -> bool {
-        let Some(line_text) = self.current_line_text(file_path, current_line) else {
-            return false;
-        };
-        if line_text.is_empty() {
-            return false;
-        }
-
-        self.parent_prompt_line_texts(file_path, prompt_hash)
-            .contains(&line_text)
-    }
-
-    fn current_line_text(&mut self, file_path: &str, line: u32) -> Option<String> {
-        let commit_sha = self.commit_sha;
-        let repo = self.repo;
-        let lines = self
-            .current_file_lines
-            .entry(file_path.to_string())
-            .or_insert_with(|| read_normalized_lines_at_commit(repo, commit_sha, file_path));
-        line.checked_sub(1)
-            .and_then(|idx| lines.as_ref()?.get(idx as usize).cloned())
-    }
-
-    fn parent_prompt_line_texts(&mut self, file_path: &str, prompt_hash: &str) -> &HashSet<String> {
-        let key = (file_path.to_string(), prompt_hash.to_string());
-        if !self.parent_prompt_lines.contains_key(&key) {
-            let lines = self.collect_parent_prompt_line_texts(file_path, prompt_hash);
-            self.parent_prompt_lines.insert(key.clone(), lines);
-        }
-        self.parent_prompt_lines
-            .get(&key)
-            .expect("parent prompt line cache should contain key")
-    }
-
-    fn collect_parent_prompt_line_texts(
-        &mut self,
-        file_path: &str,
-        prompt_hash: &str,
-    ) -> HashSet<String> {
-        let Some(parent_sha) = self.parent_sha else {
-            return HashSet::new();
-        };
-        let Some(parent_log) = self.parent_authorship_log else {
-            return HashSet::new();
-        };
-
-        let repo = self.repo;
-        let parent_lines = self
-            .parent_file_lines
-            .entry(file_path.to_string())
-            .or_insert_with(|| read_normalized_lines_at_commit(repo, parent_sha, file_path));
-        let Some(parent_lines) = parent_lines.as_ref() else {
-            return HashSet::new();
-        };
-
-        let mut texts = HashSet::new();
-        for file_attestation in &parent_log.attestations {
-            if file_attestation.file_path != file_path {
-                continue;
-            }
-            for entry in &file_attestation.entries {
-                if entry.hash != prompt_hash {
-                    continue;
-                }
-                for range in &entry.line_ranges {
-                    for line in range.expand() {
-                        let Some(text) = line
-                            .checked_sub(1)
-                            .and_then(|idx| parent_lines.get(idx as usize))
-                        else {
-                            continue;
-                        };
-                        if !text.is_empty() {
-                            texts.insert(text.clone());
-                        }
-                    }
-                }
-            }
-        }
-        texts
-    }
-}
-
-fn read_normalized_lines_at_commit(
-    repo: &Repository,
-    commit_sha: &str,
-    file_path: &str,
-) -> Option<Vec<String>> {
-    let bytes = repo.get_file_content(file_path, commit_sha).ok()?;
-    let content = String::from_utf8_lossy(&bytes);
-    Some(content.lines().map(normalize_line_for_copy_match).collect())
-}
-
-fn normalize_line_for_copy_match(line: &str) -> String {
-    line.trim().to_string()
-}
-
-#[cfg(test)]
 fn line_range_overlap_len(range: &LineRange, added_lines: &[u32]) -> u32 {
     match range {
         LineRange::Single(line) => u32::from(added_lines.binary_search(line).is_ok()),
@@ -1992,5 +1811,3 @@ mod tests {
         );
     }
 }
-#[cfg(test)]
-use crate::authorship::authorship_log::LineRange;

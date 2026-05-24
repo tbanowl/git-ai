@@ -654,6 +654,72 @@ fn test_uncheckpointed_human_token_change_on_ai_line_reclaims_attribution() {
 }
 
 #[test]
+fn test_uncheckpointed_human_copy_after_ai_checkpoint_before_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("copy_after_checkpoint.rs");
+
+    std::fs::write(&file_path, "let generated = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "copy_after_checkpoint.rs"])
+        .unwrap();
+
+    std::fs::write(
+        &file_path,
+        "let generated = compute();\nlet generated = compute();\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Human copies AI line before commit without checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("copy_after_checkpoint.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "let generated = compute();".ai(),
+        "let generated = compute();".human(),
+    ]);
+}
+
+#[test]
+fn test_uncheckpointed_human_copy_after_ai_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("copy_after_commit.rs");
+
+    std::fs::write(&file_path, "let generated = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "copy_after_commit.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Commit AI line").unwrap();
+
+    std::fs::write(
+        &file_path,
+        "let generated = compute();\nlet generated = compute();\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("Human copies committed AI line without checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("copy_after_commit.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "let generated = compute();".ai(),
+        "let generated = compute();".human(),
+    ]);
+}
+
+#[test]
+fn test_uncheckpointed_human_token_change_after_ai_checkpoint_before_commit_reclaims_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("token_after_checkpoint.rs");
+
+    std::fs::write(&file_path, "let x = compute();\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "token_after_checkpoint.rs"])
+        .unwrap();
+
+    std::fs::write(&file_path, "let value = compute();\n").unwrap();
+    repo.stage_all_and_commit("Human changes AI line before commit without checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("token_after_checkpoint.rs");
+    file.assert_lines_and_blame(crate::lines!["let value = compute();".human()]);
+}
+
+#[test]
 fn test_human_token_change_on_ai_line_reclaims_attribution() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("token_change.rs");
@@ -759,6 +825,9 @@ crate::reuse_tests_in_worktree!(
     test_uncheckpointed_edge_spaces_commit_writes_ai_note_and_clears_parent_working_log,
     test_mixed_checkpointed_ai_and_uncheckpointed_edge_spaces_write_both_ai_notes,
     test_uncheckpointed_human_token_change_on_ai_line_reclaims_attribution,
+    test_uncheckpointed_human_copy_after_ai_checkpoint_before_commit_stays_human,
+    test_uncheckpointed_human_copy_after_ai_commit_stays_human,
+    test_uncheckpointed_human_token_change_after_ai_checkpoint_before_commit_reclaims_attribution,
     test_human_token_change_on_ai_line_reclaims_attribution,
     test_known_human_aliases_serialize_as_canonical_human_checkpoint,
 );

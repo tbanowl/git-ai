@@ -2,7 +2,6 @@ use crate::authorship::authorship_log::{LineRange, PromptRecord};
 use crate::authorship::ignore::{
     build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::stats::{CommitStats, stats_for_commit_stats};
 use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
 use crate::git::refs::{get_authorship, show_authorship_note};
@@ -359,9 +358,23 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
             }
 
             let commit_stats = if parsed.options.include_stats {
-                let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
-                let stats = stats_for_commit_stats(repo, &to_commit, &ignore_patterns)?;
-                Some(diff_commit_stats_from_commit_stats(stats))
+                let mut stats_prompts = output_prompts.clone();
+                if is_single_commit && !parsed.options.all_prompts {
+                    merge_missing_prompts_from_authorship_note(
+                        repo,
+                        &to_commit,
+                        &mut stats_prompts,
+                    );
+                }
+                if is_single_commit && parsed.options.blame_deletions {
+                    filter_stats_prompts_for_blame_deletions(
+                        repo,
+                        &to_commit,
+                        &artifacts,
+                        &mut stats_prompts,
+                    );
+                }
+                Some(calculate_diff_commit_stats(&artifacts, &stats_prompts))
             } else {
                 None
             };
@@ -1346,7 +1359,32 @@ fn merge_missing_prompts_from_authorship_note(
     }
 }
 
-#[cfg(test)]
+fn filter_stats_prompts_for_blame_deletions(
+    repo: &Repository,
+    commit_sha: &str,
+    artifacts: &DiffBuildArtifacts,
+    prompts: &mut BTreeMap<String, PromptRecord>,
+) {
+    let mut keep_prompt_ids = prompt_ids_from_added_hunks(artifacts);
+    keep_prompt_ids.extend(prompt_ids_from_authorship_note(repo, commit_sha));
+    prompts.retain(|prompt_id, _| keep_prompt_ids.contains(prompt_id));
+}
+
+fn prompt_ids_from_added_hunks(artifacts: &DiffBuildArtifacts) -> HashSet<String> {
+    artifacts
+        .json_hunks
+        .iter()
+        .filter(|hunk| hunk.hunk_kind == "addition")
+        .filter_map(|hunk| hunk.prompt_id.clone())
+        .collect()
+}
+
+fn prompt_ids_from_authorship_note(repo: &Repository, commit_sha: &str) -> HashSet<String> {
+    get_authorship(repo, commit_sha)
+        .map(|authorship_log| authorship_log.metadata.prompts.into_keys().collect())
+        .unwrap_or_default()
+}
+
 fn line_range_len(range: &LineRange) -> u32 {
     match range {
         LineRange::Single(_) => 1,
@@ -1354,34 +1392,6 @@ fn line_range_len(range: &LineRange) -> u32 {
     }
 }
 
-fn diff_commit_stats_from_commit_stats(stats: CommitStats) -> DiffCommitStats {
-    let tool_model_breakdown = stats
-        .tool_model_breakdown
-        .into_iter()
-        .map(|(key, tool_stats)| {
-            (
-                key,
-                DiffToolModelStats {
-                    ai_lines_added: tool_stats.ai_additions,
-                    ai_lines_generated: tool_stats.total_ai_additions,
-                    ai_deletions_generated: tool_stats.total_ai_deletions,
-                },
-            )
-        })
-        .collect();
-
-    DiffCommitStats {
-        ai_lines_added: stats.ai_additions,
-        ai_lines_generated: stats.total_ai_additions,
-        ai_deletions_generated: stats.total_ai_deletions,
-        human_lines_added: stats.human_additions,
-        git_lines_added: stats.git_diff_added_lines,
-        git_lines_deleted: stats.git_diff_deleted_lines,
-        tool_model_breakdown,
-    }
-}
-
-#[cfg(test)]
 fn calculate_diff_commit_stats(
     artifacts: &DiffBuildArtifacts,
     prompts: &BTreeMap<String, PromptRecord>,

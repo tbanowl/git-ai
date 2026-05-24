@@ -189,6 +189,110 @@ fn test_human_insert_between_ai_lines_before_first_commit_stays_human() {
 }
 
 #[test]
+fn test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("evergreen_append.rs");
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"ai\");\n}\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "evergreen_append.rs"])
+        .unwrap();
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"ai\");\n}\nfn human_added() {\n    println!(\"human\");\n}\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "evergreen_append.rs"])
+        .unwrap();
+
+    repo.stage_all_and_commit("AI file with human append before first commit")
+        .unwrap();
+
+    let mut file = repo.filename("evergreen_append.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "fn generated() {".ai(),
+        "    println!(\"ai\");".ai(),
+        "}".ai(),
+        "fn human_added() {".human(),
+        "    println!(\"human\");".human(),
+        "}".human(),
+    ]);
+}
+
+#[test]
+fn test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("evergreen_uncheckpointed_append.rs");
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"ai\");\n}\n",
+    )
+    .unwrap();
+    repo.git_ai(&[
+        "checkpoint",
+        "mock_ai",
+        "evergreen_uncheckpointed_append.rs",
+    ])
+    .unwrap();
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"ai\");\n}\nfn human_added() {\n    println!(\"human\");\n}\n",
+    )
+    .unwrap();
+
+    repo.stage_all_and_commit("AI file with uncheckpointed human append before first commit")
+        .unwrap();
+
+    let mut file = repo.filename("evergreen_uncheckpointed_append.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "fn generated() {".ai(),
+        "    println!(\"ai\");".ai(),
+        "}".ai(),
+        "fn human_added() {".human(),
+        "    println!(\"human\");".human(),
+        "}".human(),
+    ]);
+}
+
+#[test]
+fn test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("evergreen_modify.rs");
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"ai\");\n}\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "evergreen_modify.rs"])
+        .unwrap();
+
+    fs::write(
+        &file_path,
+        "fn generated() {\n    println!(\"human changed this line\");\n}\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "evergreen_modify.rs"])
+        .unwrap();
+
+    repo.stage_all_and_commit("AI file with human modification before first commit")
+        .unwrap();
+
+    let mut file = repo.filename("evergreen_modify.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "fn generated() {".ai(),
+        "    println!(\"human changed this line\");".human(),
+        "}".ai(),
+    ]);
+}
+
+#[test]
 fn test_simple_additions_new_file_not_git_added() {
     let repo = TestRepo::new();
     let mut file = repo.filename("new_file.txt");
@@ -1860,5 +1964,8 @@ crate::reuse_tests_in_worktree!(
     test_complex_mixed_additions_and_deletions,
     test_partial_staging_filters_unstaged_lines,
     test_human_stages_some_ai_lines,
+    test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_human,
+    test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_commit_stays_human,
+    test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human,
     test_ai_generated_file_then_human_full_rewrite,
 );
