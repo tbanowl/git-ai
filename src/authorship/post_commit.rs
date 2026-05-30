@@ -825,9 +825,10 @@ fn record_commit_metrics(
 
     // Build attributes - start with version
     let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
+    let metrics_author = commit_author_for_metrics(repo, commit_sha, human_author);
 
     attrs = attrs
-        .author(human_author)
+        .author(metrics_author)
         .commit_sha(commit_sha)
         .base_commit_sha(parent_sha);
 
@@ -854,12 +855,27 @@ fn record_commit_metrics(
     record(values, attrs);
 }
 
+fn commit_author_for_metrics(repo: &Repository, commit_sha: &str, fallback_author: &str) -> String {
+    if let Ok(commit) = repo.find_commit(commit_sha.to_string())
+        && let Ok(author) = commit.author()
+    {
+        match (author.name(), author.email()) {
+            (Some(name), Some(email)) => return format!("{} <{}>", name, email),
+            (Some(name), None) => return name.to_string(),
+            (None, Some(email)) => return email.to_string(),
+            (None, None) => {}
+        }
+    }
+
+    fallback_author.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         STATS_SKIP_MAX_ADDED_LINES, STATS_SKIP_MAX_DELETED_LINES,
         STATS_SKIP_MAX_FILES_WITH_ADDITIONS, STATS_SKIP_MAX_HUNKS, StatsCostEstimate,
-        count_line_ranges, should_skip_expensive_post_commit_stats,
+        commit_author_for_metrics, count_line_ranges, should_skip_expensive_post_commit_stats,
     };
     use crate::git::test_utils::TmpRepo;
 
@@ -975,6 +991,40 @@ mod tests {
         assert!(
             authorship_log.attestations.is_empty(),
             "Should have empty attestations when no checkpoints exist"
+        );
+    }
+
+    #[test]
+    fn test_commit_author_for_metrics_prefers_actual_commit_author() {
+        let tmp_repo = TmpRepo::new().unwrap();
+        tmp_repo.write_file("test.txt", "Hello\n", true).unwrap();
+
+        let mut index = tmp_repo.repo().index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = tmp_repo.repo().find_tree(tree_id).unwrap();
+        let fixed_time = git2::Time::new(1672574400, 0);
+        let author = git2::Signature::new("Real Author", "real@example.com", &fixed_time).unwrap();
+        let committer =
+            git2::Signature::new("Committer", "committer@example.com", &fixed_time).unwrap();
+        let commit_id = tmp_repo
+            .repo()
+            .commit(
+                Some("HEAD"),
+                &author,
+                &committer,
+                "Initial commit",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let repo =
+            crate::git::repository::find_repository_in_path(tmp_repo.path().to_str().unwrap())
+                .unwrap();
+
+        assert_eq!(
+            commit_author_for_metrics(&repo, &commit_id.to_string(), "Daemon Name"),
+            "Real Author <real@example.com>"
         );
     }
 
