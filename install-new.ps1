@@ -346,8 +346,8 @@ function Set-PathPrependBeforeGit {
         foreach ($e in $entries) {
             $n = NormalizePath $e
             if (-not $seen.Contains($n) -and $n -ne $normalizedAdd) {
-                $seen.Add($n)
-                $list.Add($e)
+                $seen.Add($n) | Out-Null
+                $list.Add($e) | Out-Null
             }
         }
 
