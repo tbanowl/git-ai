@@ -818,6 +818,34 @@ fn test_stats_ignores_renamed_files() {
     assert_eq!(stats.human_additions, 0);
 }
 
+#[test]
+fn test_stats_counts_human_whitespace_edit_of_ai_line_as_ai() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("whitespace-ai.txt");
+
+    fs::write(&file_path, "return value;\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "whitespace-ai.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("AI writes line").unwrap();
+
+    let mut file = repo.filename("whitespace-ai.txt");
+    file.assert_committed_lines(crate::lines!["return value;".ai()]);
+
+    fs::write(&file_path, "  return value;  \n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "whitespace-ai.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("Human adds whitespace around AI line")
+        .unwrap();
+
+    file.assert_committed_lines(crate::lines!["  return value;  ".ai()]);
+
+    let stats = stats_from_args(&repo, &["stats", "HEAD", "--json"]);
+    assert_eq!(stats.git_diff_added_lines, 1);
+    assert_eq!(stats.ai_accepted, 1);
+    assert_eq!(stats.ai_additions, 1);
+    assert_eq!(stats.human_additions, 0);
+}
+
 crate::reuse_tests_in_worktree!(
     test_authorship_log_stats,
     test_stats_cli_range,
@@ -838,4 +866,5 @@ crate::reuse_tests_in_worktree!(
     test_stats_range_uses_default_ignores,
     test_post_commit_large_ignored_files_do_not_trigger_skip_warning,
     test_stats_ignores_renamed_files,
+    test_stats_counts_human_whitespace_edit_of_ai_line_as_ai,
 );

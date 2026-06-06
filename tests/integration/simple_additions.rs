@@ -193,11 +193,7 @@ fn test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_
     let repo = TestRepo::new();
     let file_path = repo.path().join("evergreen_append.rs");
 
-    fs::write(
-        &file_path,
-        "fn generated() {\n    println!(\"ai\");\n}\n",
-    )
-    .unwrap();
+    fs::write(&file_path, "fn generated() {\n    println!(\"ai\");\n}\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "evergreen_append.rs"])
         .unwrap();
 
@@ -228,11 +224,7 @@ fn test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_comm
     let repo = TestRepo::new();
     let file_path = repo.path().join("evergreen_uncheckpointed_append.rs");
 
-    fs::write(
-        &file_path,
-        "fn generated() {\n    println!(\"ai\");\n}\n",
-    )
-    .unwrap();
+    fs::write(&file_path, "fn generated() {\n    println!(\"ai\");\n}\n").unwrap();
     repo.git_ai(&[
         "checkpoint",
         "mock_ai",
@@ -265,11 +257,7 @@ fn test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_com
     let repo = TestRepo::new();
     let file_path = repo.path().join("evergreen_modify.rs");
 
-    fs::write(
-        &file_path,
-        "fn generated() {\n    println!(\"ai\");\n}\n",
-    )
-    .unwrap();
+    fs::write(&file_path, "fn generated() {\n    println!(\"ai\");\n}\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "evergreen_modify.rs"])
         .unwrap();
 

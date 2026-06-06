@@ -2,67 +2,28 @@ use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::git::repository::Repository;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy)]
-enum DuplicateParentAiMatchMode {
-    Trimmed,
-    Exact,
-}
-
 pub(crate) struct DuplicateParentAiContext<'a> {
     repo: &'a Repository,
     commit_sha: &'a str,
     parent_sha: Option<&'a str>,
     parent_authorship_log: Option<&'a AuthorshipLog>,
-    match_mode: DuplicateParentAiMatchMode,
     current_file_lines: HashMap<String, Option<Vec<String>>>,
     parent_file_lines: HashMap<String, Option<Vec<String>>>,
     parent_prompt_lines: HashMap<(String, String), HashSet<String>>,
 }
 
 impl<'a> DuplicateParentAiContext<'a> {
-    pub(crate) fn new(
-        repo: &'a Repository,
-        commit_sha: &'a str,
-        parent_sha: Option<&'a str>,
-        parent_authorship_log: Option<&'a AuthorshipLog>,
-    ) -> Self {
-        Self::new_with_match_mode(
-            repo,
-            commit_sha,
-            parent_sha,
-            parent_authorship_log,
-            DuplicateParentAiMatchMode::Trimmed,
-        )
-    }
-
     pub(crate) fn new_exact(
         repo: &'a Repository,
         commit_sha: &'a str,
         parent_sha: Option<&'a str>,
         parent_authorship_log: Option<&'a AuthorshipLog>,
     ) -> Self {
-        Self::new_with_match_mode(
-            repo,
-            commit_sha,
-            parent_sha,
-            parent_authorship_log,
-            DuplicateParentAiMatchMode::Exact,
-        )
-    }
-
-    fn new_with_match_mode(
-        repo: &'a Repository,
-        commit_sha: &'a str,
-        parent_sha: Option<&'a str>,
-        parent_authorship_log: Option<&'a AuthorshipLog>,
-        match_mode: DuplicateParentAiMatchMode,
-    ) -> Self {
         Self {
             repo,
             commit_sha,
             parent_sha,
             parent_authorship_log,
-            match_mode,
             current_file_lines: HashMap::new(),
             parent_file_lines: HashMap::new(),
             parent_prompt_lines: HashMap::new(),
@@ -89,11 +50,10 @@ impl<'a> DuplicateParentAiContext<'a> {
     fn current_line_text(&mut self, file_path: &str, line: u32) -> Option<String> {
         let commit_sha = self.commit_sha;
         let repo = self.repo;
-        let match_mode = self.match_mode;
         let lines = self
             .current_file_lines
             .entry(file_path.to_string())
-            .or_insert_with(|| read_lines_at_commit(repo, commit_sha, file_path, match_mode));
+            .or_insert_with(|| read_lines_at_commit(repo, commit_sha, file_path));
         line.checked_sub(1)
             .and_then(|idx| lines.as_ref()?.get(idx as usize).cloned())
     }
@@ -122,11 +82,10 @@ impl<'a> DuplicateParentAiContext<'a> {
         };
 
         let repo = self.repo;
-        let match_mode = self.match_mode;
         let parent_lines = self
             .parent_file_lines
             .entry(file_path.to_string())
-            .or_insert_with(|| read_lines_at_commit(repo, parent_sha, file_path, match_mode));
+            .or_insert_with(|| read_lines_at_commit(repo, parent_sha, file_path));
         let Some(parent_lines) = parent_lines.as_ref() else {
             return HashSet::new();
         };
@@ -163,21 +122,8 @@ fn read_lines_at_commit(
     repo: &Repository,
     commit_sha: &str,
     file_path: &str,
-    match_mode: DuplicateParentAiMatchMode,
 ) -> Option<Vec<String>> {
     let bytes = repo.get_file_content(file_path, commit_sha).ok()?;
     let content = String::from_utf8_lossy(&bytes);
-    Some(
-        content
-            .lines()
-            .map(|line| normalize_line_for_copy_match(line, match_mode))
-            .collect(),
-    )
-}
-
-fn normalize_line_for_copy_match(line: &str, match_mode: DuplicateParentAiMatchMode) -> String {
-    match match_mode {
-        DuplicateParentAiMatchMode::Trimmed => line.trim().to_string(),
-        DuplicateParentAiMatchMode::Exact => line.to_string(),
-    }
+    Some(content.lines().map(|line| line.to_string()).collect())
 }

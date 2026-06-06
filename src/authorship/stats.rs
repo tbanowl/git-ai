@@ -580,7 +580,7 @@ pub fn stats_for_commit_stats(
     let parent_authorship_log = parent_commit_sha
         .as_deref()
         .and_then(|parent_sha| get_authorship(repo, parent_sha));
-    let mut duplicate_context = DuplicateParentAiContext::new(
+    let mut duplicate_context = DuplicateParentAiContext::new_exact(
         repo,
         commit_sha,
         parent_commit_sha.as_deref(),
