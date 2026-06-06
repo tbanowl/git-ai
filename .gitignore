@@ -40,3 +40,4 @@ fuzz/corpus/
 .worktrees/
 .claude/worktrees/
 .claude
+.omo
