@@ -202,11 +202,11 @@ fn test_path_is_in_workdir() {
         "File in a regular subdirectory (no .git/) should return true"
     );
 
-    // Path inside a submodule (.git file, not directory) should return true
-    // Submodules are transparent to the parent repo
+    // Path inside a submodule (.git file, not directory) should return false
+    // for content ownership. Submodule file contents belong to the submodule
+    // repository, while the parent owns .gitmodules and the gitlink pointer.
     let submodule_dir = test_repo.path().join("my-submodule");
     fs::create_dir_all(submodule_dir.join("src")).unwrap();
-    // Simulate a submodule by creating a .git *file* (not directory)
     fs::write(
         submodule_dir.join(".git"),
         "gitdir: ../.git/modules/my-submodule\n",
@@ -215,8 +215,8 @@ fn test_path_is_in_workdir() {
     let submodule_file = submodule_dir.join("src").join("lib.rs");
     fs::write(&submodule_file, "submodule content").unwrap();
     assert!(
-        repo.path_is_in_workdir(&submodule_file),
-        "File inside a submodule (.git file, not directory) should return true"
+        !repo.path_is_in_workdir(&submodule_file),
+        "File inside a submodule (.git file, not directory) should return false for content ownership"
     );
 
     // Non-existent file path inside a nested subrepo should return false
