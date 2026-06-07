@@ -17,7 +17,8 @@ use crate::test_utils::fixture_path;
 
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Creates a unique temporary directory for tests
@@ -34,6 +35,33 @@ fn create_unique_workspace(prefix: &str) -> PathBuf {
     let path = base.join(dir_name);
     fs::create_dir_all(&path).expect("failed to create workspace dir");
     path
+}
+
+fn run_git_checked(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run git {:?} in {}: {}", args, path.display(), e));
+
+    if !output.status.success() {
+        panic!(
+            "git {:?} failed in {}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn init_plain_git_repo(path: &Path) {
+    fs::create_dir_all(path).expect("failed to create git repo dir");
+    run_git_checked(path, &["init"]);
+    run_git_checked(path, &["config", "user.name", "Test User"]);
+    run_git_checked(path, &["config", "user.email", "test@example.com"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1253,105 @@ fn test_claude_preset_nested_subrepo_pre_post_cycle() {
         "Scenario 8 (cycle): AI attestations should be present in nested subrepo \
          after PreToolUse + PostToolUse cycle from parent repo's CWD."
     );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+/// Claude Code running in a parent repo and editing an initialized Git submodule.
+/// The submodule has a `.git` file pointing into the parent's `.git/modules`,
+/// so this specifically covers true submodule routing rather than an ordinary
+/// nested repo with a `.git/` directory.
+#[test]
+fn test_claude_preset_parent_cwd_real_submodule_records_prompts() {
+    let workspace = create_unique_workspace("git-ai-claude-real-submodule-test");
+
+    let remote_submodule_path = workspace.join("remote-submodule");
+    init_plain_git_repo(&remote_submodule_path);
+    fs::write(remote_submodule_path.join("README.md"), "# Remote Submodule\n").unwrap();
+    run_git_checked(&remote_submodule_path, &["add", "-A"]);
+    run_git_checked(&remote_submodule_path, &["commit", "-m", "initial submodule"]);
+
+    let parent_path = workspace.join("parent-repo");
+    let parent = TestRepo::new_at_path(&parent_path);
+    fs::write(parent_path.join("README.md"), "# Parent Repo\n").unwrap();
+    parent.stage_all_and_commit("initial parent").unwrap();
+
+    parent
+        .git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            remote_submodule_path.to_str().unwrap(),
+            "vendor/submodule",
+        ])
+        .expect("submodule add should succeed");
+    parent
+        .stage_all_and_commit("add submodule")
+        .expect("parent submodule pointer commit should succeed");
+
+    let submodule_path = parent_path.join("vendor").join("submodule");
+    let mut submodule = TestRepo::new_at_path(&submodule_path);
+    submodule.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+    });
+
+    let transcript_path = submodule.canonical_path().join("claude-session.jsonl");
+    let fixture = fixture_path("example-claude-code.jsonl");
+    fs::copy(&fixture, &transcript_path).unwrap();
+
+    let target_file = submodule.canonical_path().join("src").join("generated.ts");
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    fs::write(&target_file, "export const generated = true;\n").unwrap();
+
+    let hook_input = json!({
+        "cwd": parent.canonical_path().to_string_lossy().to_string(),
+        "hook_event_name": "PostToolUse",
+        "transcript_path": transcript_path.to_string_lossy().to_string(),
+        "tool_input": {
+            "file_path": target_file.to_string_lossy().to_string()
+        }
+    })
+    .to_string();
+
+    submodule
+        .git_ai_from_working_dir(
+            &parent.canonical_path(),
+            &["checkpoint", "claude", "--hook-input", &hook_input],
+        )
+        .expect("Claude checkpoint from parent CWD for real submodule should succeed");
+
+    let submodule_working_log = submodule.current_working_logs();
+    let submodule_ai_files = submodule_working_log
+        .all_ai_touched_files()
+        .unwrap_or_default();
+    assert!(
+        !submodule_ai_files.is_empty(),
+        "Working log entries should exist in the real submodule when Claude runs from the parent CWD"
+    );
+
+    let parent_working_log = parent.current_working_logs();
+    let parent_ai_files = parent_working_log.all_ai_touched_files().unwrap_or_default();
+    assert!(
+        parent_ai_files.is_empty(),
+        "Parent working log should not claim submodule content edits: {:?}",
+        parent_ai_files
+    );
+
+    let commit = submodule
+        .stage_all_and_commit("add generated submodule code")
+        .expect("submodule commit should succeed");
+    assert!(
+        !commit.authorship_log.metadata.prompts.is_empty(),
+        "Submodule commit note should contain Claude prompt metadata"
+    );
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "Submodule commit note should contain AI attestations"
+    );
+
+    let mut file = submodule.filename("src/generated.ts");
+    file.assert_lines_and_blame(crate::lines!["export const generated = true;".ai()]);
 
     let _ = fs::remove_dir_all(&workspace);
 }
