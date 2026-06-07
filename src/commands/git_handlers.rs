@@ -1,4 +1,6 @@
 use crate::authorship::virtual_attribution::VirtualAttributions;
+use crate::authorship::working_log::CheckpointKind;
+use crate::commands::checkpoint;
 use crate::commands::git_hook_handlers::{
     ENV_SKIP_MANAGED_HOOKS, has_repo_hook_state, resolve_previous_non_managed_hooks_path,
 };
@@ -176,6 +178,11 @@ pub fn handle_git(args: &[String]) {
             return;
         }
 
+        let is_commit_command = parsed
+            .command
+            .as_deref()
+            .is_some_and(|cmd| matches!(cmd, "commit"));
+
         // Initialize the daemon telemetry handle so we can send wrapper state
         if let crate::daemon::telemetry_handle::DaemonTelemetryInitResult::Failed(e) =
             crate::daemon::telemetry_handle::init_daemon_telemetry_handle()
@@ -185,6 +192,18 @@ pub fn handle_git(args: &[String]) {
 
         let repository = find_repository(&parsed.global_args).ok();
         let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
+
+        if is_commit_command && let Some(repo) = repository.as_ref() {
+            let default_user_name = repo.git_author_identity().name_or_unknown();
+            let _ = checkpoint::run(
+                &repo,
+                &default_user_name,
+                CheckpointKind::Human,
+                true,
+                None,
+                false,
+            );
+        }
 
         let pre_state = worktree
             .as_deref()
