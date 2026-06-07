@@ -594,7 +594,7 @@ pub fn find_random_files_with_options(
     }
 
     // Sort by size descending and take top N
-    file_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    file_sizes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
     let large_files: Vec<String> = file_sizes
         .into_iter()
         .take(options.large_file_count)

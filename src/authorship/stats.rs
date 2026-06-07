@@ -686,10 +686,15 @@ fn accepted_lines_from_attestations_with_duplicate_filter(
 }
 
 #[cfg(test)]
-fn line_range_overlap_len(range: &LineRange, added_lines: &[u32]) -> u32 {
+fn line_range_overlap_len(
+    range: &crate::authorship::authorship_log::LineRange,
+    added_lines: &[u32],
+) -> u32 {
     match range {
-        LineRange::Single(line) => u32::from(added_lines.binary_search(line).is_ok()),
-        LineRange::Range(start, end) => {
+        crate::authorship::authorship_log::LineRange::Single(line) => {
+            u32::from(added_lines.binary_search(line).is_ok())
+        }
+        crate::authorship::authorship_log::LineRange::Range(start, end) => {
             let start_idx = added_lines.partition_point(|line| *line < *start);
             let end_idx = added_lines.partition_point(|line| *line <= *end);
             end_idx.saturating_sub(start_idx) as u32
@@ -801,6 +806,7 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
+    use crate::authorship::authorship_log::LineRange;
     use crate::git::test_utils::TmpRepo;
 
     #[test]
@@ -1860,5 +1866,3 @@ mod tests {
         );
     }
 }
-#[cfg(test)]
-use crate::authorship::authorship_log::LineRange;

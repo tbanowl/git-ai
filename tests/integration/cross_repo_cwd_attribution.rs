@@ -1267,9 +1267,16 @@ fn test_claude_preset_parent_cwd_real_submodule_records_prompts() {
 
     let remote_submodule_path = workspace.join("remote-submodule");
     init_plain_git_repo(&remote_submodule_path);
-    fs::write(remote_submodule_path.join("README.md"), "# Remote Submodule\n").unwrap();
+    fs::write(
+        remote_submodule_path.join("README.md"),
+        "# Remote Submodule\n",
+    )
+    .unwrap();
     run_git_checked(&remote_submodule_path, &["add", "-A"]);
-    run_git_checked(&remote_submodule_path, &["commit", "-m", "initial submodule"]);
+    run_git_checked(
+        &remote_submodule_path,
+        &["commit", "-m", "initial submodule"],
+    );
 
     let parent_path = workspace.join("parent-repo");
     let parent = TestRepo::new_at_path(&parent_path);
@@ -1331,7 +1338,9 @@ fn test_claude_preset_parent_cwd_real_submodule_records_prompts() {
     );
 
     let parent_working_log = parent.current_working_logs();
-    let parent_ai_files = parent_working_log.all_ai_touched_files().unwrap_or_default();
+    let parent_ai_files = parent_working_log
+        .all_ai_touched_files()
+        .unwrap_or_default();
     assert!(
         parent_ai_files.is_empty(),
         "Parent working log should not claim submodule content edits: {:?}",

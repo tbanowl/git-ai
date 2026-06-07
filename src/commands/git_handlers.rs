@@ -196,7 +196,7 @@ pub fn handle_git(args: &[String]) {
         if is_commit_command && let Some(repo) = repository.as_ref() {
             let default_user_name = repo.git_author_identity().name_or_unknown();
             let _ = checkpoint::run(
-                &repo,
+                repo,
                 &default_user_name,
                 CheckpointKind::Human,
                 true,
