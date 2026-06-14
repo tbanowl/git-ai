@@ -110,7 +110,7 @@ impl VirtualAttributions {
         &self,
         missing_ids: &[String],
     ) -> Result<Vec<(String, String, PromptRecord)>, GitAiError> {
-        const MAX_CONCURRENT: usize = if cfg!(windows) { 4 } else { 30 };
+        const MAX_CONCURRENT: usize = 30;
 
         let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
         let mut tasks = Vec::new();
@@ -184,7 +184,7 @@ impl VirtualAttributions {
 
     /// Add multiple pathspecs concurrently
     async fn add_pathspecs_concurrent(&mut self, pathspecs: &[String]) -> Result<(), GitAiError> {
-        const MAX_CONCURRENT: usize = if cfg!(windows) { 4 } else { 30 };
+        const MAX_CONCURRENT: usize = 30;
 
         let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
         let mut tasks = Vec::new();

@@ -338,7 +338,7 @@ stdin 方向是父进程写、子进程读。父进程 stdin writer 线程如果
 - **前置**：PR #1 合并后观察 1-2 周 Windows 生产运行
   - 期望：Sentry / 日志里 Windows timeout 事件趋近于 0
   - 期望：stress test 在内部 CI 上稳定
-- 把以下三处 `if cfg!(windows) { 4 } else { 30 }` 改回统一 `30`：
+- 把以下三处 `30` 改回统一 `30`：
   - `src/git/repository.rs:2197`
   - `src/commands/checkpoint.rs:2250`
   - `src/authorship/virtual_attribution.rs:109, 183`

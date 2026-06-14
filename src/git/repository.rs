@@ -2484,7 +2484,7 @@ impl Repository {
         use futures::future::join_all;
         use std::sync::Arc;
 
-        const MAX_CONCURRENT: usize = if cfg!(windows) { 4 } else { 30 };
+        const MAX_CONCURRENT: usize = 30;
 
         let normalize_path = |path: &str| {
             if path.is_ascii() {
