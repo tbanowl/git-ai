@@ -1,5 +1,9 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use git_ai::authorship::attribution_tracker::LineAttribution;
+use git_ai::authorship::working_log::{
+    AgentId, Checkpoint, CheckpointKind, CheckpointLineStats, WorkingLogEntry,
+};
 use std::fs;
 
 fn configure_diff_settings(repo: &TestRepo, settings: &[(&str, &str)]) {
@@ -1941,6 +1945,121 @@ fn test_ai_generated_file_then_human_full_rewrite() {
     ]);
 }
 
+#[test]
+fn test_human_checkpoint_preserves_legacy_ai_line_only_attribution() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("legacy-line-only.rs");
+
+    let ai_content = "\
+fn main() {
+    println!(\"ai line\");
+    println!(\"still ai\");
+}
+";
+    fs::write(&file_path, ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(ai_content)
+        .expect("persist legacy AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "legacy-ai-line-only".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "legacy-line-only.rs".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 4,
+                    author_id: agent_author_id.clone(),
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 4,
+                deletions: 0,
+                additions_sloc: 4,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append legacy AI checkpoint");
+
+    let human_content = "\
+fn main() {
+    println!(\"human edited line\");
+    println!(\"still ai\");
+}
+";
+    fs::write(&file_path, human_content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "legacy-line-only.rs"])
+        .unwrap();
+
+    let checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("read checkpoints");
+    let human_entry = checkpoints
+        .iter()
+        .rev()
+        .find_map(|checkpoint| {
+            if checkpoint.kind != CheckpointKind::Human {
+                return None;
+            }
+            checkpoint
+                .entries
+                .iter()
+                .find(|entry| entry.file == "legacy-line-only.rs")
+        })
+        .expect("human checkpoint entry for edited file");
+
+    assert!(
+        human_entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id == agent_author_id),
+        "human checkpoint should preserve AI byte attribution from legacy line-only checkpoint: {human_entry:#?}"
+    );
+    assert!(
+        human_entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id == "human"),
+        "human checkpoint should attribute the edited range to human: {human_entry:#?}"
+    );
+
+    repo.stage_all_and_commit("human edit after legacy AI checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("legacy-line-only.rs");
+    file.assert_lines_and_blame(crate::lines![
+        "fn main() {".ai(),
+        "    println!(\"human edited line\");".human(),
+        "    println!(\"still ai\");".ai(),
+        "}".ai(),
+    ]);
+}
+
 crate::reuse_tests_in_worktree!(
     test_simple_additions_empty_repo,
     test_simple_additions_with_base_commit,
@@ -1956,4 +2075,5 @@ crate::reuse_tests_in_worktree!(
     test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_commit_stays_human,
     test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human,
     test_ai_generated_file_then_human_full_rewrite,
+    test_human_checkpoint_preserves_legacy_ai_line_only_attribution,
 );
