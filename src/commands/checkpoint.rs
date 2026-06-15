@@ -43,6 +43,7 @@ struct FileLineStats {
 struct PreviousFileState {
     blob_sha: String,
     attributions: Vec<Attribution>,
+    line_attributions: Vec<LineAttribution>,
 }
 
 use crate::authorship::working_log::AgentId;
@@ -1650,6 +1651,7 @@ fn build_previous_file_state_maps(
                 PreviousFileState {
                     blob_sha: entry.blob_sha.clone(),
                     attributions: entry.attributions.clone(),
+                    line_attributions: entry.line_attributions.clone(),
                 },
             );
 
