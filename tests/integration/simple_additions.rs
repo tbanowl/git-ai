@@ -968,7 +968,7 @@ Untracked line
 Human line
 ";
     fs::write(&file_path, second_edit).unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "example.md"])
+    repo.git_ai(&["checkpoint", "mock_known_human", "example.md"])
         .unwrap();
 
     // Explicit add call (very useful to test partial staging scenarios)
@@ -1017,9 +1017,10 @@ Another AI line
         .unwrap();
     repo.stage_all_and_commit("Fourth commit").unwrap();
     file.assert_committed_lines(lines![
-        "Human line".human(),   // known human
-        "AI line".ai(),         // AI line
-        "Another AI line".ai(), // AI line
+        "Human line".human(),
+        "AI line".ai(),
+        "Another untracked line".human(),
+        "Another AI line".ai(),
     ]);
 }
 
@@ -1870,6 +1871,118 @@ fn test_ai_edits_file_with_spaces_in_filename() {
     ]);
 }
 
+#[test]
+fn test_commit_time_human_checkpoint_preserves_line_only_ai_for_new_file() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("foo.cpp");
+
+    let ai_content = "\
+int main() {
+    int value = 1;
+    value += 2;
+    value += 3;
+    return value;
+}
+";
+    fs::write(&file_path, ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(ai_content)
+        .expect("persist line-only AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "line-only-ai-before-commit".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "foo.cpp".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 6,
+                    author_id: agent_author_id.clone(),
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 6,
+                deletions: 0,
+                additions_sloc: 6,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append line-only AI checkpoint");
+
+    let final_content = "\
+int main() {
+    int value = 1;
+    value += 3;
+    return value;
+}
+";
+    fs::write(&file_path, final_content).unwrap();
+
+    // Simulates the Human checkpoint appended during the commit-time capture path.
+    // The remaining lines are inherited from the previous AI checkpoint; there is no
+    // human-authored replacement text in the final file.
+    repo.git_ai(&["checkpoint", "--", "foo.cpp"]).unwrap();
+
+    let checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("read checkpoints");
+    let human_entry = checkpoints
+        .iter()
+        .rev()
+        .find_map(|checkpoint| {
+            if checkpoint.kind != CheckpointKind::Human {
+                return None;
+            }
+            checkpoint.entries.iter().find(|entry| entry.file == "foo.cpp")
+        })
+        .expect("human checkpoint entry for foo.cpp");
+
+    assert!(
+        human_entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id == agent_author_id),
+        "commit-time human checkpoint should preserve AI byte attribution from prior line-only checkpoint: {human_entry:#?}"
+    );
+
+    repo.stage_all_and_commit("add foo after synthetic human capture")
+        .unwrap();
+
+    let mut file = repo.filename("foo.cpp");
+    file.assert_lines_and_blame(crate::lines![
+        "int main() {".ai(),
+        "    int value = 1;".ai(),
+        "    value += 3;".ai(),
+        "    return value;".ai(),
+        "}".ai(),
+    ]);
+}
+
 /// Regression test: AI generates a full new file, then human deletes everything and
 /// rewrites. The commit should report 100% human, not 100% AI.
 ///
@@ -1917,6 +2030,11 @@ fn test_ai_generated_file_then_human_full_rewrite() {
         .trim()
         .to_string();
     let git_dir = std::path::Path::new(&git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        repo.path().join(git_dir)
+    };
     let base_commit = repo
         .git(&["rev-parse", "HEAD"])
         .unwrap_or_else(|_| "initial".to_string())
@@ -2074,6 +2192,7 @@ crate::reuse_tests_in_worktree!(
     test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_human,
     test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_commit_stays_human,
     test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human,
+    test_commit_time_human_checkpoint_preserves_line_only_ai_for_new_file,
     test_ai_generated_file_then_human_full_rewrite,
     test_human_checkpoint_preserves_legacy_ai_line_only_attribution,
 );
