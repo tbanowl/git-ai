@@ -1743,14 +1743,35 @@ fn get_checkpoint_entry_for_file(
         return Ok(Some((entry, stats)));
     }
 
-    let from_checkpoint = previous_state.as_ref().map(|state| {
-        (
-            working_log
-                .get_file_version(&state.blob_sha)
-                .unwrap_or_default(),
-            state.attributions.clone(),
-        )
-    });
+    let from_checkpoint: Option<(String, Vec<Attribution>)> = previous_state
+        .as_ref()
+        .map(|state| -> Result<(String, Vec<Attribution>), GitAiError> {
+            if !state.attributions.is_empty() {
+                let previous_content = working_log
+                    .get_file_version(&state.blob_sha)
+                    .unwrap_or_default();
+                return Ok((previous_content, state.attributions.clone()));
+            }
+
+            if state.line_attributions.is_empty() {
+                let previous_content = working_log
+                    .get_file_version(&state.blob_sha)
+                    .unwrap_or_default();
+                return Ok((previous_content, Vec::new()));
+            }
+
+            let previous_content = working_log.get_file_version(&state.blob_sha)?;
+            // Legacy line attribution carries no timestamp, so use a synthetic previous timestamp.
+            let prev_attributions =
+                crate::authorship::attribution_tracker::line_attributions_to_attributions(
+                    &state.line_attributions,
+                    &previous_content,
+                    ts.saturating_sub(1),
+                );
+
+            Ok((previous_content, prev_attributions))
+        })
+        .transpose()?;
 
     let is_from_checkpoint = from_checkpoint.is_some();
     let (previous_content, prev_attributions) = if let Some((content, attrs)) = from_checkpoint {
