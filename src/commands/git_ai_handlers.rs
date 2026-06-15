@@ -14,7 +14,6 @@ use crate::commands::checkpoint_agent::agent_v1_preset::AgentV1Preset;
 use crate::commands::checkpoint_agent::amp_preset::AmpPreset;
 use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
 use crate::commands::checkpoint_agent::pi_preset::PiPreset;
-use crate::commands::git_handlers::WaitForGitProcessError;
 use crate::config;
 use crate::daemon::{
     CapturedCheckpointRunRequest, CheckpointRunRequest, ControlRequest, LiveCheckpointRunRequest,
@@ -36,10 +35,6 @@ use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::path::{PathBuf};
-
-const DEFAULT_GIT_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn handle_git_ai(args: &[String]) {
     if args.is_empty() {
@@ -388,111 +383,6 @@ fn print_help() {
     std::process::exit(0);
 }
 
-fn handle_maintenance(args: &[String]) {
-    let mut repo_dir = None;
-    let mut common_dir = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--repo" => {
-                if i + 1 < args.len() {
-                    let dir = strip_utf8_bom(args[i + 1].clone());
-                    repo_dir = Some(PathBuf::from(dir));
-                    i += 2;
-                }
-            }
-            "--common-dir" => {
-                if i + 1 < args.len() {
-                    let dir = strip_utf8_bom(args[i + 1].clone());
-                    common_dir = Some(PathBuf::from(dir));
-                    i += 2;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    let Some(repo_dir) = repo_dir else {
-        tracing::warn!("missing --repo");
-        return;
-    };
-
-    let Some(common_dir) = common_dir else {
-        tracing::warn!("missing --common-dir");
-        return;
-    };
-
-    tracing::debug!(
-        "git maintenance repo_dir: {}, common_dir: {}",
-        repo_dir.display(),
-        common_dir.display()
-    );
-    let git_cmd = config::Config::get().git_cmd();
-
-    let mut cmd = Command::new(git_cmd);
-    cmd.arg("maintenance")
-        .arg("run")
-        .arg("--auto")
-        .arg("--no-quiet")
-        .current_dir(repo_dir)
-        .env_remove("GIT_AI_ASYNC_MODE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    
-    #[cfg(windows)]
-    {
-        if !is_interactive_terminal() {
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-    }
-
-    match cmd.spawn() {
-        Ok(mut child) => {
-            match crate::commands::git_handlers::wait_for_git_process_windows(&mut child, DEFAULT_GIT_MAINTENANCE_TIMEOUT) {
-                Ok(status) => {
-                    if status.success() {
-                        use std::fs;
-                        let new_timestamp = chrono::Local::now().timestamp();
-
-                        let last_maintenance_file = common_dir.join("last_maintenance");
-                        if let Err(e) = fs::write(
-                            &last_maintenance_file,
-                            new_timestamp.to_string(),
-                        ) {
-                            tracing::warn!(
-                                "Failed to update last_maintenance file: {}",
-                                e
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "git maintenance exited with non-zero status: {:?}",
-                            status
-                        );
-                    }
-                }
-                Err(WaitForGitProcessError::Wait(err)) => {
-                    tracing::error!("Failed to wait for git maintenance: {}", err);
-                }
-                Err(WaitForGitProcessError::TimedOut) => {
-                    tracing::error!(
-                        "git maintenance timed out after {}ms on Windows",
-                        DEFAULT_GIT_MAINTENANCE_TIMEOUT.as_millis()
-                    );
-                }
-            }
-        }
-        Err(err) => {
-            tracing::error!("Failed to execute git maintenance: {}", err);
-        }
-    };
-
-}
 
 fn handle_checkpoint(args: &[String]) {
     let mut repository_working_dir = std::env::current_dir()
