@@ -159,6 +159,12 @@ pub fn handle_git(args: &[String]) {
             proxy_to_git(&orig_args, true, None, None);
             return;
         }
+        
+        if is_command_skip_hooks(&parsed) {
+            let orig_args: Vec<String> = std::env::args().skip(1).collect();
+            proxy_to_git(&orig_args, true, None, None);
+            return;
+        }
 
         // Repo-creating commands (clone, init) have no meaningful pre/post
         // repo state — the target repo doesn't exist yet. The wrapper would
@@ -178,11 +184,6 @@ pub fn handle_git(args: &[String]) {
             return;
         }
 
-        let is_commit_command = parsed
-            .command
-            .as_deref()
-            .is_some_and(|cmd| matches!(cmd, "commit"));
-
         // Initialize the daemon telemetry handle so we can send wrapper state
         if let crate::daemon::telemetry_handle::DaemonTelemetryInitResult::Failed(e) =
             crate::daemon::telemetry_handle::init_daemon_telemetry_handle()
@@ -193,16 +194,9 @@ pub fn handle_git(args: &[String]) {
         let repository = find_repository(&parsed.global_args).ok();
         let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
 
-        if is_commit_command && let Some(repo) = repository.as_ref() {
-            let default_user_name = repo.git_author_identity().name_or_unknown();
-            let _ = checkpoint::run(
-                repo,
-                &default_user_name,
-                CheckpointKind::Human,
-                true,
-                None,
-                false,
-            );
+        let is_commit = is_commit_command(&parsed);
+        if is_commit && let Some(repo) = repository.as_ref() {
+            pre_commit_human_checkpoint(repo);
         }
 
         let pre_state = worktree
@@ -225,39 +219,52 @@ pub fn handle_git(args: &[String]) {
         // After a successful commit, wait briefly for the daemon to produce an
         // authorship note so we can show stats inline (same UX as plain wrapper mode).
         if exit_status.success()
-            && parsed.command.as_deref() == Some("commit")
             && let Some(repo) = repository.as_ref()
         {
-            maybe_show_async_post_commit_stats(&parsed, repo);
+            // let proxy_to_git_maintenance_start = Instant::now();
+            // proxy_to_git_maintenance(repo);
+            // tracing::debug!("proxy_to_git_maintenance cost {}ms", proxy_to_git_maintenance_start.elapsed().as_millis());
+            if is_commit {
+                if std::env::var("GIT_AI_ASYNC_SHOW_COMMIT_STATS").unwrap_or_default() == "1" {
+                    maybe_show_async_post_commit_stats(&parsed, repo);
+                } else {
+                    let commit_sha = match repo.head().ok().and_then(|h| h.target().ok()) {
+                        Some(sha) => sha,
+                        None => return,
+                    };
+                    eprintln!(
+                        "[git-ai] still processing commit {}... run `git-ai stats` to see stats.",
+                        &commit_sha[..std::cmp::min(8, commit_sha.len())]
+                    );
+                }
+            }
         }
 
         exit_with_status(exit_status);
     }
 
     let mut parsed_args = parse_git_cli_args(args);
+    
+    if is_command_skip_hooks(&parsed_args) {
+        let orig_args: Vec<String> = std::env::args().skip(1).collect();
+        proxy_to_git(&orig_args, true, None, None);
+        return;
+    }
 
-    let find_repository_start = Instant::now();
     let mut repository_option = find_repository(&parsed_args.global_args).ok();
-    let find_repository_duration = find_repository_start.elapsed();
-    tracing::debug!(
-        "[handle-git] find_repository {}ms",
-        find_repository_duration.as_millis()
-    );
 
     let check_hooks_start = Instant::now();
     let has_repo = repository_option.is_some();
 
     // Resolve aliases before is_command_skip_hooks() so "ci" → "commit" is recognized.
-    if let Some(repository) = repository_option.as_mut()
-        && let Some(resolved) = resolve_alias_invocation(&parsed_args, repository)
-    {
-        parsed_args = resolved;
+    if let Some(repository) = repository_option.as_mut() {
+        if let Some(resolved) = resolve_alias_invocation(&parsed_args, repository) {
+            parsed_args = resolved;
+        }
     }
-
-    if is_command_skip_hooks(&parsed_args) {
-        let orig_args: Vec<String> = std::env::args().skip(1).collect();
-        proxy_to_git(&orig_args, true, None, None);
-        return;
+    
+    if is_commit_command(&parsed_args) && let Some(repository) = repository_option.as_ref() {
+        pre_commit_human_checkpoint(repository);
     }
 
     let get_config_start = Instant::now();
@@ -344,7 +351,10 @@ pub fn handle_git(args: &[String]) {
             git_duration,
             post_command_duration,
         );
-
+        
+        // let proxy_to_git_maintenance_start = Instant::now();
+        // proxy_to_git_maintenance(repository);
+        // tracing::debug!("proxy_to_git_maintenance cost {}ms", proxy_to_git_maintenance_start.elapsed().as_millis());
         exit_status
     } else {
         // run without hooks
@@ -358,6 +368,22 @@ pub fn handle_git(args: &[String]) {
         )
     };
     exit_with_status(exit_status);
+}
+
+fn pre_commit_human_checkpoint(repo: &Repository) {
+    let default_user_name = repo.git_author_identity().name_or_unknown();
+    let _ = checkpoint::run(
+        &repo,
+        &default_user_name,
+        CheckpointKind::Human,
+        true,
+        None,
+        false,
+    );
+}
+
+fn is_commit_command(parsed_args: &ParsedGitInvocation) -> bool {
+    parsed_args.command.as_deref().is_some_and(|cmd| matches!(cmd, "commit"))
 }
 
 fn is_command_skip_hooks(parsed_args: &ParsedGitInvocation) -> bool {
@@ -779,7 +805,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
 
     if std::env::var("GIT_AI_WAIT_COMMIT_STATS").unwrap_or_default() != "1" {
         eprintln!(
-            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            "[git-ai] Skipped git-ai stats for large commit. Run `git-ai stats {}` to compute stats on demand.",
             commit_sha
         );
         return;
@@ -813,7 +839,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
 
     if !note_found {
         eprintln!(
-            "[git-ai] still processing commit {}... run `git ai stats` to see stats.",
+            "[git-ai] still processing commit {}... run `git-ai stats` to see stats.",
             &commit_sha[..std::cmp::min(8, commit_sha.len())]
         );
         return;
@@ -841,7 +867,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
     ) && estimate.should_skip()
     {
         eprintln!(
-            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            "[git-ai] Skipped git-ai stats for large commit. Run `git-ai stats {}` to compute stats on demand.",
             commit_sha
         );
         return;
@@ -906,6 +932,115 @@ fn send_wrapper_post_state_to_daemon(
         );
     }
 }
+
+// fn proxy_to_git_maintenance(repository: &Repository) {
+//     tracing::debug!("[proxy_to_git_maintenance] start git maintenance");
+//     tracing::debug!("[proxy_to_git_maintenance] repo common dir: {}", repository.common_dir().display());
+//     tracing::debug!("[proxy_to_git_maintenance] repo work dir: {:?}", repository.workdir());
+//     let last_maintenance_file = repository.common_dir().join("last_maintenance");
+//     let now = chrono::Local::now().timestamp();
+//     let common_dir = repository.common_dir();
+//     let last_maintenance = if last_maintenance_file.exists() {
+//         match fs::File::open(&last_maintenance_file) {
+//             Ok(mut file) => {
+//                 let mut content = String::new();
+//                 match file.read_to_string(&mut content) {
+//                     Ok(_) => content.trim().parse::<i64>().unwrap_or(0),
+//                     Err(_) => {
+//                         tracing::warn!(
+//                             "Failed to read last_maintenance file, using current time"
+//                         );
+//                         fs::write(&last_maintenance_file, now.to_string()).ok();
+//                         now
+//                     }
+//                 }
+//             }
+//             Err(_) => {
+//                 tracing::warn!(
+//                     "Failed to open last_maintenance file, using current time"
+//                 );
+//                 fs::write(&last_maintenance_file, now.to_string()).ok();
+//                 now
+//             }
+//         }
+//     } else {
+//         fs::write(&last_maintenance_file, now.to_string()).ok();
+//         now
+//     };
+
+//     let interval = std::env::var("GIT_AI_MAINTENANCE_INTERVAL")
+//         .ok()
+//         .and_then(|value| value.parse::<i64>().ok())
+//         .filter(|&value| value > 0)
+//         .unwrap_or(18_000);
+
+//     let elapsed = now - last_maintenance;
+//     if elapsed < interval {
+//         tracing::debug!("Skip maintenance: last run {} seconds ago", elapsed);
+//         return;
+//     }
+
+//     tracing::debug!("[proxy_to_git_maintenance] try lock start");
+//     let lock_file = repository.common_dir().join("git_ai_maintenance.lock");
+//     let lock = LockFile::try_acquire(&lock_file);
+//     tracing::debug!("[proxy_to_git_maintenance]  try lock end");
+
+//     if lock.is_none() {
+//         tracing::debug!("maintenance worker already running");
+//         return;
+//     }
+    
+//     tracing::debug!("[proxy_to_git_maintenance] spawn_maintenance_worker start");
+//     let repo_dir = repository.workdir().ok();
+//     match spawn_maintenance_worker(&repo_dir.unwrap_or_default(), &common_dir) {
+//         Ok(()) => true,
+//         Err(err) => {
+//             tracing::error!("Failed to spawn maintenance worker: {}", err);
+//             false
+//         }
+//     };
+    
+//     tracing::debug!("[proxy_to_git_maintenance] spawn_maintenance_worker end");
+// }
+
+// fn spawn_maintenance_worker(repo_dir: &Path, common_dir: &Path) -> std::io::Result<()> {
+//     let Ok(exe) = current_git_ai_exe() else {
+//         return Ok(());
+//     };
+    
+//     let mut cmd = Command::new(exe);
+//     cmd.arg("maintenance-worker")
+//         .arg("--repo")
+//         .arg(repo_dir)
+//         .arg("--common-dir")
+//         .arg(common_dir)
+//         .env(crate::commands::git_hook_handlers::ENV_SKIP_ALL_HOOKS, "1")
+//         .env_remove("GIT_AI_ASYNC_MODE")
+//         .stdin(Stdio::null())
+//         .stdout(Stdio::null())
+//         .stderr(Stdio::null());
+
+//     #[cfg(windows)]
+//     {
+//         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+//     }
+
+//     // #[cfg(unix)]
+//     // {
+//     //     use std::os::unix::process::CommandExt;
+
+//     //     unsafe {
+//     //         cmd.pre_exec(|| {
+//     //             libc::setsid();
+//     //             Ok(())
+//     //         });
+//     //     }
+//     // }
+
+//     cmd.spawn()?;
+
+//     Ok(())
+// }
 
 fn proxy_to_git(
     args: &[String],
@@ -1067,19 +1202,35 @@ fn proxy_to_git(
         Ok(child) => {
             #[cfg(windows)]
             {
-                let exempt = is_command_exempt_from_retry(args);
-                let status = wait_for_git_with_retry_windows(
-                    child,
-                    args,
-                    child_hooks_path_override,
-                    wrapper_invocation_id,
-                    suppress_trace2,
-                    exempt,
-                );
-                if exit_on_completion {
-                    exit_with_status(status);
+                if std::env::var("GIT_AI_GIT_RETRY").unwrap_or_default() == "1" {
+                    let exempt = is_command_exempt_from_retry(args);
+                    let status = wait_for_git_with_retry_windows(
+                        child,
+                        args,
+                        child_hooks_path_override,
+                        wrapper_invocation_id,
+                        suppress_trace2,
+                        exempt,
+                    );
+                    if exit_on_completion {
+                        exit_with_status(status);
+                    }
+                    return status;
                 }
-                status
+                let mut child = child;
+                let status = child.wait();
+                match status {
+                    Ok(status) => {
+                        if exit_on_completion {
+                            exit_with_status(status);
+                        }
+                        status
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to wait for git process: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
 
             #[cfg(not(windows))]
@@ -1171,13 +1322,13 @@ fn wait_for_git_with_retry_windows(
 }
 
 #[cfg(windows)]
-enum WaitForGitProcessError {
+pub enum WaitForGitProcessError {
     TimedOut,
     Wait(std::io::Error),
 }
 
 #[cfg(windows)]
-fn wait_for_git_process_windows(
+pub fn wait_for_git_process_windows(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, WaitForGitProcessError> {

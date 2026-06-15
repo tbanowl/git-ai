@@ -84,10 +84,10 @@ pub use control_api::{
 
 const PID_META_FILE: &str = "daemon.pid.json";
 const TRACE_INGEST_SEQ_FIELD: &str = "git_ai_ingest_seq";
-const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
-const DAEMON_CHECKPOINT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
-const DAEMON_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
+const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_CHECKPOINT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const DAEMON_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 #[cfg(windows)]
 const WINDOWS_TRACE_PIPE_WORKERS: usize = 16;
 #[cfg(windows)]

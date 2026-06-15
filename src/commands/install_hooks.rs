@@ -1,7 +1,7 @@
 use crate::config;
 use crate::daemon::DaemonConfig;
 use crate::error::GitAiError;
-use crate::mdm::agents::get_all_installers;
+use crate::mdm::agents::{get_all_installers, get_min_installers};
 use crate::mdm::git_client_installer::GitClientInstallerParams;
 use crate::mdm::git_clients::get_all_git_client_installers;
 use crate::mdm::hook_installer::HookInstallerParams;
@@ -489,7 +489,7 @@ async fn async_run_install(
     // === Coding Agents ===
     println!("\n\x1b[1mCoding Agents\x1b[0m");
 
-    let installers = get_all_installers();
+    let installers = get_min_installers();
     let mut installed_tools: HashSet<String> = HashSet::new();
     // Track agents whose hooks were updated (name, process_names) for restart warnings
     let mut updated_agents: Vec<(String, Vec<String>)> = Vec::new();
@@ -771,9 +771,9 @@ async fn async_run_install(
             println!(
                 "This is expected — once you commit and start a fresh session, attribution will work correctly."
             );
-            println!(
-                "If the issue persists, please open an issue at https://github.com/git-ai-project/git-ai/issues"
-            );
+            // println!(
+            //     "If the issue persists, please open an issue at https://github.com/git-ai-project/git-ai/issues"
+            // );
         }
     }
 

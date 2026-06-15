@@ -67,6 +67,7 @@ fn create_junction(
 ) -> Result<(), GitAiError> {
     use std::process::Command;
 
+    let target_path = &target.to_string_lossy().replace('/', "\\");
     // Use mklink /J to create a junction - this doesn't require admin privileges
     let status = Command::new("cmd")
         .args([
@@ -74,7 +75,7 @@ fn create_junction(
             "mklink",
             "/J",
             &junction_path.to_string_lossy(),
-            &target.to_string_lossy(),
+            &target_path,
         ])
         .output()
         .map_err(|e| GitAiError::Generic(format!("Failed to run mklink: {}", e)))?;

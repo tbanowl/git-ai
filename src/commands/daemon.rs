@@ -90,10 +90,10 @@ fn daemon_startup_timeout() -> Duration {
             || std::env::var_os("GITAI_TEST_DB_PATH").is_some()
             || std::env::var_os("CI").is_some()
         {
-            return Duration::from_secs(12);
+            return Duration::from_secs(15);
         }
 
-        Duration::from_secs(5)
+        Duration::from_secs(15)
     }
 
     #[cfg(not(windows))]
@@ -660,7 +660,7 @@ pub(crate) fn restart_daemon(config: &DaemonConfig) -> Result<(), String> {
     if was_running {
         stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
     }
-    ensure_daemon_running(Duration::from_secs(5)).map(|_| ())
+    ensure_daemon_running(Duration::from_secs(15)).map(|_| ())
 }
 
 fn parse_repo_arg(args: &[String]) -> Option<String> {

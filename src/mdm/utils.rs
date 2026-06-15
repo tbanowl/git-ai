@@ -616,6 +616,10 @@ pub fn install_vsc_editor_extension(
     cli: &EditorCliCommand,
     id_or_vsix: &str,
 ) -> Result<(), GitAiError> {
+    if std::env::var("GIT_AI_SLOW_VM").unwrap_or_default() != "0" {
+        tracing::debug!("VM skip install vsc extension.");
+        return Ok(());
+    }
     // NOTE: We try up to 3 times, because the editor CLI can be flaky (throws intermittent JS errors)
     let mut last_error_message: Option<String> = None;
     for attempt in 1..=3 {

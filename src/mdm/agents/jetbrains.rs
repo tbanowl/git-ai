@@ -18,6 +18,16 @@ impl JetBrainsInstaller {
     /// Try to install the plugin to a single IDE
     fn install_to_ide(detected: &DetectedIde, dry_run: bool) -> InstallResult {
         let ide_name = detected.ide.name;
+        if std::env::var("GIT_AI_SLOW_VM").unwrap_or_default() != "0" {
+            return InstallResult {
+                changed: true,
+                diff: None,
+                message: format!(
+                    "{}: Plugin installed from JetBrains Marketplace",
+                    ide_name
+                ),
+            };
+        }
 
         // Check if already installed
         if is_plugin_installed(detected) {

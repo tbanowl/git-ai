@@ -20,11 +20,11 @@ use std::time::Duration;
 
 /// Read/write timeout for the persistent daemon socket.
 /// Prevents indefinite blocking if the daemon becomes unresponsive.
-const DAEMON_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum time to wait for the daemon socket on process start.
 #[cfg(not(any(test, feature = "test-support")))]
-const DAEMON_TELEMETRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_TELEMETRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Global handle to the daemon control socket for telemetry submission.
 static DAEMON_TELEMETRY_HANDLE: OnceLock<Mutex<Option<DaemonTelemetryHandle>>> = OnceLock::new();

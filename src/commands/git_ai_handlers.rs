@@ -14,6 +14,7 @@ use crate::commands::checkpoint_agent::agent_v1_preset::AgentV1Preset;
 use crate::commands::checkpoint_agent::amp_preset::AmpPreset;
 use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
 use crate::commands::checkpoint_agent::pi_preset::PiPreset;
+use crate::commands::git_handlers::WaitForGitProcessError;
 use crate::config;
 use crate::daemon::{
     CapturedCheckpointRunRequest, CheckpointRunRequest, ControlRequest, LiveCheckpointRunRequest,
@@ -26,11 +27,19 @@ use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes, push_a
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
 use crate::observability::{self, log_message};
 use crate::utils::is_interactive_terminal;
+#[cfg(windows)]
+use crate::utils::CREATE_NO_WINDOW;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::process::{Command, Stdio};
+use std::path::{PathBuf};
+
+const DEFAULT_GIT_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn handle_git_ai(args: &[String]) {
     if args.is_empty() {
@@ -254,6 +263,10 @@ pub fn handle_git_ai(args: &[String]) {
         "show-transcript" => {
             handle_show_transcript(&args[1..]);
         }
+        #[cfg(not(unix))]
+        "maintenance-worker" => {
+            handle_maintenance(&args[1..]);
+        }
         _ => {
             println!("Unknown git-ai command: {}", args[0]);
             std::process::exit(1);
@@ -373,6 +386,112 @@ fn print_help() {
     eprintln!("  help, -h, --help           Show this help message");
     eprintln!();
     std::process::exit(0);
+}
+
+fn handle_maintenance(args: &[String]) {
+    let mut repo_dir = None;
+    let mut common_dir = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo" => {
+                if i + 1 < args.len() {
+                    let dir = strip_utf8_bom(args[i + 1].clone());
+                    repo_dir = Some(PathBuf::from(dir));
+                    i += 2;
+                }
+            }
+            "--common-dir" => {
+                if i + 1 < args.len() {
+                    let dir = strip_utf8_bom(args[i + 1].clone());
+                    common_dir = Some(PathBuf::from(dir));
+                    i += 2;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let Some(repo_dir) = repo_dir else {
+        tracing::warn!("missing --repo");
+        return;
+    };
+
+    let Some(common_dir) = common_dir else {
+        tracing::warn!("missing --common-dir");
+        return;
+    };
+
+    tracing::debug!(
+        "git maintenance repo_dir: {}, common_dir: {}",
+        repo_dir.display(),
+        common_dir.display()
+    );
+    let git_cmd = config::Config::get().git_cmd();
+
+    let mut cmd = Command::new(git_cmd);
+    cmd.arg("maintenance")
+        .arg("run")
+        .arg("--auto")
+        .arg("--no-quiet")
+        .current_dir(repo_dir)
+        .env_remove("GIT_AI_ASYNC_MODE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            match crate::commands::git_handlers::wait_for_git_process_windows(&mut child, DEFAULT_GIT_MAINTENANCE_TIMEOUT) {
+                Ok(status) => {
+                    if status.success() {
+                        use std::fs;
+                        let new_timestamp = chrono::Local::now().timestamp();
+
+                        let last_maintenance_file = common_dir.join("last_maintenance");
+                        if let Err(e) = fs::write(
+                            &last_maintenance_file,
+                            new_timestamp.to_string(),
+                        ) {
+                            tracing::warn!(
+                                "Failed to update last_maintenance file: {}",
+                                e
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "git maintenance exited with non-zero status: {:?}",
+                            status
+                        );
+                    }
+                }
+                Err(WaitForGitProcessError::Wait(err)) => {
+                    tracing::error!("Failed to wait for git maintenance: {}", err);
+                }
+                Err(WaitForGitProcessError::TimedOut) => {
+                    tracing::error!(
+                        "git maintenance timed out after {}ms on Windows",
+                        DEFAULT_GIT_MAINTENANCE_TIMEOUT.as_millis()
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!("Failed to execute git maintenance: {}", err);
+        }
+    };
+
 }
 
 fn handle_checkpoint(args: &[String]) {
@@ -641,40 +760,6 @@ fn handle_checkpoint(args: &[String]) {
                         std::process::exit(0);
                     }
                 }
-            }
-            "known_human" | "mock_known_human" => {
-                let will_edit_filepaths = if args.len() > 1 {
-                    let paths = collect_checkpoint_preset_pathspecs(&args[1..]);
-                    if paths.is_empty() { None } else { Some(paths) }
-                } else {
-                    let working_dir = agent_run_result
-                        .as_ref()
-                        .and_then(|r| r.repo_working_dir.clone())
-                        .unwrap_or(repository_working_dir.clone());
-                    Some(get_all_files_for_mock_ai(&working_dir))
-                };
-
-                agent_run_result = Some(AgentRunResult {
-                    agent_id: AgentId {
-                        tool: "mock_known_human".to_string(),
-                        id: format!(
-                            "human-thread-{}",
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or_else(|_| 0)
-                        ),
-                        model: "unknown".to_string(),
-                    },
-                    agent_metadata: None,
-                    checkpoint_kind: CheckpointKind::Human,
-                    transcript: None,
-                    repo_working_dir: None,
-                    edited_filepaths: None,
-                    will_edit_filepaths,
-                    dirty_files: None,
-                    captured_checkpoint_id: None,
-                });
             }
             "mock_ai" => {
                 let mock_agent_id = format!(
@@ -1238,9 +1323,9 @@ fn run_checkpoint_via_daemon_or_local(
             let is_test = std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
                 || std::env::var_os("GITAI_TEST_DB_PATH").is_some();
             let checkpoint_daemon_timeout = if cfg!(windows) || is_test {
-                Duration::from_secs(10)
+                Duration::from_secs(15)
             } else {
-                Duration::from_secs(5)
+                Duration::from_secs(15)
             };
             match crate::commands::daemon::ensure_daemon_running(checkpoint_daemon_timeout) {
                 Ok(config) => {
@@ -1535,6 +1620,9 @@ fn log_daemon_checkpoint_delegate_failure(
 }
 
 fn daemon_checkpoint_delegate_enabled() -> bool {
+    if std::env::var("GIT_AI_DEAMON_CHECKPOINT").unwrap_or_default() != "1" {
+        return false
+    }
     crate::utils::checkpoint_delegation_enabled()
 }
 

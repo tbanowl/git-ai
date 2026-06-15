@@ -248,6 +248,8 @@ pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// Windows-specific flag to start a new process group
 #[cfg(windows)]
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+#[cfg(windows)]
+pub const DETACHED_PROCESS: u32 = 0x00000008;
 /// Windows-specific flag to allow a child process to break away from the current job object
 #[cfg(windows)]
 pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;

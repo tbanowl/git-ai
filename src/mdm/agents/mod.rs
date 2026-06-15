@@ -46,3 +46,22 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
         // Box::new(WindsurfInstaller),
     ]
 }
+
+/// Get all available hook installers
+pub fn get_min_installers() -> Vec<Box<dyn HookInstaller>> {
+    vec![
+        Box::new(ClaudeCodeInstaller),
+        // Box::new(CodexInstaller),
+        // Box::new(CursorInstaller),
+        Box::new(VSCodeInstaller),
+        // Box::new(GitHubCopilotInstaller),
+        // Box::new(AmpInstaller),
+        Box::new(OpenCodeInstaller),
+        // Box::new(PiInstaller),
+        // Box::new(GeminiInstaller),
+        // Box::new(DroidInstaller),
+        // Box::new(FirebenderInstaller),
+        // Box::new(JetBrainsInstaller),
+        // Box::new(WindsurfInstaller),
+    ]
+}

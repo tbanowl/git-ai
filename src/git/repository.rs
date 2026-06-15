@@ -103,7 +103,7 @@ thread_local! {
 }
 static INTERNAL_GIT_HOOKS_DISABLED_DEPTH_GLOBAL: AtomicUsize = AtomicUsize::new(0);
 
-const EXEC_GIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const EXEC_GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const EXEC_GIT_TIMEOUT_STDERR: &str = "Command timed out";
 
 struct GitExecRequest {
@@ -409,10 +409,6 @@ fn build_git_command(request: &GitExecRequest) -> PreparedGitCommand {
         }
     }
 
-    if is_debug_enabled() {
-        tracing::debug!("[exec_git] cmd = {:?}", cmd);
-    }
-
     PreparedGitCommand {
         cmd,
         effective_args,
@@ -500,7 +496,6 @@ fn run_git_once(request: &GitExecRequest) -> Result<Output, GitAiError> {
     } = build_git_command(request);
 
     let cmd_start = Instant::now();
-    tracing::debug!("[exec_git] Starting git command execution");
 
     #[cfg(windows)]
     let mut child = {
@@ -585,14 +580,14 @@ fn run_git_once(request: &GitExecRequest) -> Result<Output, GitAiError> {
 
     let elapsed = cmd_start.elapsed();
     tracing::debug!(
-        "[exec_git] git command [{:?}] execution total {}ms",
-        effective_args,
-        elapsed.as_millis()
+        "[exec_git] git command cost {}ms, cmd args={:?}",
+        elapsed.as_millis(),
+        effective_args
     );
-    if elapsed > std::time::Duration::from_secs(3) {
+    if elapsed > std::time::Duration::from_secs(10) {
         eprintln!(
             "[git-ai:slow] git {:?} took {}ms",
-            effective_args.first(),
+            effective_args,
             elapsed.as_millis()
         );
     }
