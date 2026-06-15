@@ -1,6 +1,4 @@
 use crate::authorship::virtual_attribution::VirtualAttributions;
-use crate::authorship::working_log::CheckpointKind;
-use crate::commands::checkpoint;
 use crate::commands::git_hook_handlers::{
     ENV_SKIP_MANAGED_HOOKS, has_repo_hook_state, resolve_previous_non_managed_hooks_path,
 };
