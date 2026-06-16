@@ -22,10 +22,7 @@ impl JetBrainsInstaller {
             return InstallResult {
                 changed: true,
                 diff: None,
-                message: format!(
-                    "{}: Plugin installed from JetBrains Marketplace",
-                    ide_name
-                ),
+                message: format!("{}: Plugin installed from JetBrains Marketplace", ide_name),
             };
         }
 
