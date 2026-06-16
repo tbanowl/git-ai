@@ -137,7 +137,6 @@ fn test_authorship_log_stats() {
     let json = extract_json_object(&raw);
     let stats: CommitStats = serde_json::from_str(&json).unwrap();
     assert_eq!(stats.human_additions, 4);
-    // assert_eq!(stats.unknown_additions, 0);
     assert_eq!(stats.mixed_additions, 1);
     assert_eq!(stats.ai_additions, 6); // Neptune (override) no longer counted as mixed AI
     assert_eq!(stats.ai_accepted, 5);
@@ -339,10 +338,7 @@ fn test_stats_cli_empty_tree_range() {
     assert_eq!(stats.authorship_stats.total_commits, 2);
     assert_eq!(stats.range_stats.git_diff_added_lines, 2);
     assert_eq!(stats.range_stats.ai_additions, 1);
-    // Range stats use canonical Human checkpoints and pass human_accepted=0,
-    // so human lines appear as unknown_additions (not human_additions).
     assert_eq!(stats.range_stats.human_additions, 1);
-    // assert_eq!(stats.range_stats.unknown_additions, 1);
 }
 
 #[test]
@@ -352,7 +348,6 @@ fn test_markdown_stats_deletion_only() {
 
     let stats = CommitStats {
         human_additions: 0,
-        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
@@ -376,7 +371,6 @@ fn test_markdown_stats_all_human() {
 
     let stats = CommitStats {
         human_additions: 10,
-        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
@@ -400,7 +394,6 @@ fn test_markdown_stats_all_ai() {
 
     let stats = CommitStats {
         human_additions: 0,
-        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 15,
         ai_accepted: 15,
@@ -424,7 +417,6 @@ fn test_markdown_stats_mixed() {
 
     let stats = CommitStats {
         human_additions: 10,
-        // unknown_additions: 0,
         mixed_additions: 5,
         ai_additions: 20,
         ai_accepted: 15,
@@ -448,7 +440,6 @@ fn test_markdown_stats_no_mixed() {
 
     let stats = CommitStats {
         human_additions: 8,
-        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 12,
         ai_accepted: 12,
@@ -473,7 +464,6 @@ fn test_markdown_stats_minimal_human() {
     // Test that humans get at least 2 visible blocks if they have more than 1 line
     let stats = CommitStats {
         human_additions: 2,
-        // unknown_additions: 0,
         mixed_additions: 0,
         ai_additions: 98,
         ai_accepted: 98,
@@ -510,7 +500,6 @@ fn test_markdown_stats_formatting() {
 
     let stats = CommitStats {
         human_additions: 5,
-        // unknown_additions: 0,
         mixed_additions: 2,
         ai_additions: 8,
         ai_accepted: 6,
@@ -832,7 +821,7 @@ fn test_stats_counts_human_whitespace_edit_of_ai_line_as_ai() {
     file.assert_committed_lines(crate::lines!["return value;".ai()]);
 
     fs::write(&file_path, "  return value;  \n").unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "whitespace-ai.txt"])
+    repo.git_ai(&["checkpoint", "--", "whitespace-ai.txt"])
         .unwrap();
     repo.stage_all_and_commit("Human adds whitespace around AI line")
         .unwrap();

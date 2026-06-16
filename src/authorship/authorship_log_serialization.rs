@@ -48,11 +48,9 @@ impl Default for AuthorshipMetadata {
 
 /// Attestation entry: a short hash followed by line ranges.
 ///
-/// The hash maps to either:
-/// - An AI session entry in `metadata.prompts` (16 hex chars, no prefix), or
-/// - A known-human author entry in `metadata.humans` (prefixed with `h_`)
+/// The hash maps to an AI session entry in `metadata.prompts` (16 hex chars, no prefix).
 ///
-/// Lines with no attestation entry are "unknown" — not tracked by git-ai..
+/// Lines with no attestation entry are treated as human-authored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationEntry {
     /// Short hash (7 chars) that maps to an entry in the prompts section of the metadata

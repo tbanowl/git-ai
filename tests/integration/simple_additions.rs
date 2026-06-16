@@ -1,10 +1,36 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
-use git_ai::authorship::attribution_tracker::LineAttribution;
+use git_ai::authorship::attribution_tracker::{Attribution, LineAttribution};
+use git_ai::authorship::authorship_log::LineRange;
+use git_ai::authorship::authorship_log_serialization::generate_short_hash;
 use git_ai::authorship::working_log::{
     AgentId, Checkpoint, CheckpointKind, CheckpointLineStats, WorkingLogEntry,
 };
 use std::fs;
+
+fn numbered_cpp_lines(count: usize, line_ending: &str) -> String {
+    (1..=count)
+        .map(|idx| format!("int value_{idx:04} = {idx};"))
+        .collect::<Vec<_>>()
+        .join(line_ending)
+        + line_ending
+}
+
+fn expected_numbered_cpp_lines_with_human_line(
+    count: usize,
+    human_line: usize,
+    human_line_content: &str,
+) -> Vec<crate::repos::test_file::ExpectedLine> {
+    (1..=count)
+        .map(|idx| {
+            if idx == human_line {
+                human_line_content.to_string().human()
+            } else {
+                format!("int value_{idx:04} = {idx};").ai()
+            }
+        })
+        .collect()
+}
 
 fn configure_diff_settings(repo: &TestRepo, settings: &[(&str, &str)]) {
     for (key, value) in settings {
@@ -193,7 +219,7 @@ fn test_human_insert_between_ai_lines_before_first_commit_stays_human() {
 }
 
 #[test]
-fn test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_human() {
+fn test_ai_generated_new_file_then_human_append_before_first_commit_stays_human() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("evergreen_append.rs");
 
@@ -206,7 +232,7 @@ fn test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_
         "fn generated() {\n    println!(\"ai\");\n}\nfn human_added() {\n    println!(\"human\");\n}\n",
     )
     .unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "evergreen_append.rs"])
+    repo.git_ai(&["checkpoint", "--", "evergreen_append.rs"])
         .unwrap();
 
     repo.stage_all_and_commit("AI file with human append before first commit")
@@ -257,7 +283,7 @@ fn test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_comm
 }
 
 #[test]
-fn test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human() {
+fn test_ai_generated_new_file_then_human_modifies_ai_line_before_first_commit_stays_human() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("evergreen_modify.rs");
 
@@ -270,7 +296,7 @@ fn test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_com
         "fn generated() {\n    println!(\"human changed this line\");\n}\n",
     )
     .unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "evergreen_modify.rs"])
+    repo.git_ai(&["checkpoint", "--", "evergreen_modify.rs"])
         .unwrap();
 
     repo.stage_all_and_commit("AI file with human modification before first commit")
@@ -968,16 +994,13 @@ Untracked line
 Human line
 ";
     fs::write(&file_path, second_edit).unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "example.md"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "--", "example.md"]).unwrap();
 
     // Explicit add call (very useful to test partial staging scenarios)
     repo.git(&["add", "."]).unwrap();
     // Explicit commit
     repo.commit("Second commit").unwrap();
-    file.assert_committed_lines(lines![
-        "Human line".human(), // known human
-    ]);
+    file.assert_committed_lines(lines!["Human line".human(),]);
 
     let third_edit = "\
 Human line
@@ -989,8 +1012,8 @@ AI line
     // Example of a completely untracked edit where we didn't fire a checkpoint call at all
     repo.stage_all_and_commit("Third commit").unwrap();
     file.assert_committed_lines(lines![
-        "Human line".human(), // known human
-        "AI line".ai(),       // AI line
+        "Human line".human(),
+        "AI line".ai(), // AI line
     ]);
 
     let fourth_edit = "\
@@ -1958,7 +1981,10 @@ int main() {
             if checkpoint.kind != CheckpointKind::Human {
                 return None;
             }
-            checkpoint.entries.iter().find(|entry| entry.file == "foo.cpp")
+            checkpoint
+                .entries
+                .iter()
+                .find(|entry| entry.file == "foo.cpp")
         })
         .expect("human checkpoint entry for foo.cpp");
 
@@ -2130,7 +2156,7 @@ fn main() {
 }
 ";
     fs::write(&file_path, human_content).unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "legacy-line-only.rs"])
+    repo.git_ai(&["checkpoint", "--", "legacy-line-only.rs"])
         .unwrap();
 
     let checkpoints = repo
@@ -2178,6 +2204,610 @@ fn main() {
     ]);
 }
 
+#[test]
+fn test_human_checkpoint_normalizes_crlf_before_diffing_prior_ai_content() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("large-crlf.cpp");
+
+    let ai_content = numbered_cpp_lines(1800, "\r\n");
+    fs::write(&file_path, &ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(&ai_content)
+        .expect("persist CRLF AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "large-crlf-ai-line-only".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "large-crlf.cpp".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 1800,
+                    author_id: agent_author_id.clone(),
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 1800,
+                deletions: 0,
+                additions_sloc: 1800,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append CRLF AI checkpoint");
+
+    let mut final_lines = (1..=1800)
+        .map(|idx| format!("int value_{idx:04} = {idx};"))
+        .collect::<Vec<_>>();
+    final_lines[899] = "int value_0900 = 42;".to_string();
+    let final_content = final_lines.join("\n") + "\n";
+    fs::write(&file_path, final_content).unwrap();
+
+    repo.git_ai(&["checkpoint", "--", "large-crlf.cpp"])
+        .unwrap();
+
+    let checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("read checkpoints");
+    let human_entry = checkpoints
+        .iter()
+        .rev()
+        .find_map(|checkpoint| {
+            if checkpoint.kind != CheckpointKind::Human {
+                return None;
+            }
+            checkpoint
+                .entries
+                .iter()
+                .find(|entry| entry.file == "large-crlf.cpp")
+        })
+        .expect("human checkpoint entry for edited CRLF file");
+
+    assert!(
+        human_entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id == agent_author_id),
+        "human checkpoint should preserve prior AI ranges across CRLF->LF conversion: {human_entry:#?}"
+    );
+    assert!(
+        human_entry
+            .line_attributions
+            .iter()
+            .any(|attr| attr.author_id == agent_author_id),
+        "human checkpoint should retain AI line attribution across CRLF->LF conversion: {human_entry:#?}"
+    );
+    assert!(
+        human_entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id == CheckpointKind::Human.to_str()),
+        "human checkpoint should attribute the edited range to human: {human_entry:#?}"
+    );
+
+    repo.stage_all_and_commit("human edit after CRLF AI checkpoint")
+        .unwrap();
+
+    let mut file = repo.filename("large-crlf.cpp");
+    file.assert_lines_and_blame(expected_numbered_cpp_lines_with_human_line(
+        1800,
+        900,
+        "int value_0900 = 42;",
+    ));
+}
+
+#[test]
+fn test_human_checkpoint_after_empty_human_entry_preserves_prior_ai_attribution() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("legacy-empty-human.cpp");
+
+    let ai_content = "\
+int main() {
+    int value = 1;
+    value += 2;
+    return value;
+}
+";
+    fs::write(&file_path, ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(ai_content)
+        .expect("persist AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "line-only-ai".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "legacy-empty-human.cpp".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 5,
+                    author_id: agent_author_id,
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 5,
+                deletions: 0,
+                additions_sloc: 5,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append AI checkpoint");
+
+    let intermediate_human_content = "\
+int main() {
+    int value = 1;
+    return value;
+}
+";
+    fs::write(&file_path, intermediate_human_content).unwrap();
+    let intermediate_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(intermediate_human_content.as_bytes()).finalize()
+    );
+    working_log
+        .persist_file_version(intermediate_human_content)
+        .expect("persist intermediate human blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::Human,
+            diff: "legacy-empty-human".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "legacy-empty-human.cpp".to_string(),
+                intermediate_sha,
+                Vec::new(),
+                Vec::new(),
+            )],
+            timestamp: 2000,
+            transcript: None,
+            agent_id: None,
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 0,
+                deletions: 1,
+                additions_sloc: 0,
+                deletions_sloc: 1,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append legacy empty human checkpoint");
+
+    let final_content = "\
+int main() {
+    int value = 1;
+    value += 3;
+    return value;
+}
+";
+    fs::write(&file_path, final_content).unwrap();
+    repo.git_ai(&["checkpoint", "--", "legacy-empty-human.cpp"])
+        .unwrap();
+
+    let commit = repo
+        .stage_all_and_commit("human edit after empty human checkpoint")
+        .unwrap();
+    assert!(
+        commit
+            .authorship_log
+            .attestations
+            .iter()
+            .any(|attestation| attestation.file_path == "legacy-empty-human.cpp"),
+        "expected authorship note to include legacy-empty-human.cpp: {:#?}",
+        commit.authorship_log
+    );
+
+    let mut file = repo.filename("legacy-empty-human.cpp");
+    file.assert_lines_and_blame(crate::lines![
+        "int main() {".ai(),
+        "    int value = 1;".ai(),
+        "    value += 3;".human(),
+        "    return value;".ai(),
+        "}".ai(),
+    ]);
+}
+
+#[test]
+fn test_all_human_checkpoint_reconstruction_handles_crlf_prior_ai_snapshot() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("legacy-all-human-crlf.cpp");
+
+    let ai_content = numbered_cpp_lines(1800, "\r\n");
+    fs::write(&file_path, &ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(&ai_content)
+        .expect("persist CRLF AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "legacy-crlf-ai-line-only".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "legacy-all-human-crlf.cpp".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 1800,
+                    author_id: agent_author_id,
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 1800,
+                deletions: 0,
+                additions_sloc: 1800,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append CRLF AI checkpoint");
+
+    let mut final_lines = (1..=1800)
+        .map(|idx| format!("int value_{idx:04} = {idx};"))
+        .collect::<Vec<_>>();
+    final_lines[899] = "int value_0900 = 42;".to_string();
+    let final_content = final_lines.join("\n") + "\n";
+    fs::write(&file_path, &final_content).unwrap();
+
+    let final_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(final_content.as_bytes()).finalize()
+    );
+    working_log
+        .persist_file_version(&final_content)
+        .expect("persist LF all-human blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::Human,
+            diff: "legacy-all-human-crlf-capture".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "legacy-all-human-crlf.cpp".to_string(),
+                final_sha,
+                vec![
+                    Attribution::new(0, 0, CheckpointKind::Human.to_str(), 2000),
+                    Attribution::new(0, final_content.len(), CheckpointKind::Human.to_str(), 2000),
+                ],
+                Vec::new(),
+            )],
+            timestamp: 2000,
+            transcript: None,
+            agent_id: None,
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 1,
+                deletions: 1,
+                additions_sloc: 1,
+                deletions_sloc: 1,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append legacy all-human checkpoint");
+
+    let commit = repo
+        .stage_all_and_commit("commit legacy all-human CRLF reconstruction")
+        .unwrap();
+    assert!(
+        commit
+            .authorship_log
+            .attestations
+            .iter()
+            .any(|attestation| attestation.file_path == "legacy-all-human-crlf.cpp"),
+        "expected authorship note to include legacy-all-human-crlf.cpp: {:#?}",
+        commit.authorship_log
+    );
+
+    let mut file = repo.filename("legacy-all-human-crlf.cpp");
+    file.assert_lines_and_blame(expected_numbered_cpp_lines_with_human_line(
+        1800,
+        900,
+        "int value_0900 = 42;",
+    ));
+}
+
+#[test]
+fn test_all_human_checkpoint_after_reset_preserves_prior_ai_attribution() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("reset-recommit.cpp");
+
+    let ai_content = "\
+int main() {
+    int value = 1;
+    value += 2;
+    return value;
+}
+";
+    fs::write(&file_path, ai_content).unwrap();
+
+    let ai_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(ai_content.as_bytes()).finalize()
+    );
+    let agent_author_id = "3bd30911a58cb074".to_string();
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(ai_content)
+        .expect("persist AI blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "line-only-ai-before-reset".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "reset-recommit.cpp".to_string(),
+                ai_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 5,
+                    author_id: agent_author_id,
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(AgentId {
+                tool: "mock_ai".to_string(),
+                id: "test_session".to_string(),
+                model: "test".to_string(),
+            }),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 5,
+                deletions: 0,
+                additions_sloc: 5,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append AI checkpoint");
+
+    let final_content = "\
+int main() {
+    int value = 1;
+    value += 3;
+    return value;
+}
+";
+    fs::write(&file_path, final_content).unwrap();
+    let final_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(final_content.as_bytes()).finalize()
+    );
+    working_log
+        .persist_file_version(final_content)
+        .expect("persist reset recommit blob");
+
+    // Regression for git-notes-test2 reset/recommit: an old commit-time Human
+    // checkpoint can contain non-empty but all-human byte attribution for a file
+    // that still has a prior AI line-only checkpoint. That stale all-human entry
+    // must not erase the earlier AI attribution for unchanged lines.
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::Human,
+            diff: "reset-recommit-human-capture".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "reset-recommit.cpp".to_string(),
+                final_sha,
+                vec![
+                    Attribution::new(0, 0, CheckpointKind::Human.to_str(), 2000),
+                    Attribution::new(0, final_content.len(), CheckpointKind::Human.to_str(), 2000),
+                ],
+                Vec::new(),
+            )],
+            timestamp: 2000,
+            transcript: None,
+            agent_id: None,
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 1,
+                deletions: 1,
+                additions_sloc: 1,
+                deletions_sloc: 1,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append all-human checkpoint");
+
+    let commit = repo
+        .stage_all_and_commit("reset recommit after all-human checkpoint")
+        .unwrap();
+    assert!(
+        commit
+            .authorship_log
+            .attestations
+            .iter()
+            .any(|attestation| attestation.file_path == "reset-recommit.cpp"),
+        "expected authorship note to include reset-recommit.cpp: {:#?}",
+        commit.authorship_log
+    );
+
+    let mut file = repo.filename("reset-recommit.cpp");
+    file.assert_lines_and_blame(crate::lines![
+        "int main() {".ai(),
+        "    int value = 1;".ai(),
+        "    value += 3;".human(),
+        "    return value;".ai(),
+        "}".ai(),
+    ]);
+}
+
+#[test]
+fn test_prompt_metadata_accepted_lines_matches_committed_attestations() {
+    use sha2::{Digest, Sha256};
+
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("metadata-accepted-lines.cpp");
+
+    let base_content = "\
+int value_1 = 1;
+int value_2 = 2;
+int value_3 = 3;
+int value_4 = 4;
+";
+    fs::write(&file_path, base_content).unwrap();
+    repo.stage_all_and_commit("base commit").unwrap();
+
+    let final_content = "\
+int value_1 = 1;
+int value_2 = 2;
+int ai_inserted = 99;
+int value_3 = 3;
+int value_4 = 4;
+";
+    fs::write(&file_path, final_content).unwrap();
+
+    let agent_id = AgentId {
+        tool: "mock_ai".to_string(),
+        id: "metadata-session".to_string(),
+        model: "test".to_string(),
+    };
+    let agent_author_id = generate_short_hash(&agent_id.id, &agent_id.tool);
+    let final_sha = format!(
+        "{:x}",
+        Sha256::new_with_prefix(final_content.as_bytes()).finalize()
+    );
+
+    let working_log = repo.current_working_logs();
+    working_log
+        .persist_file_version(final_content)
+        .expect("persist final blob");
+    working_log
+        .append_checkpoint(&Checkpoint {
+            kind: CheckpointKind::AiAgent,
+            diff: "metadata-accepted-lines".to_string(),
+            author: "Test User".to_string(),
+            entries: vec![WorkingLogEntry::new(
+                "metadata-accepted-lines.cpp".to_string(),
+                final_sha,
+                Vec::new(),
+                vec![LineAttribution {
+                    start_line: 1,
+                    end_line: 5,
+                    author_id: agent_author_id.clone(),
+                    overrode: None,
+                }],
+            )],
+            timestamp: 1000,
+            transcript: None,
+            agent_id: Some(agent_id),
+            agent_metadata: None,
+            line_stats: CheckpointLineStats {
+                additions: 1,
+                deletions: 0,
+                additions_sloc: 1,
+                deletions_sloc: 0,
+            },
+            api_version: "checkpoint/1.0.0".to_string(),
+            git_ai_version: Some("development:test".to_string()),
+        })
+        .expect("append AI checkpoint");
+
+    let commit = repo
+        .stage_all_and_commit("commit one AI line with inflated checkpoint")
+        .unwrap();
+
+    let prompt = commit
+        .authorship_log
+        .metadata
+        .prompts
+        .get(&agent_author_id)
+        .expect("prompt metadata should include AI session");
+    assert_eq!(
+        prompt.accepted_lines, 1,
+        "metadata accepted_lines should count only committed attestation lines, not the full virtual attribution state: {:#?}",
+        commit.authorship_log
+    );
+
+    let file_attestation = commit
+        .authorship_log
+        .attestations
+        .iter()
+        .find(|attestation| attestation.file_path == "metadata-accepted-lines.cpp")
+        .expect("authorship note should include committed file");
+    let entry = file_attestation
+        .entries
+        .iter()
+        .find(|entry| entry.hash == agent_author_id)
+        .expect("authorship note should include AI attestation entry");
+    assert_eq!(entry.line_ranges, vec![LineRange::Single(3)]);
+}
+
 crate::reuse_tests_in_worktree!(
     test_simple_additions_empty_repo,
     test_simple_additions_with_base_commit,
@@ -2189,10 +2819,15 @@ crate::reuse_tests_in_worktree!(
     test_complex_mixed_additions_and_deletions,
     test_partial_staging_filters_unstaged_lines,
     test_human_stages_some_ai_lines,
-    test_ai_generated_new_file_then_known_human_append_before_first_commit_stays_human,
+    test_ai_generated_new_file_then_human_append_before_first_commit_stays_human,
     test_ai_generated_new_file_then_uncheckpointed_human_append_before_first_commit_stays_human,
-    test_ai_generated_new_file_then_known_human_modifies_ai_line_before_first_commit_stays_human,
+    test_ai_generated_new_file_then_human_modifies_ai_line_before_first_commit_stays_human,
     test_commit_time_human_checkpoint_preserves_line_only_ai_for_new_file,
     test_ai_generated_file_then_human_full_rewrite,
     test_human_checkpoint_preserves_legacy_ai_line_only_attribution,
+    test_human_checkpoint_normalizes_crlf_before_diffing_prior_ai_content,
+    test_human_checkpoint_after_empty_human_entry_preserves_prior_ai_attribution,
+    test_all_human_checkpoint_reconstruction_handles_crlf_prior_ai_snapshot,
+    test_all_human_checkpoint_after_reset_preserves_prior_ai_attribution,
+    test_prompt_metadata_accepted_lines_matches_committed_attestations,
 );

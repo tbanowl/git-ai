@@ -7,6 +7,7 @@ use crate::authorship::imara_diff_utils::{ByteDiff, ByteDiffOp, DiffOp, capture_
 use crate::authorship::move_detection::{DeletedLine, InsertedLine, detect_moves};
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -574,6 +575,17 @@ impl AttributionTracker {
         ts: u128,
         is_ai_checkpoint: bool,
     ) -> Result<Vec<Attribution>, GitAiError> {
+        if old_content.contains("\r\n") || new_content.contains("\r\n") {
+            return self.update_attributions_for_checkpoint_normalized_line_endings(
+                old_content,
+                new_content,
+                old_attributions,
+                current_author,
+                ts,
+                is_ai_checkpoint,
+            );
+        }
+
         // Cursor-based scans in transform_attributions assume sorted ranges.
         // Normalize once at the boundary so callers can pass ranges in any order.
         let sorted_old_storage = (!is_attribution_list_sorted(old_attributions))
@@ -612,6 +624,36 @@ impl AttributionTracker {
 
         // Phase 5: Merge and clean up
         Ok(self.merge_attributions(new_attributions))
+    }
+
+    fn update_attributions_for_checkpoint_normalized_line_endings(
+        &self,
+        old_content: &str,
+        new_content: &str,
+        old_attributions: &[Attribution],
+        current_author: &str,
+        ts: u128,
+        is_ai_checkpoint: bool,
+    ) -> Result<Vec<Attribution>, GitAiError> {
+        let old_normalized = normalize_crlf_to_lf(old_content);
+        let new_normalized = normalize_crlf_to_lf(new_content);
+        let old_map = OffsetMapper::new(old_content, old_normalized.as_ref());
+        let new_map = OffsetMapper::new(new_content, new_normalized.as_ref());
+        let normalized_old_attributions =
+            map_attributions_to_normalized(old_attributions, &old_map, old_normalized.len());
+
+        let normalized_attributions = self.update_attributions_for_checkpoint(
+            old_normalized.as_ref(),
+            new_normalized.as_ref(),
+            &normalized_old_attributions,
+            current_author,
+            ts,
+            is_ai_checkpoint,
+        )?;
+
+        let mapped_attributions =
+            map_attributions_to_original(&normalized_attributions, &new_map, new_content.len());
+        Ok(self.merge_attributions(mapped_attributions))
     }
 
     fn should_skip_move_detection(
@@ -1827,6 +1869,113 @@ fn sort_attributions_for_transform(attributions: &[Attribution]) -> Vec<Attribut
     sorted
 }
 
+fn normalize_crlf_to_lf(content: &str) -> Cow<'_, str> {
+    if content.contains("\r\n") {
+        Cow::Owned(content.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(content)
+    }
+}
+
+struct OffsetMapper {
+    original_to_normalized: Vec<usize>,
+    normalized_to_original: Vec<usize>,
+}
+
+impl OffsetMapper {
+    fn new(original: &str, normalized: &str) -> Self {
+        let mut original_to_normalized = vec![0; original.len() + 1];
+        let mut normalized_to_original = Vec::with_capacity(normalized.len() + 1);
+        let bytes = original.as_bytes();
+        let mut original_offset = 0usize;
+        let mut normalized_offset = 0usize;
+
+        normalized_to_original.push(0);
+
+        while original_offset < bytes.len() {
+            original_to_normalized[original_offset] = normalized_offset;
+
+            if bytes[original_offset] == b'\r'
+                && original_offset + 1 < bytes.len()
+                && bytes[original_offset + 1] == b'\n'
+            {
+                original_to_normalized[original_offset + 1] = normalized_offset;
+                original_offset += 2;
+                normalized_offset += 1;
+                normalized_to_original.push(original_offset);
+            } else {
+                original_offset += 1;
+                normalized_offset += 1;
+                normalized_to_original.push(original_offset);
+            }
+        }
+
+        original_to_normalized[original.len()] = normalized_offset;
+
+        debug_assert_eq!(normalized_offset, normalized.len());
+        debug_assert_eq!(normalized_to_original.len(), normalized.len() + 1);
+
+        Self {
+            original_to_normalized,
+            normalized_to_original,
+        }
+    }
+
+    fn to_normalized(&self, original_offset: usize) -> usize {
+        self.original_to_normalized
+            .get(original_offset)
+            .copied()
+            .unwrap_or_else(|| *self.original_to_normalized.last().unwrap_or(&0))
+    }
+
+    fn to_original(&self, normalized_offset: usize) -> usize {
+        self.normalized_to_original
+            .get(normalized_offset)
+            .copied()
+            .unwrap_or_else(|| *self.normalized_to_original.last().unwrap_or(&0))
+    }
+}
+
+fn map_attributions_to_normalized(
+    attributions: &[Attribution],
+    mapper: &OffsetMapper,
+    normalized_len: usize,
+) -> Vec<Attribution> {
+    attributions
+        .iter()
+        .map(|attr| {
+            let start = mapper.to_normalized(attr.start).min(normalized_len);
+            let end = mapper.to_normalized(attr.end).min(normalized_len);
+            Attribution::new(
+                start.min(end),
+                end.max(start),
+                attr.author_id.clone(),
+                attr.ts,
+            )
+        })
+        .collect()
+}
+
+fn map_attributions_to_original(
+    attributions: &[Attribution],
+    mapper: &OffsetMapper,
+    original_len: usize,
+) -> Vec<Attribution> {
+    attributions
+        .iter()
+        .map(|attr| {
+            let start = mapper.to_original(attr.start).min(original_len);
+            let end = mapper.to_original(attr.end).min(original_len);
+            Attribution::new(
+                start.min(end),
+                end.max(start),
+                attr.author_id.clone(),
+                attr.ts,
+            )
+        })
+        .collect()
+}
+
 fn find_attribution_for_insertion<'a>(
     old_attributions: &'a [Attribution],
     position: usize,
@@ -2722,6 +2871,45 @@ mod tests {
         let line3_start = "line1\nmodified\n".len();
         let line3_end = "line1\nmodified\nline3".len();
         assert_range_owned_by(&updated, line3_start, line3_end, "Alice");
+    }
+
+    #[test]
+    fn large_crlf_to_lf_with_real_edit_preserves_unchanged_attribution() {
+        let tracker = AttributionTracker::new();
+        let old = (1..=1800)
+            .map(|idx| format!("int value_{idx:04} = {idx};"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n";
+
+        let mut new_lines = (1..=1800)
+            .map(|idx| format!("int value_{idx:04} = {idx};"))
+            .collect::<Vec<_>>();
+        new_lines[899] = "int value_0900 = 42;".to_string();
+        let new = new_lines.join("\n") + "\n";
+
+        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
+        let updated = tracker
+            .update_attributions_for_checkpoint(&old, &new, &old_attrs, "Bob", TEST_TS + 1, false)
+            .unwrap();
+
+        assert_range_owned_by(&updated, 0, "int value_0001 = 1;".len(), "Alice");
+
+        let edited_start = new
+            .find("int value_0900 = 42;")
+            .expect("edited line should exist")
+            + "int value_0900 = ".len();
+        assert_range_owned_by(&updated, edited_start, edited_start + "42".len(), "Bob");
+
+        let tail_start = new
+            .find("int value_1800 = 1800;")
+            .expect("tail line should exist");
+        assert_range_owned_by(
+            &updated,
+            tail_start,
+            tail_start + "int value_1800 = 1800;".len(),
+            "Alice",
+        );
     }
 
     #[test]

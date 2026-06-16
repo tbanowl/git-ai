@@ -1646,6 +1646,16 @@ fn build_previous_file_state_maps(
     // Keep only the latest entry for each file.
     for checkpoint in previous_checkpoints {
         for entry in &checkpoint.entries {
+            // Legacy human checkpoints sometimes wrote empty entries for AI-touched files.
+            // Treat those as no-op snapshots so they do not erase earlier AI state.
+            if checkpoint.kind == CheckpointKind::Human
+                && entry.attributions.is_empty()
+                && entry.line_attributions.is_empty()
+                && ai_touched_files.contains(&entry.file)
+            {
+                continue;
+            }
+
             previous_file_state_by_file.insert(
                 entry.file.clone(),
                 PreviousFileState {

@@ -157,7 +157,7 @@ pub fn handle_git(args: &[String]) {
             proxy_to_git(&orig_args, true, None, None);
             return;
         }
-        
+
         if is_command_skip_hooks(&parsed) {
             let orig_args: Vec<String> = std::env::args().skip(1).collect();
             proxy_to_git(&orig_args, true, None, None);
@@ -225,7 +225,7 @@ pub fn handle_git(args: &[String]) {
             if is_commit {
                 if std::env::var("GIT_AI_ASYNC_SHOW_COMMIT_STATS").unwrap_or_default() == "1" {
                     maybe_show_async_post_commit_stats(&parsed, repo);
-                } else {
+                } else if should_show_async_post_commit_output(&parsed) {
                     let commit_sha = match repo.head().ok().and_then(|h| h.target().ok()) {
                         Some(sha) => sha,
                         None => return,
@@ -242,7 +242,7 @@ pub fn handle_git(args: &[String]) {
     }
 
     let mut parsed_args = parse_git_cli_args(args);
-    
+
     if is_command_skip_hooks(&parsed_args) {
         let orig_args: Vec<String> = std::env::args().skip(1).collect();
         proxy_to_git(&orig_args, true, None, None);
@@ -260,7 +260,7 @@ pub fn handle_git(args: &[String]) {
             parsed_args = resolved;
         }
     }
-    
+
     // if is_commit_command(&parsed_args) && let Some(repository) = repository_option.as_ref() {
     //     pre_commit_human_checkpoint(repository);
     // }
@@ -349,7 +349,7 @@ pub fn handle_git(args: &[String]) {
             git_duration,
             post_command_duration,
         );
-        
+
         // let proxy_to_git_maintenance_start = Instant::now();
         // proxy_to_git_maintenance(repository);
         // tracing::debug!("proxy_to_git_maintenance cost {}ms", proxy_to_git_maintenance_start.elapsed().as_millis());
@@ -381,7 +381,29 @@ pub fn handle_git(args: &[String]) {
 // }
 
 fn is_commit_command(parsed_args: &ParsedGitInvocation) -> bool {
-    parsed_args.command.as_deref().is_some_and(|cmd| matches!(cmd, "commit"))
+    parsed_args
+        .command
+        .as_deref()
+        .is_some_and(|cmd| matches!(cmd, "commit"))
+}
+
+fn should_show_async_post_commit_output(parsed: &ParsedGitInvocation) -> bool {
+    use crate::git::cli_parser::is_dry_run;
+    use std::io::IsTerminal;
+
+    if is_dry_run(&parsed.command_args) {
+        return false;
+    }
+
+    let suppress_output = parsed.has_command_flag("--porcelain")
+        || parsed.has_command_flag("--quiet")
+        || parsed.has_command_flag("-q")
+        || parsed.has_command_flag("--no-status");
+    if suppress_output || config::Config::get().is_quiet() {
+        return false;
+    }
+
+    std::io::stdout().is_terminal() || std::env::var_os("GIT_AI_TEST_FORCE_TTY").is_some()
 }
 
 fn is_command_skip_hooks(parsed_args: &ParsedGitInvocation) -> bool {
@@ -773,25 +795,10 @@ fn resolve_child_git_hooks_path_override(
 fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repository) {
     use crate::authorship::ignore::effective_ignore_patterns;
     use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
-    use crate::git::cli_parser::is_dry_run;
     use crate::git::refs::show_authorship_note;
-    use std::io::IsTerminal;
 
     // Respect the same suppression flags as the synchronous wrapper path.
-    if is_dry_run(&parsed.command_args) {
-        return;
-    }
-    let suppress_output = parsed.has_command_flag("--porcelain")
-        || parsed.has_command_flag("--quiet")
-        || parsed.has_command_flag("-q")
-        || parsed.has_command_flag("--no-status");
-    if suppress_output || config::Config::get().is_quiet() {
-        return;
-    }
-
-    let is_interactive =
-        std::io::stdout().is_terminal() || std::env::var_os("GIT_AI_TEST_FORCE_TTY").is_some();
-    if !is_interactive {
+    if !should_show_async_post_commit_output(parsed) {
         return;
     }
 
@@ -987,7 +994,7 @@ fn send_wrapper_post_state_to_daemon(
 //         tracing::debug!("maintenance worker already running");
 //         return;
 //     }
-    
+
 //     tracing::debug!("[proxy_to_git_maintenance] spawn_maintenance_worker start");
 //     let repo_dir = repository.workdir().ok();
 //     match spawn_maintenance_worker(&repo_dir.unwrap_or_default(), &common_dir) {
@@ -997,7 +1004,7 @@ fn send_wrapper_post_state_to_daemon(
 //             false
 //         }
 //     };
-    
+
 //     tracing::debug!("[proxy_to_git_maintenance] spawn_maintenance_worker end");
 // }
 
@@ -1005,7 +1012,7 @@ fn send_wrapper_post_state_to_daemon(
 //     let Ok(exe) = current_git_ai_exe() else {
 //         return Ok(());
 //     };
-    
+
 //     let mut cmd = Command::new(exe);
 //     cmd.arg("maintenance-worker")
 //         .arg("--repo")

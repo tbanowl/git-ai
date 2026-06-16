@@ -25,16 +25,16 @@ use crate::git::repository::{CommitRange, Repository, group_files_by_repository}
 use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes, push_authorship_notes};
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
 use crate::observability::{self, log_message};
-use crate::utils::is_interactive_terminal;
 #[cfg(windows)]
 use crate::utils::CREATE_NO_WINDOW;
+use crate::utils::is_interactive_terminal;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn handle_git_ai(args: &[String]) {
     if args.is_empty() {
@@ -382,7 +382,6 @@ fn print_help() {
     eprintln!();
     std::process::exit(0);
 }
-
 
 fn handle_checkpoint(args: &[String]) {
     let mut repository_working_dir = std::env::current_dir()
@@ -975,7 +974,13 @@ fn handle_checkpoint(args: &[String]) {
     // Override to AI when a non-stale pre-snapshot exists, which is the precise signal
     // that a bash invocation is in flight. This uses existing snapshot lifecycle — no new
     // daemon messages or side-channel files needed.
-    if checkpoint_kind == CheckpointKind::Human && agent_run_result.is_none() {
+    let human_checkpoint_has_explicit_pathspecs =
+        checkpoint_request_has_explicit_capture_scope(args, agent_run_result.as_ref());
+
+    if checkpoint_kind == CheckpointKind::Human
+        && agent_run_result.is_none()
+        && !human_checkpoint_has_explicit_pathspecs
+    {
         let repo_root = std::path::Path::new(&effective_working_dir);
 
         if let Some((resolved_kind, resolved_agent_run_result)) =
@@ -1510,10 +1515,14 @@ fn log_daemon_checkpoint_delegate_failure(
 }
 
 fn daemon_checkpoint_delegate_enabled() -> bool {
-    if std::env::var("GIT_AI_DEAMON_CHECKPOINT").unwrap_or_default() != "1" {
-        return false
-    }
-    crate::utils::checkpoint_delegation_enabled()
+    matches!(
+        std::env::var("GIT_AI_DAEMON_CHECKPOINT_DELEGATE")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    ) && crate::utils::checkpoint_delegation_enabled()
 }
 
 fn checkpoint_kind_to_str(kind: CheckpointKind) -> &'static str {

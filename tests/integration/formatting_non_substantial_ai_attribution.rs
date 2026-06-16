@@ -1,7 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
-use git_ai::authorship::working_log::CheckpointKind;
 use git_ai::git::find_repository_in_path;
 
 #[test]
@@ -836,69 +835,6 @@ fn test_human_token_change_on_ai_line_reclaims_attribution() {
     file.assert_lines_and_blame(crate::lines!["let value = compute();".human()]);
 }
 
-#[test]
-fn test_known_human_aliases_serialize_as_canonical_human_checkpoint() {
-    let repo = TestRepo::new();
-    let file_path = repo.path().join("known_human_alias.rs");
-
-    std::fs::write(&file_path, "let value = compute();\n").unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "known_human_alias.rs"])
-        .unwrap();
-    repo.stage_all_and_commit("Commit AI line").unwrap();
-
-    std::fs::write(&file_path, "let renamed = compute();\n").unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "known_human_alias.rs"])
-        .unwrap();
-
-    std::fs::write(&file_path, "let renamed_again = compute();\n").unwrap();
-    repo.git_ai_with_stdin(
-        &[
-            "checkpoint",
-            "known_human",
-            "--hook-input",
-            "stdin",
-            "known_human_alias.rs",
-        ],
-        br#"{"edited_filepaths":["known_human_alias.rs"]}"#,
-    )
-    .unwrap();
-
-    let checkpoints = repo
-        .current_working_logs()
-        .read_all_checkpoints()
-        .expect("working log checkpoints should be readable");
-    let checkpoints_jsonl =
-        std::fs::read_to_string(repo.current_working_logs().dir.join("checkpoints.jsonl"))
-            .expect("working log JSONL should be readable");
-    for line in checkpoints_jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-    {
-        let checkpoint_json: serde_json::Value =
-            serde_json::from_str(line).expect("checkpoint JSONL line should parse");
-        assert_ne!(
-            checkpoint_json.get("kind").and_then(|kind| kind.as_str()),
-            Some("known_human"),
-            "compatibility aliases must not be serialized as a checkpoint kind: {checkpoint_json}"
-        );
-    }
-    let human_checkpoints: Vec<_> = checkpoints
-        .iter()
-        .filter(|checkpoint| checkpoint.kind == CheckpointKind::Human)
-        .collect();
-
-    assert_eq!(
-        human_checkpoints.len(),
-        2,
-        "both known_human aliases should normalize to canonical human checkpoints: {checkpoints:#?}"
-    );
-    repo.stage_all_and_commit("Human alias edits AI line")
-        .unwrap();
-
-    let mut file = repo.filename("known_human_alias.rs");
-    file.assert_lines_and_blame(crate::lines!["let renamed_again = compute();".human()]);
-}
-
 crate::reuse_tests_in_worktree!(
     test_ai_reflow_human_single_line_call_is_fully_ai,
     test_ai_indentation_only_change_on_human_block_attributes_touched_line_to_ai,
@@ -927,5 +863,4 @@ crate::reuse_tests_in_worktree!(
     test_human_duplicate_copy_of_parent_ai_line_does_not_write_ai_note,
     test_uncheckpointed_human_token_change_after_ai_checkpoint_before_commit_reclaims_attribution,
     test_human_token_change_on_ai_line_reclaims_attribution,
-    test_known_human_aliases_serialize_as_canonical_human_checkpoint,
 );

@@ -343,7 +343,10 @@ fn async_mode_checkpoint_starts_daemon_when_down() {
     .expect("failed to write async checkpoint file");
 
     let output = repo
-        .git_ai(&["checkpoint", "mock_ai", "async-checkpoint.txt"])
+        .git_ai_with_env(
+            &["checkpoint", "mock_ai", "async-checkpoint.txt"],
+            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        )
         .expect("async mode checkpoint should succeed");
 
     assert!(
@@ -629,7 +632,10 @@ fn async_commit_with_ai_content(extra_envs: &[(&str, &str)]) -> (TestRepo, Strin
 
 #[test]
 fn async_mode_post_commit_shows_stats_for_ai_commit() {
-    let (_repo, output) = async_commit_with_ai_content(&[]);
+    let (_repo, output) = async_commit_with_ai_content(&[
+        ("GIT_AI_ASYNC_SHOW_COMMIT_STATS", "1"),
+        ("GIT_AI_WAIT_COMMIT_STATS", "1"),
+    ]);
     // The wrapper should have found the authorship note and printed the
     // stats progress bar (contains "you" label and "ai" label).
     assert!(
@@ -717,8 +723,8 @@ fn async_mode_post_commit_still_processing_when_no_daemon() {
         output
     );
     assert!(
-        output.contains("git ai stats"),
-        "expected hint to run 'git ai stats', got:\n{}",
+        output.contains("git-ai stats"),
+        "expected hint to run 'git-ai stats', got:\n{}",
         output
     );
 }

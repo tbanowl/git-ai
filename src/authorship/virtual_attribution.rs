@@ -1,9 +1,9 @@
 use crate::authorship::attribution_tracker::{
-    Attribution, LineAttribution, line_attributions_to_attributions,
+    Attribution, AttributionTracker, LineAttribution, line_attributions_to_attributions,
 };
 use crate::authorship::authorship_log::{LineRange, PromptRecord};
 use crate::authorship::duplicate_parent_ai::DuplicateParentAiContext;
-use crate::authorship::working_log::CheckpointKind;
+use crate::authorship::working_log::{Checkpoint, CheckpointKind, WorkingLogEntry};
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::error::GitAiError;
 use crate::git::refs::get_reference_as_authorship_log_v3;
@@ -30,6 +30,92 @@ pub struct VirtualAttributions {
     // These are stale prompts from prior commits and should only appear in the
     // authorship note if they have committed lines in the current commit.
     initial_only_prompt_ids: HashSet<String>,
+}
+
+fn entry_has_non_human_attribution(
+    char_attrs: &[Attribution],
+    line_attrs: &[LineAttribution],
+) -> bool {
+    char_attrs
+        .iter()
+        .any(|attr| attr.author_id != CheckpointKind::Human.to_str())
+        || line_attrs
+            .iter()
+            .any(|attr| attr.author_id != CheckpointKind::Human.to_str())
+}
+
+fn is_legacy_all_human_entry(checkpoint: &Checkpoint, entry: &WorkingLogEntry) -> bool {
+    checkpoint.kind == CheckpointKind::Human
+        && entry.line_attributions.is_empty()
+        && !entry.attributions.is_empty()
+        && entry
+            .attributions
+            .iter()
+            .all(|attr| attr.author_id == CheckpointKind::Human.to_str())
+}
+
+fn checkpoint_entry_ts(checkpoint: &Checkpoint, entry: &WorkingLogEntry) -> u128 {
+    entry
+        .attributions
+        .iter()
+        .map(|attr| attr.ts)
+        .max()
+        .unwrap_or_else(|| (checkpoint.timestamp as u128).saturating_mul(1000))
+}
+
+fn reconstruct_legacy_all_human_entry(
+    checkpoint: &Checkpoint,
+    entry: &WorkingLogEntry,
+    previous_content: Option<&str>,
+    previous_state: Option<&(Vec<Attribution>, Vec<LineAttribution>)>,
+    current_content: &str,
+) -> Result<Option<(Vec<Attribution>, Vec<LineAttribution>)>, GitAiError> {
+    if !is_legacy_all_human_entry(checkpoint, entry) {
+        return Ok(None);
+    }
+
+    let (Some(previous_content), Some((previous_attrs, previous_line_attrs))) =
+        (previous_content, previous_state)
+    else {
+        return Ok(None);
+    };
+
+    if !entry_has_non_human_attribution(previous_attrs, previous_line_attrs) {
+        return Ok(None);
+    }
+
+    let ts = checkpoint_entry_ts(checkpoint, entry);
+    let previous_attrs = if previous_line_attrs.is_empty() {
+        previous_attrs.clone()
+    } else {
+        line_attributions_to_attributions(
+            previous_line_attrs,
+            previous_content,
+            ts.saturating_sub(1),
+        )
+    };
+    let tracker = AttributionTracker::new();
+    let filled_previous_attrs = tracker.attribute_unattributed_ranges(
+        previous_content,
+        &previous_attrs,
+        &CheckpointKind::Human.to_str(),
+        ts.saturating_sub(1),
+    );
+    let reconstructed_attrs = tracker.update_attributions_for_checkpoint(
+        previous_content,
+        current_content,
+        &filled_previous_attrs,
+        &CheckpointKind::Human.to_str(),
+        ts,
+        false,
+    )?;
+    let reconstructed_line_attrs =
+        crate::authorship::attribution_tracker::attributions_to_line_attributions(
+            &reconstructed_attrs,
+            current_content,
+        );
+
+    Ok(Some((reconstructed_attrs, reconstructed_line_attrs)))
 }
 
 impl VirtualAttributions {
@@ -327,6 +413,7 @@ impl VirtualAttributions {
             HashMap::new();
         let mut prompts = BTreeMap::new();
         let mut file_contents: HashMap<String, String> = HashMap::new();
+        let mut checkpoint_contents: HashMap<String, String> = HashMap::new();
         // Prompt IDs that originate from INITIAL attributions (prior commits).
         // If a checkpoint later references the same prompt_id, it is removed from
         // this set because the prompt was actively used in this commit's session.
@@ -357,6 +444,7 @@ impl VirtualAttributions {
                     String::new()
                 };
                 file_contents.insert(file_path.clone(), file_content.clone());
+                checkpoint_contents.insert(file_path.clone(), file_content.clone());
 
                 // Convert line attributions to character attributions
                 let char_attrs = line_attributions_to_attributions(line_attrs, &file_content, 0);
@@ -415,6 +503,9 @@ impl VirtualAttributions {
                     continue;
                 }
 
+                let previous_content = checkpoint_contents.get(&entry.file).cloned();
+                let previous_state = attributions.get(&entry.file).cloned();
+
                 // Get the latest file content from working directory
                 if let Ok(workdir) = repo.workdir() {
                     let abs_path = workdir.join(&entry.file);
@@ -429,13 +520,32 @@ impl VirtualAttributions {
                 // Prefer persisted line attributions. Fall back to converting char attributions
                 // for compatibility with older checkpoint data.
                 let file_content = file_contents.get(&entry.file).cloned().unwrap_or_default();
-                let line_attrs = if entry.line_attributions.is_empty() {
-                    crate::authorship::attribution_tracker::attributions_to_line_attributions(
-                        &entry.attributions,
-                        &file_content,
-                    )
+                let checkpoint_content = working_log
+                    .get_file_version(&entry.blob_sha)
+                    .unwrap_or_else(|_| file_content.clone());
+                let (char_attrs, line_attrs) = if let Some(reconstructed) =
+                    reconstruct_legacy_all_human_entry(
+                        checkpoint,
+                        entry,
+                        previous_content.as_deref(),
+                        previous_state.as_ref(),
+                        &checkpoint_content,
+                    )? {
+                    reconstructed
+                } else if entry.line_attributions.is_empty() {
+                    let line_attrs =
+                        crate::authorship::attribution_tracker::attributions_to_line_attributions(
+                            &entry.attributions,
+                            &file_content,
+                        );
+                    let char_attrs =
+                        line_attributions_to_attributions(&line_attrs, &file_content, 0);
+                    (char_attrs, line_attrs)
                 } else {
-                    entry.line_attributions.clone()
+                    let line_attrs = entry.line_attributions.clone();
+                    let char_attrs =
+                        line_attributions_to_attributions(&line_attrs, &file_content, 0);
+                    (char_attrs, line_attrs)
                 };
 
                 if line_attrs.is_empty() {
@@ -443,12 +553,12 @@ impl VirtualAttributions {
                     // filtering (e.g. human rewrote the entire file).  Clear any
                     // stale AI attributions from earlier checkpoints for this file.
                     attributions.remove(&entry.file);
+                    checkpoint_contents.insert(entry.file.clone(), checkpoint_content);
                     continue;
                 }
 
-                let char_attrs = line_attributions_to_attributions(&line_attrs, &file_content, 0);
-
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));
+                checkpoint_contents.insert(entry.file.clone(), checkpoint_content);
             }
         }
 
@@ -488,6 +598,7 @@ impl VirtualAttributions {
             HashMap::new();
         let mut prompts = BTreeMap::new();
         let mut file_contents: HashMap<String, String> = HashMap::new();
+        let mut checkpoint_contents: HashMap<String, String> = HashMap::new();
         let mut initial_only_prompt_ids: HashSet<String> = HashSet::new();
 
         let mut session_additions: HashMap<String, u32> = HashMap::new();
@@ -510,6 +621,7 @@ impl VirtualAttributions {
                 })
                 .unwrap_or_default();
             file_contents.insert(file_path.clone(), file_content.clone());
+            checkpoint_contents.insert(file_path.clone(), file_content.clone());
 
             let char_attrs = line_attributions_to_attributions(line_attrs, &file_content, 0);
             attributions.insert(file_path.clone(), (char_attrs, line_attrs.clone()));
@@ -555,6 +667,9 @@ impl VirtualAttributions {
                     continue;
                 }
 
+                let previous_content = checkpoint_contents.get(&entry.file).cloned();
+                let previous_state = attributions.get(&entry.file).cloned();
+
                 let file_content = final_state_snapshot
                     .get(&entry.file)
                     .cloned()
@@ -564,14 +679,33 @@ impl VirtualAttributions {
                             .unwrap_or_default()
                     });
                 file_contents.insert(entry.file.clone(), file_content.clone());
+                let checkpoint_content = working_log
+                    .get_file_version(&entry.blob_sha)
+                    .unwrap_or_else(|_| file_content.clone());
 
-                let line_attrs = if entry.line_attributions.is_empty() {
-                    crate::authorship::attribution_tracker::attributions_to_line_attributions(
-                        &entry.attributions,
-                        &file_content,
-                    )
+                let (char_attrs, line_attrs) = if let Some(reconstructed) =
+                    reconstruct_legacy_all_human_entry(
+                        checkpoint,
+                        entry,
+                        previous_content.as_deref(),
+                        previous_state.as_ref(),
+                        &checkpoint_content,
+                    )? {
+                    reconstructed
+                } else if entry.line_attributions.is_empty() {
+                    let line_attrs =
+                        crate::authorship::attribution_tracker::attributions_to_line_attributions(
+                            &entry.attributions,
+                            &file_content,
+                        );
+                    let char_attrs =
+                        line_attributions_to_attributions(&line_attrs, &file_content, 0);
+                    (char_attrs, line_attrs)
                 } else {
-                    entry.line_attributions.clone()
+                    let line_attrs = entry.line_attributions.clone();
+                    let char_attrs =
+                        line_attributions_to_attributions(&line_attrs, &file_content, 0);
+                    (char_attrs, line_attrs)
                 };
 
                 if line_attrs.is_empty() {
@@ -579,11 +713,12 @@ impl VirtualAttributions {
                     // filtering (e.g. human rewrote the entire file).  Clear any
                     // stale AI attributions from earlier checkpoints for this file.
                     attributions.remove(&entry.file);
+                    checkpoint_contents.insert(entry.file.clone(), checkpoint_content);
                     continue;
                 }
 
-                let char_attrs = line_attributions_to_attributions(&line_attrs, &file_content, 0);
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));
+                checkpoint_contents.insert(entry.file.clone(), checkpoint_content);
             }
         }
 
@@ -623,6 +758,7 @@ impl VirtualAttributions {
             HashMap::new();
         let mut prompts = BTreeMap::new();
         let mut file_contents: HashMap<String, String> = HashMap::new();
+        let mut checkpoint_contents: HashMap<String, String> = HashMap::new();
         let mut initial_only_prompt_ids: HashSet<String> = HashSet::new();
 
         let mut session_additions: HashMap<String, u32> = HashMap::new();
@@ -646,6 +782,7 @@ impl VirtualAttributions {
                     ))
                 })?;
             file_contents.insert(file_path.clone(), file_content.clone());
+            checkpoint_contents.insert(file_path.clone(), file_content.clone());
             let char_attrs = line_attributions_to_attributions(line_attrs, &file_content, 0);
             attributions.insert(file_path.clone(), (char_attrs, line_attrs.clone()));
         }
@@ -690,10 +827,22 @@ impl VirtualAttributions {
                     continue;
                 }
 
+                let previous_content = checkpoint_contents.get(&entry.file).cloned();
+                let previous_state = attributions.get(&entry.file).cloned();
+
                 let file_content = working_log.get_file_version(&entry.blob_sha)?;
                 file_contents.insert(entry.file.clone(), file_content.clone());
 
-                let (char_attrs, line_attrs) = if !entry.attributions.is_empty() {
+                let (char_attrs, line_attrs) = if let Some(reconstructed) =
+                    reconstruct_legacy_all_human_entry(
+                        checkpoint,
+                        entry,
+                        previous_content.as_deref(),
+                        previous_state.as_ref(),
+                        &file_content,
+                    )? {
+                    reconstructed
+                } else if !entry.attributions.is_empty() {
                     let char_attrs = if checkpoint.kind == CheckpointKind::Human {
                         entry.attributions.clone()
                     } else {
@@ -722,10 +871,12 @@ impl VirtualAttributions {
                     // filtering (e.g. human rewrote the entire file).  Clear any
                     // stale AI attributions from earlier checkpoints for this file.
                     attributions.remove(&entry.file);
+                    checkpoint_contents.insert(entry.file.clone(), file_content);
                     continue;
                 }
 
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));
+                checkpoint_contents.insert(entry.file.clone(), file_content);
             }
         }
 
@@ -1052,6 +1203,8 @@ impl VirtualAttributions {
             }
         }
 
+        update_prompt_accepted_lines_from_attestations(&mut authorship_log);
+
         Ok(authorship_log)
     }
 }
@@ -1273,6 +1426,31 @@ fn committed_gap_line_existed_in_parent(
     line.checked_sub(1)
         .and_then(|idx| committed_line_contents.get(idx as usize))
         .is_some_and(|content| parent_line_contents.contains(content))
+}
+
+fn line_range_len(range: &LineRange) -> u32 {
+    match range {
+        LineRange::Single(_) => 1,
+        LineRange::Range(start, end) if start <= end => end - start + 1,
+        LineRange::Range(_, _) => 0,
+    }
+}
+
+fn update_prompt_accepted_lines_from_attestations(
+    authorship_log: &mut crate::authorship::authorship_log_serialization::AuthorshipLog,
+) {
+    let mut accepted_by_prompt: HashMap<String, u32> = HashMap::new();
+
+    for file_attestation in &authorship_log.attestations {
+        for entry in &file_attestation.entries {
+            let accepted_lines = entry.line_ranges.iter().map(line_range_len).sum::<u32>();
+            *accepted_by_prompt.entry(entry.hash.clone()).or_insert(0) += accepted_lines;
+        }
+    }
+
+    for (prompt_id, prompt_record) in &mut authorship_log.metadata.prompts {
+        prompt_record.accepted_lines = *accepted_by_prompt.get(prompt_id).unwrap_or(&0);
+    }
 }
 
 impl VirtualAttributions {
@@ -1685,6 +1863,8 @@ impl VirtualAttributions {
             file_blobs: HashMap::new(),
         };
 
+        update_prompt_accepted_lines_from_attestations(&mut authorship_log);
+
         Ok((authorship_log, initial_attributions))
     }
 
@@ -1896,6 +2076,8 @@ impl VirtualAttributions {
                     || committed_prompt_ids.contains(prompt_id)
             });
         }
+
+        update_prompt_accepted_lines_from_attestations(&mut authorship_log);
 
         Ok(authorship_log)
     }

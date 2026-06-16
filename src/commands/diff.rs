@@ -116,8 +116,6 @@ pub struct DiffCommitStats {
     pub ai_deletions_generated: u32,
     #[serde(default)]
     pub human_lines_added: u32,
-    // #[serde(default)]
-    // pub unknown_lines_added: u32,
     #[serde(default)]
     pub git_lines_added: u32,
     #[serde(default)]
@@ -151,8 +149,6 @@ pub struct DiffJsonHunk {
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub human_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,7 +766,6 @@ fn build_diff_artifacts(
         to_commit,
         &mut commits,
     )?;
-
     Ok(DiffBuildArtifacts {
         attributions,
         annotations_by_file,
@@ -1163,7 +1158,6 @@ fn build_json_hunk_segments(
     let mut current_start = 0u32;
     let mut current_end = 0u32;
     let mut current_prompt_id: Option<String> = None;
-    let mut current_human_id: Option<String> = None;
     let mut current_original_commit_sha: Option<String> = None;
     let mut current_commit_sha = String::new();
     let mut current_contents: Vec<String> = Vec::new();
@@ -1172,7 +1166,6 @@ fn build_json_hunk_segments(
                  current_start: &mut u32,
                  current_end: &mut u32,
                  current_prompt_id: &mut Option<String>,
-                 current_human_id: &mut Option<String>,
                  current_original_commit_sha: &mut Option<String>,
                  current_commit_sha: &mut String,
                  current_contents: &mut Vec<String>| {
@@ -1189,12 +1182,10 @@ fn build_json_hunk_segments(
             end_line: *current_end,
             file_path: diff_hunk.file_path.clone(),
             prompt_id: current_prompt_id.clone(),
-            human_id: current_human_id.clone(),
         });
         *current_start = 0;
         *current_end = 0;
         *current_prompt_id = None;
-        *current_human_id = None;
         *current_original_commit_sha = None;
         current_commit_sha.clear();
         current_contents.clear();
@@ -1238,7 +1229,6 @@ fn build_json_hunk_segments(
                 &mut current_start,
                 &mut current_end,
                 &mut current_prompt_id,
-                &mut current_human_id,
                 &mut current_original_commit_sha,
                 &mut current_commit_sha,
                 &mut current_contents,
@@ -1260,7 +1250,6 @@ fn build_json_hunk_segments(
         &mut current_start,
         &mut current_end,
         &mut current_prompt_id,
-        &mut current_human_id,
         &mut current_original_commit_sha,
         &mut current_commit_sha,
         &mut current_contents,
@@ -1410,13 +1399,10 @@ fn calculate_diff_commit_stats(
         match attribution {
             Attribution::Human(_) => stats.human_lines_added += 1,
             Attribution::NoData => stats.human_lines_added += 1,
-            // Attribution::NoData => stats.unknown_lines_added += 1,
             Attribution::Ai(_) => {}
         }
     }
     stats.git_lines_added = stats.ai_lines_added + stats.human_lines_added;
-    // stats.git_lines_added =
-    //     stats.ai_lines_added + stats.human_lines_added + stats.unknown_lines_added;
 
     for hunk in &artifacts.json_hunks {
         if hunk.hunk_kind == "deletion" {
@@ -2423,7 +2409,7 @@ index abc123..def456 100644
     }
 
     #[test]
-    fn test_calculate_diff_commit_stats_tracks_unknown_added_lines() {
+    fn test_calculate_diff_commit_stats_counts_no_data_added_lines_as_human() {
         fn prompt_record(tool: &str, model: &str, additions: u32, deletions: u32) -> PromptRecord {
             PromptRecord {
                 agent_id: AgentId {
@@ -2467,7 +2453,7 @@ index abc123..def456 100644
             },
             Attribution::NoData,
         );
-        // Old-side no-data should not affect unknown_lines_added.
+        // Old-side no-data should not affect added-line stats.
         attributions.insert(
             DiffLineKey {
                 file: "f.rs".to_string(),
@@ -2498,7 +2484,6 @@ index abc123..def456 100644
                 end_line: 6,
                 file_path: "f.rs".to_string(),
                 prompt_id: None,
-                human_id: None,
             }],
             commits: BTreeMap::new(),
             included_files: HashSet::new(),
@@ -2507,8 +2492,6 @@ index abc123..def456 100644
         let stats = calculate_diff_commit_stats(&artifacts, &prompts);
         assert_eq!(stats.ai_lines_added, 1);
         assert_eq!(stats.human_lines_added, 2);
-        // assert_eq!(stats.human_lines_added, 1);
-        // assert_eq!(stats.unknown_lines_added, 1);
         assert_eq!(stats.git_lines_added, 3);
         assert_eq!(stats.git_lines_deleted, 2);
         assert_eq!(stats.ai_lines_generated, 5);
