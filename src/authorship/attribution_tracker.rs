@@ -2267,7 +2267,12 @@ fn find_dominant_author_for_line_candidates(
         // deleted content at this position, so they should influence line attribution
         let is_deletion_marker = attribution.start == attribution.end;
         let is_ai_author = attribution.author_id != CheckpointKind::Human.to_str();
-        let include_ai_whitespace = is_ai_checkpoint && is_ai_author;
+        let include_ai_whitespace = is_ai_checkpoint
+            && is_ai_author
+            && slice_start < slice_end
+            && full_content[slice_start..slice_end]
+                .chars()
+                .any(|c| c.is_whitespace() && c != '\n' && c != '\r');
         if has_non_whitespace || is_line_empty || is_deletion_marker || include_ai_whitespace {
             candidate_attrs.push(attribution);
         } else {
@@ -2541,6 +2546,37 @@ mod tests {
 
         let footer_pos = new.find("// Footer").unwrap();
         assert_range_owned_by(&updated, footer_pos, footer_pos + "// Footer".len(), "Bob");
+    }
+
+    #[test]
+    fn ai_checkpoint_newline_only_attribution_does_not_mark_previous_line_ai() {
+        let content = "header\nbody\nfooter\n// AI session 2";
+        let footer_pos = content.find("footer").unwrap();
+        let newline_pos = footer_pos + "footer".len();
+        let ai_pos = content.find("// AI session 2").unwrap();
+
+        let attributions = vec![
+            Attribution::new(0, newline_pos, "human".into(), TEST_TS),
+            Attribution::new(newline_pos, newline_pos + 1, "mock_ai".into(), TEST_TS + 1),
+            Attribution::new(
+                ai_pos,
+                ai_pos + "// AI session 2".len(),
+                "mock_ai".into(),
+                TEST_TS + 1,
+            ),
+        ];
+        let line_attrs =
+            attributions_to_line_attributions_for_checkpoint(&attributions, content, true);
+
+        assert_eq!(
+            line_attrs,
+            vec![LineAttribution {
+                start_line: 4,
+                end_line: 4,
+                author_id: "mock_ai".into(),
+                overrode: None,
+            }]
+        );
     }
 
     #[test]

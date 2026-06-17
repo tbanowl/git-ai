@@ -191,6 +191,57 @@ fn test_checkpoint_with_prompt_sharing_disabled_strips_messages() {
 }
 
 #[test]
+fn test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite() {
+    let mut private_repo = TestRepo::new();
+    private_repo.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec!["*".to_string()]);
+    });
+
+    let readme_path = private_repo.path().join("README.md");
+    fs::write(&readme_path, "# Test Repo\n").unwrap();
+    private_repo.git(&["add", "-A"]).unwrap();
+    private_repo
+        .git(&["commit", "-m", "initial commit"])
+        .unwrap();
+
+    private_repo
+        .git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/test/private-repo.git",
+        ])
+        .unwrap();
+
+    let mut public_repo = TestRepo::new();
+    public_repo.patch_git_ai_config(|patch| {
+        patch.exclude_prompts_in_repositories = Some(vec![]);
+        patch.prompt_storage = Some("notes".to_string());
+    });
+
+    let example_path = private_repo.path().join("example.txt");
+    fs::write(&example_path, "AI Line 1\nAI Line 2\n").unwrap();
+    checkpoint_with_message(
+        &private_repo,
+        "Add private example file",
+        vec!["example.txt".to_string()],
+    );
+
+    private_repo.git(&["add", "-A"]).unwrap();
+    let commit = private_repo
+        .commit("Add private example")
+        .expect("commit should succeed");
+
+    let prompts: Vec<_> = commit.authorship_log.metadata.prompts.values().collect();
+    assert_eq!(prompts.len(), 1, "Expected exactly one prompt record");
+    assert!(
+        prompts[0].messages.is_empty(),
+        "private repo prompt messages should stay stripped even if another repo rewrites shared daemon config, but found: {:?}",
+        prompts[0].messages
+    );
+}
+
+#[test]
 fn test_multiple_checkpoints_with_messages() {
     let mut repo = TestRepo::new();
 
@@ -309,6 +360,7 @@ fn test_prompt_sharing_disabled_with_empty_transcript() {
 crate::reuse_tests_in_worktree!(
     test_checkpoint_with_prompt_sharing_enabled,
     test_checkpoint_with_prompt_sharing_disabled_strips_messages,
+    test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite,
     test_multiple_checkpoints_with_messages,
     test_prompt_sharing_disabled_with_empty_transcript,
 );

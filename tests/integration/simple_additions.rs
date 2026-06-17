@@ -3,9 +3,12 @@ use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::attribution_tracker::{Attribution, LineAttribution};
 use git_ai::authorship::authorship_log::LineRange;
 use git_ai::authorship::authorship_log_serialization::generate_short_hash;
+use git_ai::authorship::post_commit::post_commit_with_final_state;
 use git_ai::authorship::working_log::{
     AgentId, Checkpoint, CheckpointKind, CheckpointLineStats, WorkingLogEntry,
 };
+use git_ai::git::find_repository_in_path;
+use std::collections::HashMap;
 use std::fs;
 
 fn numbered_cpp_lines(count: usize, line_ending: &str) -> String {
@@ -215,6 +218,67 @@ fn test_human_insert_between_ai_lines_before_first_commit_stays_human() {
         "AI line 2".ai(),
         "AI line 3".ai(),
         "Footer".human(),
+    ]);
+}
+
+#[test]
+fn test_post_commit_snapshot_rebases_checkpoint_attribution_to_committed_content() {
+    let repo = TestRepo::new();
+    let file_rel = "async-final-state.txt";
+    let file_path = repo.path().join(file_rel);
+
+    fs::write(&file_path, "base line\n").unwrap();
+    repo.git_og(&["add", file_rel]).unwrap();
+    repo.git_og(&["commit", "-m", "base"]).unwrap();
+    let base_commit = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line to edit\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", file_rel]).unwrap();
+    repo.git_og(&["add", file_rel]).unwrap();
+    repo.git_og(&["commit", "-m", "ai commit"]).unwrap();
+    let ai_commit = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let mut final_state = HashMap::new();
+    final_state.insert(
+        file_rel.to_string(),
+        "base line\nai line unchanged\nai line to edit\n".to_string(),
+    );
+
+    fs::write(
+        &file_path,
+        "base line\nai line unchanged\nai line edited by human\nhuman line\n",
+    )
+    .unwrap();
+
+    let git_repo = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
+    post_commit_with_final_state(
+        &git_repo,
+        Some(base_commit),
+        ai_commit,
+        "Test User".to_string(),
+        true,
+        Some(&final_state),
+    )
+    .unwrap();
+
+    let mut file = repo.filename(file_rel);
+    file.assert_lines_and_blame(crate::lines![
+        "base line".human(),
+        "ai line unchanged".ai(),
+        "ai line edited by human".human(),
+        "human line".human(),
     ]);
 }
 

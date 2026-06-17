@@ -7,10 +7,10 @@
 
 use crate::repos::test_repo::TestRepo;
 use git_ai::commands::checkpoint_agent::bash_tool::{
-    Agent, BashCheckpointAction, HookEvent, StatDiffResult, StatEntry, StatFileType, StatSnapshot,
-    ToolClass, build_gitignore, classify_tool, cleanup_stale_snapshots, diff, git_index_mtime_ns,
-    git_status_fallback, handle_bash_tool, load_and_consume_snapshot, normalize_path,
-    save_snapshot, snapshot,
+    Agent, BashCheckpointAction, DaemonWatermarks, HookEvent, StatDiffResult, StatEntry,
+    StatFileType, StatSnapshot, ToolClass, build_gitignore, classify_tool, cleanup_stale_snapshots,
+    diff, git_index_mtime_ns, git_status_fallback, handle_bash_tool, load_and_consume_snapshot,
+    normalize_path, save_snapshot, snapshot,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -1028,6 +1028,34 @@ fn test_diff_result_all_changed_paths_combines_categories() {
     );
     assert!(all.iter().any(|p| p.contains("modify.txt")));
     assert!(all.iter().any(|p| p.contains("create.txt")));
+}
+
+#[test]
+fn test_snapshot_with_worktree_watermark_still_detects_new_untracked_file() {
+    let repo = TestRepo::new();
+    let root = repo_root(&repo);
+
+    add_and_commit(&repo, "tracked.txt", "tracked", "initial");
+
+    let worktree_watermark = git_index_mtime_ns(&root).expect("index mtime should exist");
+    let watermarks = DaemonWatermarks::for_test(HashMap::new(), Some(worktree_watermark));
+    let pre = snapshot(&root, "sess", "t1", Some(&watermarks)).expect("pre-snapshot should work");
+
+    write_file(&repo, "fresh-output.txt", "fresh\n");
+
+    let post = snapshot(&root, "sess", "t2", Some(&watermarks)).expect("post-snapshot should work");
+    let result = diff(&pre, &post);
+    let created: Vec<String> = result
+        .created
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    assert!(
+        created.iter().any(|path| path.contains("fresh-output.txt")),
+        "fresh untracked file should be detected despite worktree watermark; got {:?}",
+        created
+    );
 }
 
 #[test]

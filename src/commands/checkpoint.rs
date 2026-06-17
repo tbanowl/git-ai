@@ -1518,6 +1518,8 @@ fn save_current_file_states(
                     // Read from filesystem
                     std::fs::read_to_string(&abs_path).unwrap_or_default()
                 });
+                let content = crate::authorship::imara_diff_utils::normalize_line_endings(&content)
+                    .into_owned();
 
                 // Create SHA256 hash of the content
                 let mut hasher = Sha256::new();
@@ -3472,6 +3474,42 @@ mod tests {
             "Should have 0 deletions, not {} (which would mean CRLF→LF caused all old lines to appear deleted)",
             latest.line_stats.deletions
         );
+    }
+
+    #[test]
+    fn test_checkpoint_stores_lf_normalized_blob_for_crlf_working_tree() {
+        let repo = TmpRepo::new().unwrap();
+        repo.write_file("test.txt", "base\n", true).unwrap();
+        repo.commit_with_message("initial commit").unwrap();
+
+        std::fs::write(repo.path().join("test.txt"), "base\r\nai line\r\n").unwrap();
+        repo.trigger_checkpoint_with_author("test-author").unwrap();
+
+        let gitai_repo =
+            crate::git::repository::find_repository_in_path(repo.path().to_str().unwrap())
+                .expect("Repository should exist");
+        let base_commit = gitai_repo
+            .head()
+            .ok()
+            .and_then(|head| head.target().ok())
+            .unwrap_or_else(|| "initial".to_string());
+        let working_log = gitai_repo
+            .storage
+            .working_log_for_base_commit(&base_commit)
+            .unwrap();
+        let checkpoints = working_log.read_all_checkpoints().unwrap();
+        let entry = checkpoints
+            .last()
+            .and_then(|checkpoint| {
+                checkpoint
+                    .entries
+                    .iter()
+                    .find(|entry| entry.file == "test.txt")
+            })
+            .expect("test.txt checkpoint entry should exist");
+        let stored = working_log.get_file_version(&entry.blob_sha).unwrap();
+
+        assert_eq!(stored, "base\nai line\n");
     }
 
     #[test]

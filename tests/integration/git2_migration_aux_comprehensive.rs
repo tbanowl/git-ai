@@ -109,6 +109,7 @@ fn default_branch(repo: &TestRepo) -> String {
 }
 
 fn repo_rewrite_events(repo: &TestRepo) -> Vec<RewriteLogEvent> {
+    repo.sync_daemon();
     open_repo(repo)
         .storage
         .read_rewrite_events()

@@ -18,7 +18,7 @@ use crate::utils::{checkpoint_delegation_enabled, normalize_to_posix};
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -539,6 +539,33 @@ pub fn git_index_mtime_ns(repo_root: &Path) -> Option<u128> {
     Some(system_time_to_nanos(mtime))
 }
 
+fn git_index_tracked_paths(repo_root: &Path) -> HashSet<String> {
+    let Ok(git_dir) = get_git_dir(repo_root) else {
+        return HashSet::new();
+    };
+    let Ok(object_hash) =
+        crate::git::repository::repository_object_hash_kind_for_path_no_git_exec(&git_dir)
+    else {
+        return HashSet::new();
+    };
+    let index_path = git_dir.join("index");
+    let Ok(index) = gix_index::File::at(index_path, object_hash, true, Default::default()) else {
+        return HashSet::new();
+    };
+
+    let mut paths = HashSet::new();
+    for entry in index.entries() {
+        if entry.stage() != gix_index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = normalize_to_posix(&entry.path(&index).to_string());
+        if !path.trim().is_empty() {
+            paths.insert(path);
+        }
+    }
+    paths
+}
+
 /// Test whether a file is covered by the current watermarks, meaning it has
 /// not been modified since the last known-good baseline and does not need to
 /// be stored in the snapshot.
@@ -644,6 +671,11 @@ pub fn snapshot(
     };
 
     let per_file_wm: HashMap<String, u128> = wm.map(|w| w.per_file.clone()).unwrap_or_default();
+    let tracked_paths = if effective_worktree_wm.is_some() {
+        git_index_tracked_paths(repo_root)
+    } else {
+        HashSet::new()
+    };
 
     // Build the git-ai ignore ruleset: gitignore + defaults + .git-ai-ignore + linguist.
     // Arc is needed because filter_entry requires 'static, preventing a borrow.
@@ -741,7 +773,12 @@ pub fn snapshot(
                 let stat = StatEntry::from_metadata(&meta);
                 let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
+                let is_untracked_without_file_watermark = effective_worktree_wm.is_some()
+                    && !per_file_wm.contains_key(&posix_key)
+                    && !tracked_paths.contains(&posix_key);
+                if is_untracked_without_file_watermark
+                    || !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key)
+                {
                     entries.insert(normalized, stat);
                     if entries.len() > MAX_TRACKED_FILES {
                         tracing::debug!(
@@ -1049,6 +1086,13 @@ pub struct DaemonWatermarks {
     /// Timestamp of the last full (non-scoped) Human checkpoint, if any.
     /// `None` on cold start (daemon has never processed a full checkpoint).
     worktree: Option<u128>,
+}
+
+#[cfg(feature = "test-support")]
+impl DaemonWatermarks {
+    pub fn for_test(per_file: HashMap<String, u128>, worktree: Option<u128>) -> Self {
+        Self { per_file, worktree }
+    }
 }
 
 fn query_daemon_watermarks(repo_working_dir: &str) -> Option<DaemonWatermarks> {

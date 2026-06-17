@@ -17,8 +17,9 @@ use crate::git::repo_state::{
 };
 use crate::git::repository::{Repository, discover_repository_in_path_no_git_exec, exec_git};
 use crate::git::rewrite_log::{
-    CherryPickAbortEvent, CherryPickCompleteEvent, MergeSquashEvent, RebaseAbortEvent,
-    RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent, StashOperation,
+    CherryPickAbortEvent, CherryPickCompleteEvent, CherryPickStartEvent, MergeSquashEvent,
+    RebaseAbortEvent, RebaseCompleteEvent, ResetEvent, ResetKind, RewriteLogEvent, StashEvent,
+    StashOperation,
 };
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::LockFile;
@@ -2749,6 +2750,9 @@ fn rewrite_event_needs_authorship_processing(
     ) {
         return Ok(true);
     }
+    if matches!(rewrite_event, RewriteLogEvent::CherryPickStart { .. }) {
+        return Ok(false);
+    }
 
     let Some((base_commit, _)) = commit_replay_context_from_rewrite_event(rewrite_event) else {
         return Ok(true);
@@ -3125,7 +3129,26 @@ fn resolve_cherry_pick_source_refs(
     let mut resolved = Vec::new();
     let repo = find_repository_in_path(worktree.to_string_lossy().as_ref())?;
     for src in source_refs {
-        if is_valid_oid(src) && !is_zero_oid(src) {
+        if src.contains("..") {
+            let mut args = repo.global_args_for_exec();
+            args.push("rev-list".to_string());
+            args.push("--reverse".to_string());
+            args.push(src.clone());
+            let output = exec_git(&args).map_err(|err| {
+                GitAiError::Generic(format!(
+                    "{} failed to expand cherry-pick source range '{}': {}",
+                    context, src, err
+                ))
+            })?;
+            let stdout = String::from_utf8(output.stdout).map_err(GitAiError::from)?;
+            resolved.extend(
+                stdout
+                    .lines()
+                    .map(str::trim)
+                    .filter(|oid| is_valid_oid(oid) && !is_zero_oid(oid))
+                    .map(ToString::to_string),
+            );
+        } else if is_valid_oid(src) && !is_zero_oid(src) {
             resolved.push(src.clone());
         } else {
             let obj = repo.revparse_single(src).map_err(|err| {
@@ -6461,6 +6484,12 @@ impl ActorDaemonCoordinator {
                             "cherry-pick complete original head mismatch"
                         );
                     }
+                    out.push(RewriteLogEvent::cherry_pick_start(
+                        CherryPickStartEvent::new(
+                            resolved_original_head.clone(),
+                            source_commits.clone(),
+                        ),
+                    ));
                     out.push(RewriteLogEvent::cherry_pick_complete(
                         CherryPickCompleteEvent::new(
                             resolved_original_head,

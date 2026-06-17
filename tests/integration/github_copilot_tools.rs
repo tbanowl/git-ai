@@ -155,9 +155,10 @@ fn test_run_in_terminal_bash_checkpoint() {
     ])
     .unwrap();
 
-    // Simulate the command creating/modifying a file (like creating output.txt)
-    let mut output = repo.filename("output.txt");
-    output.set_contents(crate::lines!["Hello, World!"]);
+    // Simulate the command creating/modifying a file. Use raw I/O here because
+    // the TestFile helper creates its own mock checkpoints, while this test is
+    // specifically validating the bash snapshot checkpoint flow.
+    std::fs::write(repo.path().join("output.txt"), "Hello, World!\n").unwrap();
 
     // PostToolUse hook
     let post_hook_input = json!({
@@ -192,6 +193,7 @@ fn test_run_in_terminal_bash_checkpoint() {
         .unwrap();
 
     // File created by bash command should be attributed to AI
+    let mut output = repo.filename("output.txt");
     output.assert_lines_and_blame(crate::lines!["Hello, World!".ai()]);
 }
 

@@ -371,14 +371,19 @@ impl PersistedWorkingLog {
         if let Some(ref dirty_files) = self.dirty_files
             && let Some(content) = dirty_files.get(&file_path.to_string())
         {
-            return Ok(content.clone());
+            return Ok(
+                crate::authorship::imara_diff_utils::normalize_line_endings(content).into_owned(),
+            );
         }
 
         let file_path = self.to_repo_absolute_path(file_path);
 
         // Fall back to reading from filesystem
         match fs::read(&file_path) {
-            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+            Ok(bytes) => Ok(crate::authorship::imara_diff_utils::normalize_line_endings(
+                &String::from_utf8_lossy(&bytes),
+            )
+            .into_owned()),
             Err(_) => Ok(String::new()),
         }
     }

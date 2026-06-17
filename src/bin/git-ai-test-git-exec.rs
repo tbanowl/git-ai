@@ -48,9 +48,14 @@ fn from_error(err: GitAiError) -> ExecResult {
 fn main() {
     let op = env::args().nth(1).expect("expected operation arg");
     let args = repo_git_dir_args();
+    let timeout = env::var("GIT_AI_TEST_GIT_EXEC_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(100));
 
     let result = match op.as_str() {
-        "timeout" => match exec_git_with_timeout(&args, Duration::from_millis(100)) {
+        "timeout" => match exec_git_with_timeout(&args, timeout) {
             Ok(output) => ExecResult {
                 ok: true,
                 code: output.status.code(),

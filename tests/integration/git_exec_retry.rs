@@ -161,6 +161,7 @@ fn test_exec_git_timeout_kills_and_reaps_hung_shim_process() {
                 "GIT_AI_TEST_GIT_SHIM_PID_FILE",
                 pid_file.display().to_string(),
             ),
+            ("GIT_AI_TEST_GIT_EXEC_TIMEOUT_MS", "1000".to_string()),
             ("GIT_AI_TEST_GIT_SHIM_SLEEP_MS", "5000".to_string()),
         ],
     );
