@@ -167,10 +167,8 @@ pub fn pull_post_command_hook(
         // already wrote a speculative RebaseStart; cancel it first, then write
         // a new one carrying the resolved onto_head so `git rebase --continue`
         // has full info.
-        let rebase_dir = repository.path().join("rebase-merge");
-        let rebase_apply_dir = repository.path().join("rebase-apply");
         if config.is_rebase
-            && (rebase_dir.exists() || rebase_apply_dir.exists())
+            && crate::git::pending_rebase_pick::rebase_in_progress(repository.path())
             && let Some(original_head) = &repository.pre_command_base_commit
         {
             // Cancel the speculative RebaseStart so we don't end up with two
@@ -186,14 +184,16 @@ pub fn pull_post_command_hook(
                 crate::git::rewrite_log::RebaseStartEvent::new_with_onto(
                     original_head.clone(),
                     false,
-                    onto_head,
+                    onto_head.clone(),
                 ),
             );
             let _ = repository.storage.append_rewrite_event(start_event);
+            create_pending_rebase_pick_for_paused_pull(repository, original_head, onto_head);
         } else if config.is_rebase {
             // Pull --rebase failed but no conflict dir exists (e.g. network
             // error). Cancel the speculative RebaseStart from the pre-hook.
             cancel_speculative_rebase_start(repository);
+            let _ = repository.storage.mark_pending_rebase_pick_aborted();
         }
         return;
     }
@@ -450,4 +450,32 @@ fn resolve_pull_rebase_onto_head(repository: &Repository) -> Option<String> {
         .and_then(|obj| obj.peel_to_commit())
         .map(|commit| commit.id())
         .ok()
+}
+
+fn create_pending_rebase_pick_for_paused_pull(
+    repository: &Repository,
+    original_head: &str,
+    onto_head: Option<String>,
+) {
+    let Some(source_commit) =
+        crate::git::pending_rebase_pick::stopped_rebase_source_commit(repository.path())
+    else {
+        tracing::debug!("pull rebase paused but no stopped source commit found");
+        return;
+    };
+    let Some(expected_parent) = repository.head().ok().and_then(|head| head.target().ok()) else {
+        tracing::debug!("pull rebase paused but HEAD could not be resolved");
+        return;
+    };
+
+    let pick = crate::git::pending_rebase_pick::pending_rebase_pick(
+        source_commit,
+        expected_parent,
+        original_head.to_string(),
+        onto_head,
+        "pull_rebase_conflict",
+    );
+    if let Err(error) = repository.storage.write_pending_rebase_pick(&pick) {
+        tracing::debug!("failed to write pending rebase pick: {}", error);
+    }
 }

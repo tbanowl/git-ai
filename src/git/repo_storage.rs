@@ -30,6 +30,7 @@ pub struct RepoStorage {
     pub repo_workdir: PathBuf,
     pub working_logs: PathBuf,
     pub rewrite_log: PathBuf,
+    pub pending_rebase_pick: PathBuf,
     pub logs: PathBuf,
 }
 
@@ -48,6 +49,7 @@ impl RepoStorage {
     fn for_ai_dir(ai_dir: &Path, repo_workdir: &Path) -> Result<RepoStorage, GitAiError> {
         let working_logs_dir = ai_dir.join("working_logs");
         let rewrite_log_file = ai_dir.join("rewrite_log");
+        let pending_rebase_pick_file = ai_dir.join("pending_rebase_pick.json");
         let logs_dir = ai_dir.join("logs");
 
         let config = RepoStorage {
@@ -55,6 +57,7 @@ impl RepoStorage {
             repo_workdir: repo_workdir.to_path_buf(),
             working_logs: working_logs_dir,
             rewrite_log: rewrite_log_file,
+            pending_rebase_pick: pending_rebase_pick_file,
             logs: logs_dir,
         };
 
@@ -210,6 +213,35 @@ impl RepoStorage {
 
         let content = fs::read_to_string(&self.rewrite_log)?;
         crate::git::rewrite_log::deserialize_events_from_jsonl(&content)
+    }
+
+    /* Pending Rebase Pick Persistence */
+
+    pub fn write_pending_rebase_pick(
+        &self,
+        pick: &crate::git::pending_rebase_pick::PendingRebasePick,
+    ) -> Result<(), GitAiError> {
+        crate::git::pending_rebase_pick::write_pending_rebase_pick(&self.pending_rebase_pick, pick)
+    }
+
+    pub fn take_pending_rebase_pick_for_commit(
+        &self,
+        pre_head: &str,
+        new_commit: &str,
+    ) -> Result<Option<crate::git::pending_rebase_pick::PendingRebasePick>, GitAiError> {
+        crate::git::pending_rebase_pick::take_pending_rebase_pick_for_commit(
+            &self.pending_rebase_pick,
+            pre_head,
+            new_commit,
+        )
+    }
+
+    pub fn mark_pending_rebase_pick_aborted(&self) -> Result<(), GitAiError> {
+        crate::git::pending_rebase_pick::mark_pending_rebase_pick_aborted(&self.pending_rebase_pick)
+    }
+
+    pub fn mark_pending_rebase_pick_skipped(&self) -> Result<(), GitAiError> {
+        crate::git::pending_rebase_pick::mark_pending_rebase_pick_skipped(&self.pending_rebase_pick)
     }
 }
 

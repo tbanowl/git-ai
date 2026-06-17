@@ -35,6 +35,12 @@ pub fn pre_rebase_hook(
         is_continuing
     );
 
+    if parsed_args.has_command_flag("--abort") {
+        let _ = repository.storage.mark_pending_rebase_pick_aborted();
+    } else if parsed_args.has_command_flag("--skip") {
+        let _ = repository.storage.mark_pending_rebase_pick_skipped();
+    }
+
     if !is_continuing {
         // Starting a new rebase - capture original HEAD and log Start event
         if let Ok(head) = repository.head() {
@@ -107,6 +113,7 @@ pub fn handle_rebase_post_command(
         tracing::debug!(
             "⏸ Rebase still in progress, waiting for completion (conflict or multi-step)"
         );
+        create_pending_rebase_pick_for_paused_rebase(repository, context);
         return;
     }
 
@@ -167,6 +174,43 @@ pub fn handle_rebase_post_command(
         );
     } else {
         tracing::debug!("⚠ Rebase completed but couldn't determine original head");
+    }
+}
+
+fn create_pending_rebase_pick_for_paused_rebase(
+    repository: &Repository,
+    context: &CommandHooksContext,
+) {
+    let Some(original_head) = context
+        .rebase_original_head
+        .clone()
+        .or_else(|| find_rebase_start_event(repository).map(|event| event.original_head))
+    else {
+        tracing::debug!("rebase paused but original head could not be resolved");
+        return;
+    };
+
+    let Some(source_commit) =
+        crate::git::pending_rebase_pick::stopped_rebase_source_commit(repository.path())
+    else {
+        tracing::debug!("rebase paused but no stopped source commit found");
+        return;
+    };
+
+    let Some(expected_parent) = repository.head().ok().and_then(|head| head.target().ok()) else {
+        tracing::debug!("rebase paused but HEAD could not be resolved");
+        return;
+    };
+
+    let pick = crate::git::pending_rebase_pick::pending_rebase_pick(
+        source_commit,
+        expected_parent,
+        original_head,
+        context.rebase_onto.clone(),
+        "rebase_conflict",
+    );
+    if let Err(error) = repository.storage.write_pending_rebase_pick(&pick) {
+        tracing::debug!("failed to write pending rebase pick: {}", error);
     }
 }
 

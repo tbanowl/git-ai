@@ -235,6 +235,59 @@ pub struct AuthorshipNotesPushResponse {
     pub data: AuthorshipNotesPushData,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesRewriteMapping {
+    pub source_commit: String,
+    pub target_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_note_blob_oid: Option<String>,
+    pub target_note_blob_oid: String,
+    pub target_content: String,
+    pub commit_time: i64,
+    pub author_name: String,
+    pub author_email: String,
+    pub disposition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesRewriteRequest {
+    pub repo_url: String,
+    pub rewrite_id: String,
+    pub operation: String,
+    pub branch: String,
+    pub original_head: String,
+    pub new_head: String,
+    pub mappings: Vec<AuthorshipNotesRewriteMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesRewriteConflict {
+    pub source_commit: String,
+    pub target_commit: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesRewriteData {
+    pub created: usize,
+    pub updated: usize,
+    pub superseded: usize,
+    #[serde(default)]
+    pub unchanged: usize,
+    #[serde(default)]
+    pub conflicts: Vec<AuthorshipNotesRewriteConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorshipNotesRewriteResponse {
+    pub ok: bool,
+    pub data: AuthorshipNotesRewriteData,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +307,35 @@ mod tests {
         assert_eq!(api_record.annotations.len(), 0);
         assert_eq!(api_record.diff, "");
         assert_eq!(api_record.base_content, "");
+    }
+
+    #[test]
+    fn authorship_notes_rewrite_request_serializes_expected_shape() {
+        let request = AuthorshipNotesRewriteRequest {
+            repo_url: "https://github.com/org/repo".to_string(),
+            rewrite_id: "rewrite-1".to_string(),
+            operation: "rebase_conflict_manual_commit".to_string(),
+            branch: "main".to_string(),
+            original_head: "b".repeat(40),
+            new_head: "d".repeat(40),
+            mappings: vec![AuthorshipNotesRewriteMapping {
+                source_commit: "b".repeat(40),
+                target_commit: "d".repeat(40),
+                source_note_blob_oid: Some("old-note".to_string()),
+                target_note_blob_oid: "new-note".to_string(),
+                target_content: "{}".to_string(),
+                commit_time: 1710000000,
+                author_name: "User".to_string(),
+                author_email: "user@example.com".to_string(),
+                disposition: "supersede_source".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["repo_url"], "https://github.com/org/repo");
+        assert_eq!(value["rewrite_id"], "rewrite-1");
+        assert_eq!(value["mappings"][0]["disposition"], "supersede_source");
+        assert_eq!(value["mappings"][0]["source_note_blob_oid"], "old-note");
     }
 
     #[test]

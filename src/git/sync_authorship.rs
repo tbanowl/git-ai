@@ -716,7 +716,7 @@ fn resolve_remote_name_or_url(
         })
 }
 
-fn normalized_rest_repo_url(
+pub(crate) fn normalized_rest_repo_url(
     repository: &Repository,
     remote_name: &str,
 ) -> Result<String, GitAiError> {
@@ -1124,6 +1124,111 @@ fn rest_push_notes(
     api.authorship_notes_push(&crate::api::types::AuthorshipNotesPushRequest {
         repo_url: repo_url.to_string(),
         notes,
+    })?;
+
+    Ok(())
+}
+
+pub fn rest_rewrite_authorship_notes(
+    repository: &Repository,
+    repo_url: &str,
+    operation: &str,
+    original_head: &str,
+    new_head: &str,
+    mappings: &[(String, String)],
+) -> Result<(), GitAiError> {
+    if Config::fresh().notes_store() != "rest" || mappings.is_empty() {
+        return Ok(());
+    }
+
+    let api = ApiClient::new(ApiContext::new(None));
+    let branch = get_current_branch(repository).unwrap_or_else(|_| "main".to_string());
+    let target_commits: Vec<String> = mappings.iter().map(|(_, target)| target.clone()).collect();
+    let commit_authorships = get_commits_with_notes_from_list(repository, &target_commits)?;
+
+    let mut commit_author_map: HashMap<String, (String, i64)> = HashMap::new();
+    for authorship in commit_authorships {
+        match authorship {
+            CommitAuthorship::NoLog {
+                sha,
+                git_author,
+                commit_time,
+            }
+            | CommitAuthorship::Log {
+                sha,
+                git_author,
+                commit_time,
+                ..
+            } => {
+                commit_author_map.insert(sha, (git_author, commit_time));
+            }
+        }
+    }
+
+    let source_blob_oids = note_blob_oids_for_commits(
+        repository,
+        &mappings
+            .iter()
+            .map(|(source, _)| source.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let target_blob_oids = note_blob_oids_for_commits(repository, &target_commits)?;
+
+    let mut rewrite_mappings = Vec::new();
+    for (source, target) in mappings {
+        let Some(target_content) = show_authorship_note(repository, target) else {
+            continue;
+        };
+        let Some(target_note_blob_oid) = target_blob_oids.get(target).cloned() else {
+            continue;
+        };
+        let (git_author, commit_time) = commit_author_map
+            .get(target)
+            .cloned()
+            .unwrap_or_else(|| ("Unknown <unknown@example.com>".to_string(), 0));
+        let (author_name, author_email) = parse_author_identity(&git_author);
+
+        rewrite_mappings.push(crate::api::types::AuthorshipNotesRewriteMapping {
+            source_commit: source.clone(),
+            target_commit: target.clone(),
+            source_note_blob_oid: source_blob_oids.get(source).cloned(),
+            target_note_blob_oid,
+            target_content,
+            commit_time,
+            author_name,
+            author_email,
+            disposition: "supersede_source".to_string(),
+        });
+    }
+
+    if rewrite_mappings.is_empty() {
+        return Ok(());
+    }
+
+    let rewrite_id = sha256_note_content(&format!(
+        "{}:{}:{}:{}:{}",
+        repo_url,
+        operation,
+        original_head,
+        new_head,
+        rewrite_mappings
+            .iter()
+            .map(|mapping| format!(
+                "{}>{}:{}",
+                mapping.source_commit, mapping.target_commit, mapping.target_note_blob_oid
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+
+    api.authorship_notes_rewrite(&crate::api::types::AuthorshipNotesRewriteRequest {
+        repo_url: repo_url.to_string(),
+        rewrite_id,
+        operation: operation.to_string(),
+        branch,
+        original_head: original_head.to_string(),
+        new_head: new_head.to_string(),
+        mappings: rewrite_mappings,
     })?;
 
     Ok(())

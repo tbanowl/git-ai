@@ -206,6 +206,29 @@ pub fn rewrite_authorship_if_needed(
                 &commit_author,
             )?;
 
+            if rebase_complete.original_commits.len() == rebase_complete.new_commits.len()
+                && let Ok(Some(remote)) = repo.upstream_remote()
+                && let Ok(repo_url) =
+                    crate::git::sync_authorship::normalized_rest_repo_url(repo, &remote)
+            {
+                let mappings: Vec<(String, String)> = rebase_complete
+                    .original_commits
+                    .iter()
+                    .cloned()
+                    .zip(rebase_complete.new_commits.iter().cloned())
+                    .collect();
+                if let Err(error) = crate::git::sync_authorship::rest_rewrite_authorship_notes(
+                    repo,
+                    &repo_url,
+                    "rebase_complete",
+                    &rebase_complete.original_head,
+                    &rebase_complete.new_head,
+                    &mappings,
+                ) {
+                    tracing::debug!("REST authorship notes rewrite failed: {}", error);
+                }
+            }
+
             migrate_working_log_after_rebase(
                 repo,
                 &rebase_complete.original_head,
@@ -232,6 +255,29 @@ pub fn rewrite_authorship_if_needed(
                 &cherry_pick_complete.new_commits,
                 &commit_author,
             )?;
+
+            if cherry_pick_complete.source_commits.len() == cherry_pick_complete.new_commits.len()
+                && let Ok(Some(remote)) = repo.upstream_remote()
+                && let Ok(repo_url) =
+                    crate::git::sync_authorship::normalized_rest_repo_url(repo, &remote)
+            {
+                let mappings: Vec<(String, String)> = cherry_pick_complete
+                    .source_commits
+                    .iter()
+                    .cloned()
+                    .zip(cherry_pick_complete.new_commits.iter().cloned())
+                    .collect();
+                if let Err(error) = crate::git::sync_authorship::rest_rewrite_authorship_notes(
+                    repo,
+                    &repo_url,
+                    "cherry_pick_complete",
+                    &cherry_pick_complete.original_head,
+                    &cherry_pick_complete.new_head,
+                    &mappings,
+                ) {
+                    tracing::debug!("REST authorship notes rewrite failed: {}", error);
+                }
+            }
 
             tracing::debug!(
                 "✓ Rewrote authorship for {} cherry-picked commits",

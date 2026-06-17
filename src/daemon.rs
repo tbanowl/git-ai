@@ -6261,7 +6261,45 @@ impl ActorDaemonCoordinator {
                     if let Some(merge_squash) = implicit_merge_squash.take() {
                         out.push(RewriteLogEvent::merge_squash(merge_squash));
                     }
-                    out.push(RewriteLogEvent::commit(base.clone(), new_head.clone()));
+                    let maybe_pending_event =
+                        if let (Some(worktree), Some(pre_head)) = (cmd.worktree.as_deref(), base) {
+                            crate::git::repository::find_repository_in_path(
+                                worktree.to_string_lossy().as_ref(),
+                            )
+                            .ok()
+                            .and_then(|repo| {
+                                let first_parent_matches = repo
+                                    .find_commit(new_head.clone())
+                                    .and_then(|commit| commit.parent(0))
+                                    .map(|parent| parent.id() == *pre_head)
+                                    .unwrap_or(false);
+                                if !first_parent_matches {
+                                    return None;
+                                }
+                                repo.storage
+                                    .take_pending_rebase_pick_for_commit(pre_head, new_head)
+                                    .ok()
+                                    .flatten()
+                                    .map(|pending| {
+                                        RewriteLogEvent::cherry_pick_complete(
+                                            crate::git::rewrite_log::CherryPickCompleteEvent::new(
+                                                pre_head.clone(),
+                                                new_head.clone(),
+                                                vec![pending.source_commit],
+                                                vec![new_head.clone()],
+                                            ),
+                                        )
+                                    })
+                            })
+                        } else {
+                            None
+                        };
+
+                    if let Some(event) = maybe_pending_event {
+                        out.push(event);
+                    } else {
+                        out.push(RewriteLogEvent::commit(base.clone(), new_head.clone()));
+                    }
                 }
                 crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head } => {
                     if old_head.is_empty()
@@ -6703,6 +6741,65 @@ impl ActorDaemonCoordinator {
         Ok(out)
     }
 
+    fn create_pending_rebase_pick_for_paused_command(
+        cmd: &crate::daemon::domain::NormalizedCommand,
+        operation: &str,
+    ) -> Result<(), GitAiError> {
+        let Some(worktree) = cmd.worktree.as_ref() else {
+            return Ok(());
+        };
+        let repository = find_repository_in_path(&worktree.to_string_lossy())?;
+        if !crate::git::pending_rebase_pick::rebase_in_progress(repository.path()) {
+            return Ok(());
+        }
+        let Some(source_commit) =
+            crate::git::pending_rebase_pick::stopped_rebase_source_commit(repository.path())
+        else {
+            tracing::debug!(
+                sid = %cmd.root_sid,
+                operation,
+                "rebase paused but no stopped source commit found for pending pick"
+            );
+            return Ok(());
+        };
+        let Some(expected_parent) = repository.head().ok().and_then(|head| head.target().ok())
+        else {
+            tracing::debug!(
+                sid = %cmd.root_sid,
+                operation,
+                "rebase paused but HEAD could not be resolved for pending pick"
+            );
+            return Ok(());
+        };
+        let Some(original_head) = strict_rebase_original_head_from_command(cmd, "").or_else(|| {
+            cmd.inflight_rebase_original_head
+                .as_ref()
+                .filter(|head| is_valid_oid(head) && !is_zero_oid(head))
+                .cloned()
+        }) else {
+            tracing::debug!(
+                sid = %cmd.root_sid,
+                operation,
+                "rebase paused but original head could not be resolved for pending pick"
+            );
+            return Ok(());
+        };
+        let onto_head = repository
+            .revparse_single("@{upstream}")
+            .and_then(|obj| obj.peel_to_commit())
+            .map(|commit| commit.id())
+            .ok();
+
+        let pick = crate::git::pending_rebase_pick::pending_rebase_pick(
+            source_commit,
+            expected_parent,
+            original_head,
+            onto_head,
+            operation,
+        );
+        repository.storage.write_pending_rebase_pick(&pick)
+    }
+
     async fn maybe_apply_side_effects_for_applied_command(
         &self,
         family: Option<&str>,
@@ -6875,6 +6972,13 @@ impl ActorDaemonCoordinator {
                 })?;
                 if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
                     self.clear_pending_rebase_original_head_for_worktree(worktree)?;
+                    if let Ok(repository) = find_repository_in_path(&worktree.to_string_lossy()) {
+                        let _ = repository.storage.mark_pending_rebase_pick_aborted();
+                    }
+                } else if cmd.invoked_args.iter().any(|arg| arg == "--skip") {
+                    if let Ok(repository) = find_repository_in_path(&worktree.to_string_lossy()) {
+                        let _ = repository.storage.mark_pending_rebase_pick_skipped();
+                    }
                 } else if cmd.exit_code != 0 && !rebase_is_control_mode(cmd) {
                     let pending_old_head = strict_rebase_original_head_from_command(cmd, "");
                     if let Some(old_head) = pending_old_head {
@@ -6891,7 +6995,14 @@ impl ActorDaemonCoordinator {
                         }
                         self.set_pending_rebase_original_head_for_worktree(worktree, old_head)?;
                     }
+                    Self::create_pending_rebase_pick_for_paused_command(cmd, "rebase_conflict")?;
                 }
+            }
+            if matches!(cmd.primary_command.as_deref(), Some("pull"))
+                && pull_uses_rebase
+                && cmd.exit_code != 0
+            {
+                Self::create_pending_rebase_pick_for_paused_command(cmd, "pull_rebase_conflict")?;
             }
             if cmd.primary_command.as_deref() == Some("cherry-pick") {
                 let worktree = cmd.worktree.as_ref().ok_or_else(|| {
@@ -6943,6 +7054,20 @@ impl ActorDaemonCoordinator {
                     sid = %cmd.root_sid,
                     "stash restore with non-zero exit, continuing to restore attribution"
                 );
+            }
+        }
+
+        if cmd.primary_command.as_deref() == Some("rebase")
+            && let Some(worktree) = cmd.worktree.as_ref()
+        {
+            if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
+                if let Ok(repository) = find_repository_in_path(&worktree.to_string_lossy()) {
+                    let _ = repository.storage.mark_pending_rebase_pick_aborted();
+                }
+            } else if cmd.invoked_args.iter().any(|arg| arg == "--skip")
+                && let Ok(repository) = find_repository_in_path(&worktree.to_string_lossy())
+            {
+                let _ = repository.storage.mark_pending_rebase_pick_skipped();
             }
         }
 

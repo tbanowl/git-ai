@@ -2,7 +2,7 @@ use crate::api::client::ApiClient;
 use crate::api::types::{
     ApiErrorResponse, AuthorshipBatchResponse, AuthorshipNotesBatchRequest,
     AuthorshipNotesListRequest, AuthorshipNotesListResponse, AuthorshipNotesPushRequest,
-    AuthorshipNotesPushResponse,
+    AuthorshipNotesPushResponse, AuthorshipNotesRewriteRequest, AuthorshipNotesRewriteResponse,
 };
 use crate::error::GitAiError;
 
@@ -98,6 +98,36 @@ impl ApiClient {
         if !parsed.ok {
             return Err(GitAiError::Generic(
                 "Notes push returned ok=false".to_string(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    pub fn authorship_notes_rewrite(
+        &self,
+        request: &AuthorshipNotesRewriteRequest,
+    ) -> Result<AuthorshipNotesRewriteResponse, GitAiError> {
+        let response = self
+            .context()
+            .post_json("/worker/authorship_notes/rewrite", request)?;
+        let status_code = response.status_code;
+        let body = response
+            .as_str()
+            .map_err(|e| GitAiError::Generic(format!("Failed to read response body: {}", e)))?;
+
+        if status_code != 200 {
+            let message = parse_api_error_message(body, "Notes rewrite request failed");
+            return Err(GitAiError::Generic(format!(
+                "Notes rewrite failed with status {}: {}",
+                status_code, message
+            )));
+        }
+
+        let parsed: AuthorshipNotesRewriteResponse =
+            serde_json::from_str(body).map_err(GitAiError::JsonError)?;
+        if !parsed.ok {
+            return Err(GitAiError::Generic(
+                "Notes rewrite returned ok=false".to_string(),
             ));
         }
         Ok(parsed)

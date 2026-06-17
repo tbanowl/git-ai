@@ -391,6 +391,142 @@ fn push_response(created: usize, updated: usize) -> Value {
     })
 }
 
+fn rewrite_request(rewrite_id: &str) -> git_ai::api::types::AuthorshipNotesRewriteRequest {
+    git_ai::api::types::AuthorshipNotesRewriteRequest {
+        repo_url: "https://github.com/org/repo".to_string(),
+        rewrite_id: rewrite_id.to_string(),
+        operation: "rebase_conflict_manual_commit".to_string(),
+        branch: "main".to_string(),
+        original_head: "b".repeat(40),
+        new_head: "d".repeat(40),
+        mappings: vec![git_ai::api::types::AuthorshipNotesRewriteMapping {
+            source_commit: "b".repeat(40),
+            target_commit: "d".repeat(40),
+            source_note_blob_oid: Some("old-note".to_string()),
+            target_note_blob_oid: "new-note".to_string(),
+            target_content: "{}".to_string(),
+            commit_time: 1710000000,
+            author_name: "User".to_string(),
+            author_email: "user@example.com".to_string(),
+            disposition: "supersede_source".to_string(),
+        }],
+    }
+}
+
+#[test]
+fn rest_notes_rewrite_posts_supersede_mapping() {
+    let server = RestNotesMockServer::start(vec![json!({
+        "ok": true,
+        "data": {
+            "created": 1,
+            "updated": 0,
+            "superseded": 1,
+            "unchanged": 0,
+            "conflicts": []
+        }
+    })]);
+
+    let api = git_ai::api::client::ApiClient::new(git_ai::api::client::ApiContext::new(Some(
+        server.base_url().to_string(),
+    )));
+    let response = api
+        .authorship_notes_rewrite(&rewrite_request("rewrite-1"))
+        .unwrap();
+    assert_eq!(response.data.created, 1);
+    assert_eq!(response.data.superseded, 1);
+
+    let recorded = server.recv_request();
+    assert_eq!(recorded.path, "/worker/authorship_notes/rewrite");
+    assert_eq!(recorded.body["rewrite_id"], "rewrite-1");
+    assert_eq!(
+        recorded.body["mappings"][0]["source_commit"],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    assert_eq!(
+        recorded.body["mappings"][0]["target_commit"],
+        "dddddddddddddddddddddddddddddddddddddddd"
+    );
+    assert_eq!(
+        recorded.body["mappings"][0]["disposition"],
+        "supersede_source"
+    );
+}
+
+#[test]
+fn rest_notes_rewrite_preserves_idempotent_rewrite_id() {
+    let server = RestNotesMockServer::start(vec![
+        json!({
+            "ok": true,
+            "data": {
+                "created": 1,
+                "updated": 0,
+                "superseded": 1,
+                "unchanged": 0,
+                "conflicts": []
+            }
+        }),
+        json!({
+            "ok": true,
+            "data": {
+                "created": 0,
+                "updated": 0,
+                "superseded": 0,
+                "unchanged": 1,
+                "conflicts": []
+            }
+        }),
+    ]);
+
+    let api = git_ai::api::client::ApiClient::new(git_ai::api::client::ApiContext::new(Some(
+        server.base_url().to_string(),
+    )));
+    api.authorship_notes_rewrite(&rewrite_request("rewrite-stable"))
+        .unwrap();
+    api.authorship_notes_rewrite(&rewrite_request("rewrite-stable"))
+        .unwrap();
+
+    let first = server.recv_request();
+    let second = server.recv_request();
+    assert_eq!(first.path, "/worker/authorship_notes/rewrite");
+    assert_eq!(second.path, "/worker/authorship_notes/rewrite");
+    assert_eq!(first.body["rewrite_id"], "rewrite-stable");
+    assert_eq!(second.body["rewrite_id"], "rewrite-stable");
+}
+
+#[test]
+fn rest_notes_rewrite_parses_conflict_response() {
+    let server = RestNotesMockServer::start(vec![json!({
+        "ok": true,
+        "data": {
+            "created": 0,
+            "updated": 0,
+            "superseded": 0,
+            "unchanged": 0,
+            "conflicts": [{
+                "source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "target_commit": "dddddddddddddddddddddddddddddddddddddddd",
+                "reason": "target_changed",
+                "remote_content_hash": "remote",
+                "local_content_hash": "local"
+            }]
+        }
+    })]);
+
+    let api = git_ai::api::client::ApiClient::new(git_ai::api::client::ApiContext::new(Some(
+        server.base_url().to_string(),
+    )));
+    let response = api
+        .authorship_notes_rewrite(&rewrite_request("rewrite-conflict"))
+        .unwrap();
+
+    assert_eq!(response.data.conflicts.len(), 1);
+    assert_eq!(response.data.conflicts[0].reason, "target_changed");
+    assert_eq!(
+        response.data.conflicts[0].remote_content_hash.as_deref(),
+        Some("remote")
+    );
+}
+
 #[test]
 #[serial]
 fn rest_fetch_multi_page_advances_watermark_to_final_page() {

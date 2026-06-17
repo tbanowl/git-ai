@@ -68,6 +68,35 @@ pub fn commit_post_command_hook(
     }
 
     let commit_author = get_commit_default_author(repository, &parsed_args.command_args);
+
+    if !parsed_args.has_command_flag("--amend")
+        && let (Some(orig), Some(sha)) = (original_commit.clone(), new_sha.clone())
+        && first_parent_is(repository, &sha, &orig)
+    {
+        match repository
+            .storage
+            .take_pending_rebase_pick_for_commit(&orig, &sha)
+        {
+            Ok(Some(pending)) => {
+                let event = RewriteLogEvent::cherry_pick_complete(
+                    crate::git::rewrite_log::CherryPickCompleteEvent::new(
+                        orig,
+                        sha.clone(),
+                        vec![pending.source_commit],
+                        vec![sha],
+                    ),
+                );
+                repository.handle_rewrite_log_event(event, commit_author, supress_output, true);
+                crate::observability::spawn_background_flush();
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("failed to consume pending rebase pick: {}", error);
+            }
+        }
+    }
+
     if parsed_args.has_command_flag("--amend") {
         if let (Some(orig), Some(sha)) = (original_commit.clone(), new_sha.clone()) {
             repository.handle_rewrite_log_event(
@@ -95,6 +124,14 @@ pub fn commit_post_command_hook(
 
     // Flush logs and metrics after commit
     crate::observability::spawn_background_flush();
+}
+
+fn first_parent_is(repository: &Repository, commit_sha: &str, expected_parent: &str) -> bool {
+    repository
+        .find_commit(commit_sha.to_string())
+        .and_then(|commit| commit.parent(0))
+        .map(|parent| parent.id() == expected_parent)
+        .unwrap_or(false)
 }
 
 pub fn get_commit_default_author(repo: &Repository, args: &[String]) -> String {

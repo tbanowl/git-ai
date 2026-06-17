@@ -721,6 +721,304 @@ fn test_pull_rebase_with_conflict_preserves_ai_notes() {
     );
 }
 
+#[test]
+fn test_pull_rebase_conflict_after_failed_push_commit_preserves_ai_notes() {
+    let setup = setup_conflict_pull_test();
+    let local = setup.local;
+    let upstream = setup.upstream;
+
+    // Simulate the production side effect where Session B's authorship note
+    // has already been uploaded even though the subsequent code push fails.
+    local
+        .git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .expect("push authorship notes should succeed");
+    assert!(
+        local
+            .read_authorship_note_in_git_dir(upstream.path(), &setup.session_b_ai_commit_sha)
+            .is_some(),
+        "upstream should have Session B's authorship note before the failed code push"
+    );
+
+    // The first local code push fails because upstream already contains Session A.
+    let failed_push = local.git(&["push"]);
+    assert!(
+        failed_push.is_err(),
+        "push should fail because upstream has diverged"
+    );
+
+    local
+        .git(&["config", "pull.rebase", "true"])
+        .expect("set pull.rebase should succeed");
+
+    let pull_result = local.git(&["pull"]);
+    assert!(
+        pull_result.is_err(),
+        "pull --rebase should fail due to conflict on README.md"
+    );
+
+    use std::fs;
+    fs::write(
+        local.path().join("README.md"),
+        "# Project\nSession A: AI-enhanced line 1\nSession A: AI-enhanced line 2\nSession B: AI-generated line 1\nSession B: AI-generated line 2\n",
+    )
+    .expect("writing resolved file should succeed");
+
+    local
+        .git(&["add", "README.md"])
+        .expect("staging resolved file should succeed");
+
+    // Some clients commit the staged conflict resolution directly instead of
+    // invoking `git rebase --continue`. That creates D on top of C while B drops
+    // out of first-parent history, so git-ai must still remap B's note to D.
+    local
+        .git(&["commit", "-m", "Session B: AI feature"])
+        .expect("manual conflict-resolution commit should succeed");
+
+    let new_head = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+
+    assert_ne!(
+        new_head, setup.session_b_ai_commit_sha,
+        "manual conflict-resolution commit should have a new SHA"
+    );
+    assert!(
+        local
+            .git(&[
+                "merge-base",
+                "--is-ancestor",
+                &setup.session_b_ai_commit_sha,
+                "HEAD"
+            ])
+            .is_err(),
+        "old Session B commit should not be reachable from the new HEAD"
+    );
+
+    let mut readme = local.filename("README.md");
+    readme.assert_lines_and_blame(vec![
+        "# Project".human(),
+        "Session A: AI-enhanced line 1".ai(),
+        "Session A: AI-enhanced line 2".human(),
+        "Session B: AI-generated line 1".ai(),
+        "Session B: AI-generated line 2".ai(),
+    ]);
+}
+
+#[test]
+fn test_pull_rebase_conflict_manual_commit_does_not_reuse_stale_rebase_head() {
+    let setup = setup_conflict_pull_test();
+    let local = setup.local;
+
+    local
+        .git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .expect("push authorship notes should succeed");
+    assert!(
+        local.git(&["push"]).is_err(),
+        "push should fail because upstream has diverged"
+    );
+
+    local
+        .git(&["config", "pull.rebase", "true"])
+        .expect("set pull.rebase should succeed");
+
+    let pull_result = local.git(&["pull"]);
+    assert!(
+        pull_result.is_err(),
+        "pull --rebase should fail due to conflict on README.md"
+    );
+
+    use std::fs;
+    fs::write(
+        local.path().join("README.md"),
+        "# Project\nSession A: AI-enhanced line 1\nSession A: AI-enhanced line 2\nSession B: AI-generated line 1\nSession B: AI-generated line 2\n",
+    )
+    .expect("writing resolved file should succeed");
+
+    local
+        .git(&["add", "README.md"])
+        .expect("staging resolved file should succeed");
+    local
+        .git(&["commit", "-m", "Session B: AI feature"])
+        .expect("manual conflict-resolution commit should succeed");
+
+    let rebased_b = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+    assert_ne!(
+        rebased_b, setup.session_b_ai_commit_sha,
+        "manual conflict-resolution commit should rewrite Session B to a new SHA"
+    );
+
+    // Git leaves REBASE_HEAD / stopped-sha in place after a direct conflict
+    // resolution commit. A later normal commit must not keep treating that
+    // stale source commit as the active rebase pick.
+    fs::write(
+        local.path().join("README.md"),
+        "# Project\nSession A: AI-enhanced line 1\nSession A: AI-enhanced line 2\nSession B: AI-generated line 1\nSession B: AI-generated line 2\nManual follow-up line\n",
+    )
+    .expect("writing follow-up file should succeed");
+
+    local
+        .git(&["add", "README.md"])
+        .expect("staging follow-up file should succeed");
+    local
+        .git(&["commit", "-m", "Manual follow-up"])
+        .expect("manual follow-up commit should succeed");
+
+    let follow_up = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+    assert_ne!(
+        follow_up, rebased_b,
+        "follow-up commit should create a distinct commit"
+    );
+    assert_eq!(
+        local
+            .git(&["rev-parse", "HEAD^"])
+            .expect("rev-parse parent should succeed")
+            .trim(),
+        rebased_b,
+        "follow-up commit should be a normal child of the manual rebase commit"
+    );
+
+    let mut readme = local.filename("README.md");
+    readme.assert_lines_and_blame(vec![
+        "# Project".human(),
+        "Session A: AI-enhanced line 1".ai(),
+        "Session A: AI-enhanced line 2".human(),
+        "Session B: AI-generated line 1".ai(),
+        "Session B: AI-generated line 2".ai(),
+        "Manual follow-up line".human(),
+    ]);
+
+    let stats = local
+        .stats()
+        .expect("stats should parse for follow-up commit");
+    assert_eq!(
+        stats.ai_additions, 0,
+        "follow-up commit should not inherit AI additions from stale REBASE_HEAD"
+    );
+    assert_eq!(
+        stats.total_ai_additions, 0,
+        "follow-up commit should not inherit Session B prompt metrics from stale REBASE_HEAD"
+    );
+}
+
+#[test]
+fn test_pull_rebase_conflict_abort_clears_pending_manual_commit_mapping() {
+    let setup = setup_conflict_pull_test();
+    let local = setup.local;
+
+    local
+        .git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .expect("push authorship notes should succeed");
+    assert!(
+        local.git(&["push"]).is_err(),
+        "push should fail because upstream has diverged"
+    );
+
+    local
+        .git(&["config", "pull.rebase", "true"])
+        .expect("set pull.rebase should succeed");
+    assert!(
+        local.git(&["pull"]).is_err(),
+        "pull --rebase should fail due to conflict on README.md"
+    );
+    local
+        .git(&["rebase", "--abort"])
+        .expect("rebase abort should succeed");
+
+    std::fs::write(
+        local.path().join("README.md"),
+        "# Project\nManual after abort\n",
+    )
+    .expect("writing manual file should succeed");
+    local
+        .git(&["add", "README.md"])
+        .expect("staging manual file should succeed");
+    local
+        .git(&["commit", "-m", "Manual after abort"])
+        .expect("manual commit after abort should succeed");
+
+    let mut readme = local.filename("README.md");
+    readme.assert_lines_and_blame(vec!["# Project".human(), "Manual after abort".human()]);
+
+    let stats = local
+        .stats()
+        .expect("stats should parse for manual commit after abort");
+    assert_eq!(
+        stats.ai_additions, 0,
+        "manual commit after abort should not inherit pending AI additions"
+    );
+    assert_eq!(
+        stats.total_ai_additions, 0,
+        "manual commit after abort should not inherit pending prompt metrics"
+    );
+}
+
+#[test]
+fn test_pull_rebase_conflict_skip_clears_pending_manual_commit_mapping() {
+    let setup = setup_conflict_pull_test();
+    let local = setup.local;
+
+    local
+        .git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .expect("push authorship notes should succeed");
+    assert!(
+        local.git(&["push"]).is_err(),
+        "push should fail because upstream has diverged"
+    );
+
+    local
+        .git(&["config", "pull.rebase", "true"])
+        .expect("set pull.rebase should succeed");
+    assert!(
+        local.git(&["pull"]).is_err(),
+        "pull --rebase should fail due to conflict on README.md"
+    );
+    local
+        .git(&["rebase", "--skip"])
+        .expect("rebase skip should succeed");
+
+    std::fs::write(
+        local.path().join("README.md"),
+        "# Project\nSession A: AI-enhanced line 1\nSession A: AI-enhanced line 2\nManual after skip\n",
+    )
+    .expect("writing manual file should succeed");
+    local
+        .git(&["add", "README.md"])
+        .expect("staging manual file should succeed");
+    local
+        .git(&["commit", "-m", "Manual after skip"])
+        .expect("manual commit after skip should succeed");
+
+    let mut readme = local.filename("README.md");
+    readme.assert_lines_and_blame(vec![
+        "# Project".human(),
+        "Session A: AI-enhanced line 1".ai(),
+        "Session A: AI-enhanced line 2".human(),
+        "Manual after skip".human(),
+    ]);
+
+    let stats = local
+        .stats()
+        .expect("stats should parse for manual commit after skip");
+    assert_eq!(
+        stats.ai_additions, 0,
+        "manual commit after skip should not inherit pending AI additions"
+    );
+    assert_eq!(
+        stats.total_ai_additions, 0,
+        "manual commit after skip should not inherit pending prompt metrics"
+    );
+}
+
 // =============================================================================
 // Pull --rebase abort preserves original notes
 // =============================================================================
@@ -954,6 +1252,10 @@ crate::reuse_tests_in_worktree!(
     test_pull_rebase_committed_and_autostash_preserves_all_authorship,
     test_pull_rebase_skip_commit_does_not_map_entire_upstream_history,
     test_pull_rebase_with_conflict_preserves_ai_notes,
+    test_pull_rebase_conflict_after_failed_push_commit_preserves_ai_notes,
+    test_pull_rebase_conflict_manual_commit_does_not_reuse_stale_rebase_head,
+    test_pull_rebase_conflict_abort_clears_pending_manual_commit_mapping,
+    test_pull_rebase_conflict_skip_clears_pending_manual_commit_mapping,
     test_pull_rebase_with_conflict_abort_preserves_original_notes,
     test_regular_rebase_with_conflict_preserves_ai_notes,
     test_regular_rebase_with_conflict_abort_preserves_original_notes,
