@@ -871,6 +871,12 @@ impl TestRepo {
                 serde_json::Value::String(prompt_storage.clone()),
             );
         }
+        if let Some(notes_store) = &patch.notes_store {
+            config.insert(
+                "notes_store".to_string(),
+                serde_json::Value::String(notes_store.clone()),
+            );
+        }
         if let Some(custom_attributes) = &patch.custom_attributes {
             let attrs_map: serde_json::Map<String, serde_json::Value> = custom_attributes
                 .iter()
@@ -899,6 +905,10 @@ impl TestRepo {
         {
             self.write_test_config_to_home(&daemon.daemon_home);
         }
+    }
+
+    fn sync_test_home_config_for_command(&self) {
+        self.sync_test_home_config_for_hooks();
     }
 
     fn apply_default_config_patch(&mut self) {
@@ -1703,6 +1713,14 @@ impl TestRepo {
             return;
         }
 
+        self.record_daemon_family_expected_completion_session_unchecked(session);
+    }
+
+    pub(crate) fn record_manual_daemon_completion_session(&self, session: &str) {
+        self.record_daemon_family_expected_completion_session_unchecked(session);
+    }
+
+    fn record_daemon_family_expected_completion_session_unchecked(&self, session: &str) {
         let family_key = self.daemon_family_key();
         let mut registry = daemon_sync_registry()
             .lock()
@@ -1785,6 +1803,11 @@ impl TestRepo {
             self.record_daemon_family_expected_completion_session(session);
         }
         self.sync_daemon_force();
+    }
+
+    pub(crate) fn sync_manual_daemon_sessions(&self) {
+        let family_key = self.daemon_family_key();
+        self.sync_pending_daemon_sessions(&family_key);
     }
 
     fn sync_daemon_clone_target(&self, target_repo_path: &Path) {
@@ -2030,6 +2053,8 @@ impl TestRepo {
     /// Run a raw git command (bypassing git-ai hooks) with custom environment variables.
     /// Useful for creating commits with specific author/committer identities.
     pub fn git_og_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+        self.sync_test_home_config_for_command();
+
         #[cfg(windows)]
         let null_hooks = "NUL";
         #[cfg(not(windows))]
@@ -2165,6 +2190,8 @@ impl TestRepo {
         envs: &[(&str, &str)],
         working_dir: Option<&std::path::Path>,
     ) -> Result<String, String> {
+        self.sync_test_home_config_for_command();
+
         let canonical_working_dir = if let Some(working_dir_path) = working_dir {
             Some(working_dir_path.canonicalize().map_err(|e| {
                 format!(
@@ -2300,6 +2327,8 @@ impl TestRepo {
         working_dir: &std::path::Path,
         args: &[&str],
     ) -> Result<String, String> {
+        self.sync_test_home_config_for_command();
+
         if git_ai_command_requires_daemon_sync(args) {
             self.sync_daemon_force();
         }
@@ -2366,6 +2395,8 @@ impl TestRepo {
     }
 
     pub fn git_ai_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+        self.sync_test_home_config_for_command();
+
         if git_ai_command_requires_daemon_sync(args) {
             self.sync_daemon_force();
         }
@@ -2429,6 +2460,8 @@ impl TestRepo {
     pub fn git_ai_with_stdin(&self, args: &[&str], stdin_data: &[u8]) -> Result<String, String> {
         use std::io::Write;
         use std::process::Stdio;
+
+        self.sync_test_home_config_for_command();
 
         if git_ai_command_requires_daemon_sync(args) {
             self.sync_daemon_force();

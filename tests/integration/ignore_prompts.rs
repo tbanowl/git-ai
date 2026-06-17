@@ -2,6 +2,10 @@ use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::transcript::{AiTranscript, Message};
 use std::fs;
 
+fn new_prompt_config_repo() -> TestRepo {
+    TestRepo::new_dedicated_daemon()
+}
+
 /// Helper to create a simple agent_v1 AI checkpoint with a transcript
 fn checkpoint_with_message(repo: &TestRepo, message: &str, edited_files: Vec<String>) {
     let mut transcript = AiTranscript::new();
@@ -79,7 +83,7 @@ fn checkpoint_with_empty_transcript(repo: &TestRepo, edited_files: Vec<String>) 
 
 #[test]
 fn test_checkpoint_with_prompt_sharing_enabled() {
-    let mut repo = TestRepo::new();
+    let mut repo = new_prompt_config_repo();
 
     // Enable prompt sharing for all repositories (empty blacklist = share everywhere)
     // Use prompt_storage: "notes" to explicitly store messages in git notes for testing
@@ -130,7 +134,7 @@ fn test_checkpoint_with_prompt_sharing_enabled() {
 
 #[test]
 fn test_checkpoint_with_prompt_sharing_disabled_strips_messages() {
-    let mut repo = TestRepo::new();
+    let mut repo = new_prompt_config_repo();
 
     // Prompt sharing is disabled by default (empty list), but let's be explicit
     repo.patch_git_ai_config(|patch| {
@@ -191,8 +195,8 @@ fn test_checkpoint_with_prompt_sharing_disabled_strips_messages() {
 }
 
 #[test]
-fn test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite() {
-    let mut private_repo = TestRepo::new();
+fn test_prompt_sharing_disabled_uses_isolated_daemon_config() {
+    let mut private_repo = new_prompt_config_repo();
     private_repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec!["*".to_string()]);
     });
@@ -213,7 +217,7 @@ fn test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite() {
         ])
         .unwrap();
 
-    let mut public_repo = TestRepo::new();
+    let mut public_repo = new_prompt_config_repo();
     public_repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
         patch.prompt_storage = Some("notes".to_string());
@@ -236,14 +240,14 @@ fn test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite() {
     assert_eq!(prompts.len(), 1, "Expected exactly one prompt record");
     assert!(
         prompts[0].messages.is_empty(),
-        "private repo prompt messages should stay stripped even if another repo rewrites shared daemon config, but found: {:?}",
+        "private repo prompt messages should stay stripped even if another repo has prompt sharing enabled, but found: {:?}",
         prompts[0].messages
     );
 }
 
 #[test]
 fn test_multiple_checkpoints_with_messages() {
-    let mut repo = TestRepo::new();
+    let mut repo = new_prompt_config_repo();
 
     // Enable prompt sharing for all repositories (empty blacklist = share everywhere)
     repo.patch_git_ai_config(|patch| {
@@ -328,7 +332,7 @@ fn test_multiple_checkpoints_with_messages() {
 
 #[test]
 fn test_prompt_sharing_disabled_with_empty_transcript() {
-    let mut repo = TestRepo::new();
+    let mut repo = new_prompt_config_repo();
 
     // Disable prompt sharing (default behavior)
     repo.patch_git_ai_config(|patch| {
@@ -360,7 +364,7 @@ fn test_prompt_sharing_disabled_with_empty_transcript() {
 crate::reuse_tests_in_worktree!(
     test_checkpoint_with_prompt_sharing_enabled,
     test_checkpoint_with_prompt_sharing_disabled_strips_messages,
-    test_prompt_sharing_disabled_survives_shared_daemon_config_overwrite,
+    test_prompt_sharing_disabled_uses_isolated_daemon_config,
     test_multiple_checkpoints_with_messages,
     test_prompt_sharing_disabled_with_empty_transcript,
 );

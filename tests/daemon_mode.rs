@@ -16,14 +16,14 @@ use git_ai::commands::checkpoint_agent::bash_tool::{
 };
 use git_ai::daemon::{
     CapturedCheckpointRunRequest, CheckpointRunRequest, ControlRequest, DaemonConfig, DaemonLock,
-    local_socket_connects_with_timeout, open_local_socket_stream_with_timeout, read_daemon_pid,
-    send_control_request,
+    LiveCheckpointRunRequest, local_socket_connects_with_timeout,
+    open_local_socket_stream_with_timeout, read_daemon_pid, send_control_request,
 };
 use git_ai::git::find_repository_in_path;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::{
     DaemonTestCompletionLogEntry, DaemonTestScope, GitTestMode, TestRepo, get_binary_path,
-    real_git_executable,
+    new_daemon_test_sync_session_id, real_git_executable,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -503,8 +503,143 @@ fn traced_git_with_env(
     envs: &[(&str, &str)],
     expected_top_level_completions: &mut u64,
 ) -> Result<String, String> {
-    *expected_top_level_completions += 1;
+    let session = new_daemon_test_sync_session_id();
+    let session_config = format!(
+        "{}={}",
+        git_ai::daemon::test_sync::TEST_SYNC_SESSION_CONFIG_KEY,
+        session
+    );
+    let mut traced_args = vec!["-c", session_config.as_str()];
+    traced_args.extend_from_slice(args);
+
+    let result = repo.git_og_with_env(&traced_args, envs);
+    if repo.git_command_affects_daemon_for_tracking(&traced_args, Some(repo.path())) {
+        *expected_top_level_completions += 1;
+        repo.record_manual_daemon_completion_session(&session);
+    }
+    result
+}
+
+fn traced_git_with_env_without_completion_session(
+    repo: &TestRepo,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, String> {
     repo.git_og_with_env(args, envs)
+}
+
+fn sync_traced_commands(repo: &TestRepo) {
+    repo.sync_manual_daemon_sessions();
+}
+
+fn delegated_checkpoint_with_barrier(
+    repo: &TestRepo,
+    args: &[&str],
+    expected_top_level_completions: &mut u64,
+) -> Result<String, String> {
+    let (kind, file_args) = args
+        .split_first()
+        .ok_or_else(|| "checkpoint args should include a kind".to_string())?;
+    if *kind != "checkpoint" {
+        return Err(format!("expected checkpoint command args, got {:?}", args));
+    }
+    let (preset, paths) = file_args
+        .split_first()
+        .ok_or_else(|| "checkpoint args should include a preset".to_string())?;
+    if *preset != "mock_ai" {
+        return Err(format!("expected mock_ai checkpoint, got {:?}", args));
+    }
+    let edited_filepaths = paths
+        .iter()
+        .filter(|path| !path.starts_with("--"))
+        .map(|path| (*path).to_string())
+        .collect::<Vec<_>>();
+    if edited_filepaths.is_empty() {
+        return Err(format!(
+            "delegated checkpoint barrier requires explicit file paths: {:?}",
+            args
+        ));
+    }
+
+    *expected_top_level_completions += 1;
+    let request = ControlRequest::CheckpointRun {
+        request: Box::new(CheckpointRunRequest::Live(Box::new(
+            LiveCheckpointRunRequest {
+                repo_working_dir: repo_workdir_string(repo),
+                kind: Some("ai_agent".to_string()),
+                author: Some("mock_ai".to_string()),
+                quiet: Some(true),
+                is_pre_commit: Some(false),
+                agent_run_result: Some(AgentRunResult {
+                    agent_id: AgentId {
+                        tool: "mock_ai".to_string(),
+                        id: format!(
+                            "ai-thread-{}",
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or_default()
+                        ),
+                        model: "unknown".to_string(),
+                    },
+                    agent_metadata: None,
+                    checkpoint_kind: CheckpointKind::AiAgent,
+                    transcript: None,
+                    will_edit_filepaths: None,
+                    edited_filepaths: Some(edited_filepaths),
+                    repo_working_dir: Some(repo_workdir_string(repo)),
+                    dirty_files: None,
+                    captured_checkpoint_id: None,
+                }),
+            },
+        ))),
+        wait: Some(true),
+    };
+    let response = send_control_request(&daemon_control_socket_path(repo), &request)
+        .map_err(|error| error.to_string())?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "daemon checkpoint request failed".to_string()));
+    }
+    Ok("Checkpoint completed via daemon test barrier".to_string())
+}
+
+fn wait_for_checkpoint_completion_count(repo: &TestRepo, expected_count: usize) {
+    let start = std::time::Instant::now();
+    let mut last_progress = start;
+    let mut last_observed_count = 0usize;
+    loop {
+        let entries = completion_entries_for_command(repo, "checkpoint");
+        if let Some(error_entry) = entries.iter().find(|entry| entry.status == "error") {
+            panic!(
+                "daemon checkpoint completion log reported an error: {}",
+                error_entry
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown completion error")
+            );
+        }
+        let observed_count = entries.len();
+        if observed_count >= expected_count {
+            return;
+        }
+        if observed_count > last_observed_count {
+            last_progress = std::time::Instant::now();
+            last_observed_count = observed_count;
+        }
+        if start.elapsed() >= Duration::from_secs(30)
+            || last_progress.elapsed() >= Duration::from_secs(10)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    panic!(
+        "daemon checkpoint completion log did not reach {} entries",
+        expected_count
+    );
 }
 
 fn wait_for_expected_top_level_completions(
@@ -512,6 +647,7 @@ fn wait_for_expected_top_level_completions(
     baseline: u64,
     expected_top_level_completions: u64,
 ) {
+    repo.sync_manual_daemon_sessions();
     repo.wait_for_daemon_total_completion_count(
         baseline,
         baseline.saturating_add(expected_top_level_completions),
@@ -1086,11 +1222,13 @@ fn checkpoint_delegate_autostarts_daemon_when_unavailable() {
     // Wait briefly for the daemon to release the sockets.
     std::thread::sleep(std::time::Duration::from_millis(500));
 
+    let checkpoint_baseline = completion_entries_for_command(&repo, "checkpoint").len();
     repo.git_ai_with_env(
         &["checkpoint", "mock_ai", "delegate-fallback.txt"],
         &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
     )
     .expect("checkpoint should auto-start daemon and succeed");
+    wait_for_checkpoint_completion_count(&repo, checkpoint_baseline.saturating_add(1));
 
     let status = send_control_request(
         &daemon_control_socket_path(&repo),
@@ -1197,6 +1335,7 @@ fn daemon_write_mode_applies_delegated_checkpoint_and_updates_state() {
     let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
     let _daemon = DaemonGuard::start(&repo);
     let completion_baseline = repo.daemon_total_completion_count();
+    let mut expected_top_level_completions = 0u64;
 
     fs::write(repo.path().join("delegate-write.txt"), "base\n").expect("failed to write base");
     repo.git(&["add", "delegate-write.txt"])
@@ -1210,13 +1349,18 @@ fn daemon_write_mode_applies_delegated_checkpoint_and_updates_state() {
     )
     .expect("failed to write updated file");
 
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", "delegate-write.txt"],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated checkpoint should succeed");
 
-    wait_for_expected_top_level_completions(&repo, completion_baseline, 1);
+    wait_for_expected_top_level_completions(
+        &repo,
+        completion_baseline,
+        expected_top_level_completions,
+    );
 
     let checkpoints = repo
         .current_working_logs()
@@ -1736,10 +1880,10 @@ fn daemon_pure_trace_socket_commit_after_ai_checkpoint_preserves_ai_replacement_
     .expect("base commit should succeed");
 
     fs::write(&file_path, "new line from ai\n").expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", "daemon-ai-replace.txt"],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("ai checkpoint should succeed");
     traced_git_with_env(
@@ -1801,10 +1945,10 @@ fn daemon_commit_without_human_checkpoint_marks_human_edit_after_ai_commit_as_hu
         "base line\nai line unchanged\nai line to edit\n",
     )
     .expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated ai checkpoint should succeed");
     traced_git_with_env(
@@ -1821,6 +1965,9 @@ fn daemon_commit_without_human_checkpoint_marks_human_edit_after_ai_commit_as_hu
         &mut expected_top_level_completions,
     )
     .expect("ai commit should succeed");
+    sync_traced_commands(&repo);
+    let completion_baseline = completion_baseline + expected_top_level_completions;
+    let expected_after_ai_commit = expected_top_level_completions;
 
     fs::write(
         &file_path,
@@ -1844,7 +1991,7 @@ fn daemon_commit_without_human_checkpoint_marks_human_edit_after_ai_commit_as_hu
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
-        expected_top_level_completions,
+        expected_top_level_completions.saturating_sub(expected_after_ai_commit),
     );
 
     let mut file = repo.filename(file_rel);
@@ -1892,10 +2039,10 @@ fn daemon_commit_with_autocrlf_marks_human_edit_after_ai_commit_as_human() {
         "base line\r\nai line unchanged\r\nai line to edit\r\n",
     )
     .expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated ai checkpoint should succeed");
     traced_git_with_env(
@@ -1912,6 +2059,9 @@ fn daemon_commit_with_autocrlf_marks_human_edit_after_ai_commit_as_human() {
         &mut expected_top_level_completions,
     )
     .expect("ai commit should succeed");
+    sync_traced_commands(&repo);
+    let completion_baseline = completion_baseline + expected_top_level_completions;
+    let expected_after_ai_commit = expected_top_level_completions;
 
     fs::write(
         &file_path,
@@ -1939,7 +2089,7 @@ fn daemon_commit_with_autocrlf_marks_human_edit_after_ai_commit_as_human() {
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
-        expected_top_level_completions,
+        expected_top_level_completions.saturating_sub(expected_after_ai_commit),
     );
 
     let head = repo
@@ -1995,10 +2145,10 @@ fn daemon_human_commit_with_ai_like_author_email_uses_authorship_note_not_agent_
         "base line\nai line unchanged\nai line to edit\n",
     )
     .expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated ai checkpoint should succeed");
     traced_git_with_env(
@@ -2015,6 +2165,9 @@ fn daemon_human_commit_with_ai_like_author_email_uses_authorship_note_not_agent_
         &mut expected_top_level_completions,
     )
     .expect("ai commit should succeed");
+    sync_traced_commands(&repo);
+    let completion_baseline = completion_baseline + expected_top_level_completions;
+    let expected_after_ai_commit = expected_top_level_completions;
 
     fs::write(
         &file_path,
@@ -2044,7 +2197,7 @@ fn daemon_human_commit_with_ai_like_author_email_uses_authorship_note_not_agent_
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
-        expected_top_level_completions,
+        expected_top_level_completions.saturating_sub(expected_after_ai_commit),
     );
 
     let head = repo
@@ -2103,10 +2256,10 @@ fn windows_daemon_autocrlf_ai_like_author_email_keeps_human_edit_human() {
         "base line\r\nai line unchanged\r\nai line to edit\r\n",
     )
     .expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated ai checkpoint should succeed");
     traced_git_with_env(
@@ -2123,6 +2276,9 @@ fn windows_daemon_autocrlf_ai_like_author_email_keeps_human_edit_human() {
         &mut expected_top_level_completions,
     )
     .expect("ai commit should succeed");
+    sync_traced_commands(&repo);
+    let completion_baseline = completion_baseline + expected_top_level_completions;
+    let expected_after_ai_commit = expected_top_level_completions;
 
     fs::write(
         &file_path,
@@ -2152,7 +2308,7 @@ fn windows_daemon_autocrlf_ai_like_author_email_keeps_human_edit_human() {
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
-        expected_top_level_completions,
+        expected_top_level_completions.saturating_sub(expected_after_ai_commit),
     );
 
     let head = repo
@@ -2217,10 +2373,10 @@ fn daemon_commit_with_stale_active_bash_context_does_not_mark_human_edit_as_ai()
         "base line\nai line unchanged\nai line to edit\n",
     )
     .expect("failed to write ai contents");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("delegated ai checkpoint should succeed");
     traced_git_with_env(
@@ -2379,10 +2535,10 @@ fn daemon_pure_trace_socket_checkpoint_stage_checkpoint_two_commits_preserve_ai_
             .expect("failed to open file for first append");
         writeln!(f, "test").expect("failed to append first ai line");
     }
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("first delegated ai checkpoint should succeed");
 
@@ -2401,10 +2557,10 @@ fn daemon_pure_trace_socket_checkpoint_stage_checkpoint_two_commits_preserve_ai_
             .expect("failed to open file for second append");
         writeln!(f, "test1").expect("failed to append second ai line");
     }
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("second delegated ai checkpoint should succeed");
 
@@ -2499,10 +2655,10 @@ middle line 2
 omega body
 ";
     fs::write(&file_path, first_ai_hunk).expect("failed to write first hunk content");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("first delegated checkpoint should succeed");
 
@@ -2527,10 +2683,10 @@ middle line 2
 omega body
 ";
     fs::write(&file_path, both_hunks).expect("failed to write both hunks content");
-    expected_top_level_completions += 1;
-    repo.git_ai_with_env(
+    delegated_checkpoint_with_barrier(
+        &repo,
         &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        &mut expected_top_level_completions,
     )
     .expect("second delegated checkpoint should succeed");
 
@@ -4463,15 +4619,17 @@ fn daemon_pure_trace_socket_high_throughput_ai_commit_burst_preserves_exact_blam
     let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
 
     let file_count = 16usize;
+    let mut expected_top_level_completions = 0u64;
     for idx in 0..file_count {
         let file_rel = format!("daemon-race-file-{idx}.txt");
         let file_path = repo.path().join(file_rel.as_str());
         fs::write(&file_path, format!("ai-line-{idx}\n"))
             .expect("failed to write ai burst test file");
 
-        repo.git_ai_with_env(
+        delegated_checkpoint_with_barrier(
+            &repo,
             &["checkpoint", "mock_ai", file_rel.as_str()],
-            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+            &mut expected_top_level_completions,
         )
         .expect("delegated ai checkpoint should succeed");
 
@@ -5278,20 +5436,14 @@ fn daemon_recovers_from_panic_in_side_effect_pipeline() {
     // The daemon will panic inside the side-effect pipeline, but catch_unwind
     // should keep it alive.  Because panicked commands do NOT emit completion
     // log entries, we cannot use wait_for_expected_top_level_completions here.
-    // Instead we track these commands in a throwaway counter and poll the
-    // daemon's control socket to confirm it is still responsive.
-    let mut _throwaway = 0u64;
+    // Instead we avoid recording completion sessions for these commands and
+    // poll the daemon's control socket to confirm it is still responsive.
 
     fs::write(repo.path().join("file.txt"), "initial\n").expect("failed to write initial file");
-    traced_git_with_env(&repo, &["add", "file.txt"], &env_refs, &mut _throwaway)
+    traced_git_with_env_without_completion_session(&repo, &["add", "file.txt"], &env_refs)
         .expect("add should succeed");
-    traced_git_with_env(
-        &repo,
-        &["commit", "-m", "initial"],
-        &env_refs,
-        &mut _throwaway,
-    )
-    .expect("initial commit should succeed");
+    traced_git_with_env_without_completion_session(&repo, &["commit", "-m", "initial"], &env_refs)
+        .expect("initial commit should succeed");
 
     // Give the daemon enough time to ingest the trace events and attempt
     // (and panic in) side-effect processing.  Poll the control socket to

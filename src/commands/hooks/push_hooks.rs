@@ -49,13 +49,22 @@ pub fn push_pre_command_hook(
 pub fn run_pre_push_hook_managed(parsed_args: &ParsedGitInvocation, repository: &Repository) {
     upgrade::maybe_schedule_background_update_check();
 
+    if let Err(e) = run_push_authorship_notes(parsed_args, repository) {
+        tracing::debug!("authorship push failed: {}", e);
+    }
+}
+
+pub(crate) fn run_push_authorship_notes(
+    parsed_args: &ParsedGitInvocation,
+    repository: &Repository,
+) -> Result<(), crate::error::GitAiError> {
     if should_skip_authorship_push(&parsed_args.command_args) {
-        return;
+        return Ok(());
     }
 
     let Some(remote) = resolve_push_remote(parsed_args, repository) else {
         tracing::debug!("no remotes found for authorship push; skipping");
-        return;
+        return Ok(());
     };
 
     tracing::debug!("started pushing authorship notes to remote: {}", remote);
@@ -67,9 +76,7 @@ pub fn run_pre_push_hook_managed(parsed_args: &ParsedGitInvocation, repository: 
         crate::commands::flush_cas::spawn_background_cas_flush();
     }
 
-    if let Err(e) = push_authorship_notes(repository, &remote) {
-        tracing::debug!("authorship push failed: {}", e);
-    }
+    push_authorship_notes(repository, &remote)
 }
 
 pub fn push_post_command_hook(

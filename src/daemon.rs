@@ -1466,8 +1466,7 @@ fn apply_push_side_effect(
 ) -> Result<(), GitAiError> {
     let repo = find_repository_in_path(worktree)?;
     let parsed = parsed_invocation_for_side_effect(command, args);
-    push_hooks::run_pre_push_hook_managed(&parsed, &repo);
-    Ok(())
+    push_hooks::run_push_authorship_notes(&parsed, &repo)
 }
 
 fn apply_pull_notes_sync_side_effect(
