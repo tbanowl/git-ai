@@ -18,7 +18,7 @@ use crate::utils::{checkpoint_delegation_enabled, normalize_to_posix};
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -539,33 +539,6 @@ pub fn git_index_mtime_ns(repo_root: &Path) -> Option<u128> {
     Some(system_time_to_nanos(mtime))
 }
 
-fn git_index_tracked_paths(repo_root: &Path) -> HashSet<String> {
-    let Ok(git_dir) = get_git_dir(repo_root) else {
-        return HashSet::new();
-    };
-    let Ok(object_hash) =
-        crate::git::repository::repository_object_hash_kind_for_path_no_git_exec(&git_dir)
-    else {
-        return HashSet::new();
-    };
-    let index_path = git_dir.join("index");
-    let Ok(index) = gix_index::File::at(index_path, object_hash, true, Default::default()) else {
-        return HashSet::new();
-    };
-
-    let mut paths = HashSet::new();
-    for entry in index.entries() {
-        if entry.stage() != gix_index::entry::Stage::Unconflicted {
-            continue;
-        }
-        let path = normalize_to_posix(&entry.path(&index).to_string());
-        if !path.trim().is_empty() {
-            paths.insert(path);
-        }
-    }
-    paths
-}
-
 /// Test whether a file is covered by the current watermarks, meaning it has
 /// not been modified since the last known-good baseline and does not need to
 /// be stored in the snapshot.
@@ -671,11 +644,6 @@ pub fn snapshot(
     };
 
     let per_file_wm: HashMap<String, u128> = wm.map(|w| w.per_file.clone()).unwrap_or_default();
-    let tracked_paths = if effective_worktree_wm.is_some() {
-        git_index_tracked_paths(repo_root)
-    } else {
-        HashSet::new()
-    };
 
     // Build the git-ai ignore ruleset: gitignore + defaults + .git-ai-ignore + linguist.
     // Arc is needed because filter_entry requires 'static, preventing a borrow.
@@ -773,12 +741,7 @@ pub fn snapshot(
                 let stat = StatEntry::from_metadata(&meta);
                 let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                let is_untracked_without_file_watermark = effective_worktree_wm.is_some()
-                    && !per_file_wm.contains_key(&posix_key)
-                    && !tracked_paths.contains(&posix_key);
-                if is_untracked_without_file_watermark
-                    || !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key)
-                {
+                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
                     entries.insert(normalized, stat);
                     if entries.len() > MAX_TRACKED_FILES {
                         tracing::debug!(
@@ -2168,6 +2131,51 @@ mod tests {
 
         let stale = find_stale_files(&snapshot);
         assert!(stale.is_empty(), "nonexistent file should not be stale");
+    }
+
+    #[test]
+    fn test_snapshot_worktree_watermark_skips_unmodified_mixed_case_tracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let rel_path = Path::new("PPTClient")
+            .join("Lot")
+            .join("LotHoldListDlg.cpp");
+        let abs_path = dir.path().join(&rel_path);
+        fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+        fs::write(&abs_path, "tracked\n").unwrap();
+        Command::new("git")
+            .args(["add", rel_path.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let worktree_watermark = git_index_mtime_ns(dir.path()).expect("index mtime should exist");
+        let watermarks = DaemonWatermarks::for_test(HashMap::new(), Some(worktree_watermark));
+        let snap = snapshot(dir.path(), "sess", "t1", Some(&watermarks)).unwrap();
+        let paths = snap
+            .entries
+            .keys()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.is_empty(),
+            "unmodified mixed-case tracked file should be covered by the worktree watermark; got {:?}",
+            paths
+        );
     }
 
     // -----------------------------------------------------------------------
