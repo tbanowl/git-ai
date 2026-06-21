@@ -102,6 +102,7 @@ mod stash_attribution;
 mod stats;
 mod status_ignore;
 mod subdirs;
+mod superuser_guard;
 mod sublime_merge_installer;
 mod sync_authorship_types;
 mod tls_native_certs;

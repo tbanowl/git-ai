@@ -82,6 +82,7 @@ pub struct Config {
     #[serde(serialize_with = "serialize_masked_api_key")]
     api_key: Option<String>,
     quiet: bool,
+    allow_superuser: bool,
     custom_attributes: HashMap<String, String>,
     git_ai_hooks: HashMap<String, Vec<String>>,
 }
@@ -153,6 +154,8 @@ pub struct FileConfig {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_superuser: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +420,10 @@ impl Config {
         self.quiet
     }
 
+    pub fn allow_superuser(&self) -> bool {
+        self.allow_superuser
+    }
+
     /// Returns the custom attributes map (from config file + env var override).
     pub fn custom_attributes(&self) -> &HashMap<String, String> {
         &self.custom_attributes
@@ -676,6 +683,11 @@ fn build_config() -> Config {
     // Get quiet setting (defaults to false)
     let quiet = file_cfg.as_ref().and_then(|c| c.quiet).unwrap_or(false);
 
+    let allow_superuser = file_cfg
+        .as_ref()
+        .and_then(|c| c.allow_superuser)
+        .unwrap_or(false);
+
     // Build custom attributes: file config as base, env var overrides
     let custom_attributes = build_custom_attributes(&file_cfg);
 
@@ -723,6 +735,7 @@ fn build_config() -> Config {
             default_prompt_storage,
             api_key,
             quiet,
+            allow_superuser,
             custom_attributes: custom_attributes.clone(),
             git_ai_hooks: git_ai_hooks.clone(),
         };
@@ -749,6 +762,7 @@ fn build_config() -> Config {
         default_prompt_storage,
         api_key,
         quiet,
+        allow_superuser,
         custom_attributes,
         git_ai_hooks,
     }
@@ -1166,6 +1180,7 @@ mod tests {
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
         }
@@ -1303,6 +1318,7 @@ mod tests {
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
         }
@@ -1422,6 +1438,7 @@ mod tests {
             default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
         }
