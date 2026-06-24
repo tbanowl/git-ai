@@ -583,6 +583,7 @@ $os = 'windows'
 
 # Determine binary name and download URLs
 $binaryName = "git-ai"
+# $binaryName = "git-ai-$os-$arch"
 
 # Determine release tag
 # Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
