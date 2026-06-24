@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
-$gitProxy = Join-Path $env:USERPROFILE '.git-ai\bin\git-proxy.exe'
+$gitProxy = Join-Path $env:USERPROFILE '.git-ai\bin\git.exe'
 
 if (-not (Test-Path -LiteralPath $gitProxy)) {
-    Write-Error "git-proxy.exe not found: $gitProxy"
+    Write-Error "git.exe not found: $gitProxy"
     exit 1
 }
 
