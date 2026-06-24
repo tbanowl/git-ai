@@ -364,9 +364,10 @@ fn fetch_and_verify_checksums(
         crate::http::send(request).map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
 
     if response.status_code != 200 {
-        return Err(format!(
-            "Failed to fetch SHA256SUMS: HTTP {}",
-            response.status_code
+        return Err(release_artifact_http_error(
+            "SHA256SUMS",
+            channel,
+            response.status_code,
         ));
     }
 
@@ -404,9 +405,10 @@ fn fetch_and_verify_install_script(
         .map_err(|e| format!("Failed to fetch {}: {}", script_name, e))?;
 
     if response.status_code != 200 {
-        return Err(format!(
-            "Failed to fetch {}: HTTP {}",
-            script_name, response.status_code
+        return Err(release_artifact_http_error(
+            script_name,
+            channel,
+            response.status_code,
         ));
     }
 
@@ -419,6 +421,13 @@ fn fetch_and_verify_install_script(
         .map_err(|e| format!("{} is not valid UTF-8: {}", script_name, e))?;
 
     Ok(script.to_string())
+}
+
+fn release_artifact_http_error(filename: &str, channel: &str, status_code: u16) -> String {
+    format!(
+        "Release artifact '{}' is not available for channel '{}' (HTTP {})",
+        filename, channel, status_code
+    )
 }
 
 fn fetch_release_for_channel(
@@ -1378,6 +1387,14 @@ mod tests {
         assert!(checksums.contains_key("file1"));
         assert!(checksums.contains_key("file3"));
         assert!(!checksums.contains_key("file2"));
+    }
+
+    #[test]
+    fn test_release_artifact_http_error_names_channel_and_file() {
+        let message = release_artifact_http_error("install.ps1", "latest", 404);
+        assert!(message.contains("install.ps1"));
+        assert!(message.contains("latest"));
+        assert!(message.contains("HTTP 404"));
     }
 
     // --- Additional comprehensive tests ---
