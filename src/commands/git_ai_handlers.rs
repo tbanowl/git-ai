@@ -25,15 +25,11 @@ use crate::git::repository::{CommitRange, Repository, group_files_by_repository}
 use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes, push_authorship_notes};
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
 use crate::observability::{self, log_message};
-#[cfg(windows)]
-use crate::utils::CREATE_NO_WINDOW;
 use crate::utils::is_interactive_terminal;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn handle_git_ai(args: &[String]) {
@@ -257,10 +253,6 @@ pub fn handle_git_ai(args: &[String]) {
         #[cfg(debug_assertions)]
         "show-transcript" => {
             handle_show_transcript(&args[1..]);
-        }
-        #[cfg(not(unix))]
-        "maintenance-worker" => {
-            handle_maintenance(&args[1..]);
         }
         _ => {
             println!("Unknown git-ai command: {}", args[0]);

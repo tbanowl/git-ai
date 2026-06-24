@@ -1,4 +1,6 @@
 use crate::authorship::virtual_attribution::VirtualAttributions;
+use crate::authorship::working_log::CheckpointKind;
+use crate::commands::checkpoint;
 use crate::commands::git_hook_handlers::{
     ENV_SKIP_MANAGED_HOOKS, has_repo_hook_state, resolve_previous_non_managed_hooks_path,
 };
@@ -193,9 +195,9 @@ pub fn handle_git(args: &[String]) {
         let worktree = repository.as_ref().and_then(|r| r.workdir().ok());
 
         let is_commit = is_commit_command(&parsed);
-        // if is_commit && let Some(repo) = repository.as_ref() {
-        //     pre_commit_human_checkpoint(repo);
-        // }
+        if is_commit && let Some(repo) = repository.as_ref() {
+            pre_commit_human_checkpoint(repo);
+        }
 
         let pre_state = worktree
             .as_deref()
@@ -261,9 +263,9 @@ pub fn handle_git(args: &[String]) {
         }
     }
 
-    // if is_commit_command(&parsed_args) && let Some(repository) = repository_option.as_ref() {
-    //     pre_commit_human_checkpoint(repository);
-    // }
+    if is_commit_command(&parsed_args) && let Some(repository) = repository_option.as_ref() {
+        pre_commit_human_checkpoint(repository);
+    }
 
     let get_config_start = Instant::now();
     let config = config::Config::get();
@@ -368,17 +370,17 @@ pub fn handle_git(args: &[String]) {
     exit_with_status(exit_status);
 }
 
-// fn pre_commit_human_checkpoint(repo: &Repository) {
-//     let default_user_name = repo.git_author_identity().name_or_unknown();
-//     let _ = checkpoint::run(
-//         &repo,
-//         &default_user_name,
-//         CheckpointKind::Human,
-//         true,
-//         None,
-//         false,
-//     );
-// }
+fn pre_commit_human_checkpoint(repo: &Repository) {
+    let default_user_name = repo.git_author_identity().name_or_unknown();
+    let _ = checkpoint::run(
+        &repo,
+        &default_user_name,
+        CheckpointKind::Human,
+        true,
+        None,
+        false,
+    );
+}
 
 fn is_commit_command(parsed_args: &ParsedGitInvocation) -> bool {
     parsed_args
