@@ -49,7 +49,7 @@ fn test_explicit_path_checkpoint_only_tracks_the_explicit_file() {
 }
 
 #[test]
-fn test_explicit_path_checkpoint_skips_conflicted_files() {
+fn test_explicit_path_checkpoint_tracks_resolved_unmerged_file() {
     let repo = TestRepo::new();
     let conflict_path = repo.path().join("conflict.txt");
     fs::write(&conflict_path, "base\n").expect("failed to write conflict.txt");
@@ -83,16 +83,25 @@ fn test_explicit_path_checkpoint_skips_conflicted_files() {
         "merge should leave conflict.txt unmerged"
     );
 
+    fs::write(&conflict_path, "resolved by ai\n").expect("failed to write resolved content");
     repo.git_ai(&["checkpoint", "mock_ai", "conflict.txt"])
-        .expect("explicit conflict checkpoint should succeed without recording entries");
+        .expect("explicit resolved conflict checkpoint should succeed");
 
     let checkpoints = repo
         .current_working_logs()
         .read_all_checkpoints()
         .expect("checkpoints should be readable");
-    assert!(
-        checkpoints.is_empty(),
-        "explicit-path checkpoints should skip conflicted files entirely"
+    let latest = checkpoints.last().expect("latest checkpoint should exist");
+    let latest_files = latest
+        .entries
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        latest_files,
+        vec!["conflict.txt"],
+        "explicit-path checkpoints should track resolved worktree content even before staging"
     );
 }
 

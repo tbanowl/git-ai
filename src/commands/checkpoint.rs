@@ -617,18 +617,8 @@ fn resolve_explicit_path_execution(
         // filesystems, so look up with NFC to handle the mismatch.
         let nfc_key: String = normalized_path.nfc().collect();
         let status_entry = explicit_statuses.get(&nfc_key);
-        if matches!(status_entry, Some(entry) if entry.kind == EntryKind::Unmerged) {
-            continue;
-        }
-
         let explicit_dirty_content =
             explicit_dirty_file_content_if_text(working_log, &normalized_path);
-        if status_entry.is_none()
-            && explicit_dirty_content.is_none()
-            && !preserve_unchanged_explicit_paths
-        {
-            continue;
-        }
 
         if let Some(content) = explicit_dirty_content {
             resolved_dirty_files.insert(normalized_path.clone(), content);
@@ -642,9 +632,12 @@ fn resolve_explicit_path_execution(
                 if entry.staged == StatusCode::Deleted || entry.unstaged == StatusCode::Deleted
         );
 
-        if is_text_file(working_log, &normalized_path)
-            || (is_deleted && is_text_file_in_head(repo, &normalized_path))
-        {
+        let is_text = is_text_file(working_log, &normalized_path);
+        if status_entry.is_none() && !is_text && !preserve_unchanged_explicit_paths {
+            continue;
+        }
+
+        if is_text || (is_deleted && is_text_file_in_head(repo, &normalized_path)) {
             files.push(normalized_path);
         }
     }

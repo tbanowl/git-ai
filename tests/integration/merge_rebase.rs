@@ -314,9 +314,9 @@ fn test_merge_conflict_ai_resolution_outside_session() {
     let resolved_content = "class App:\n    def feature(): pass\n    def main(): pass\n";
     fs::write(repo.path().join("app.py"), resolved_content).unwrap();
 
-    // Stage the resolved file first.  The checkpoint skips files that git still considers
-    // "unmerged" (i.e. not yet staged after conflict resolution), so we must `git add`
-    // before calling checkpoint to ensure the file is processed and attributed.
+    // Stage the resolved file first to cover the traditional post-resolution workflow.
+    // `test_merge_conflict_ai_resolution_checkpoint_before_add` covers the explicit
+    // checkpoint-before-staging workflow.
     repo.git(&["add", "app.py"]).unwrap();
 
     // Checkpoint attributes the staged content to mock_ai.
@@ -336,7 +336,48 @@ fn test_merge_conflict_ai_resolution_outside_session() {
     ]);
 }
 
+#[test]
+fn test_merge_conflict_ai_resolution_checkpoint_before_add() {
+    let repo = TestRepo::new();
+
+    let mut file = repo.filename("app.py");
+    file.set_contents(crate::lines!["class App:", "    pass"]);
+    repo.stage_all_and_commit("initial").unwrap();
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("app.py");
+    feature_file.replace_at(1, "    def feature(): pass".ai());
+    repo.stage_all_and_commit("feature AI change").unwrap();
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    let mut main_file = repo.filename("app.py");
+    main_file.replace_at(1, "    def main(): pass");
+    repo.stage_all_and_commit("main human change").unwrap();
+
+    let merge_result = repo.git(&["merge", "feature"]);
+    assert!(
+        merge_result.is_err(),
+        "merge should conflict because both branches modified the same line"
+    );
+
+    use std::fs;
+    let resolved_content = "class App:\n    def feature(): pass\n    def main(): pass\n";
+    fs::write(repo.path().join("app.py"), resolved_content).unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai", "app.py"]).unwrap();
+    repo.git(&["add", "app.py"]).unwrap();
+    repo.stage_all_and_commit("merge resolved by AI").unwrap();
+
+    file.assert_lines_and_blame(crate::lines![
+        "class App:".human(),
+        "    def feature(): pass".ai(),
+        "    def main(): pass".ai(),
+    ]);
+}
+
 crate::reuse_tests_in_worktree!(
     test_blame_after_merge_conflict_resolution,
     test_merge_conflict_ai_resolution_outside_session,
+    test_merge_conflict_ai_resolution_checkpoint_before_add,
 );
