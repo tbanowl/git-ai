@@ -94,11 +94,7 @@ fn direct_git_command_spawns_are_centralized() {
     let mut files = Vec::new();
     collect_rs_files(&src_root, &mut files);
 
-    let allowed_suffixes = [
-        "src/git/repository.rs",
-        "src/commands/git_handlers.rs",
-        "src/git/test_utils/mod.rs",
-    ];
+    let allowed_suffixes = ["src/git/repository.rs", "src/commands/git_handlers.rs"];
     let pattern = Regex::new(r#"Command::new\(config::Config::get\(\)\.git_cmd\(\)\)"#).unwrap();
 
     for file in files {
@@ -117,6 +113,29 @@ fn direct_git_command_spawns_are_centralized() {
             !pattern.is_match(&content),
             "direct git command spawn found in {}: route through centralized repository exec helpers",
             file.display()
+        );
+    }
+}
+
+#[test]
+fn ref_cursor_does_not_spawn_git_on_trace_ingestion_path() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("daemon")
+        .join("ref_cursor.rs");
+    let content = fs::read_to_string(&file).unwrap();
+    for disallowed in [
+        "Command::new(",
+        "exec_git(",
+        "exec_git_allow_nonzero(",
+        "exec_git_stdin(",
+        "exec_git_stdin_with_profile(",
+    ] {
+        assert!(
+            !content.contains(disallowed),
+            "{} must not contain `{}`; trace2 ingestion must not spawn git",
+            file.display(),
+            disallowed
         );
     }
 }

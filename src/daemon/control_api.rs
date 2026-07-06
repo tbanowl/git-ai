@@ -1,88 +1,91 @@
-use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
-use crate::daemon::domain::RepoContext;
+use crate::authorship::working_log::AgentId;
+use crate::commands::checkpoint_agent::bash_tool::StatSnapshot;
+use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
 use crate::metrics::MetricEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum ControlRequest {
+    #[serde(rename = "ping")]
+    Ping,
     #[serde(rename = "checkpoint.run")]
-    CheckpointRun {
-        request: Box<CheckpointRunRequest>,
-        wait: Option<bool>,
-    },
+    CheckpointRun { request: Box<CheckpointRequest> },
+    #[serde(rename = "sync.family")]
+    SyncFamily { repo_working_dir: String },
     #[serde(rename = "status.family")]
     StatusFamily { repo_working_dir: String },
     #[serde(rename = "telemetry.submit")]
     SubmitTelemetry { envelopes: Vec<TelemetryEnvelope> },
     #[serde(rename = "cas.submit")]
     SubmitCas { records: Vec<CasSyncPayload> },
-    #[serde(rename = "wrapper.pre_state")]
-    WrapperPreState {
-        invocation_id: String,
-        repo_working_dir: String,
-        repo_context: RepoContext,
-    },
-    #[serde(rename = "wrapper.post_state")]
-    WrapperPostState {
-        invocation_id: String,
-        repo_working_dir: String,
-        repo_context: RepoContext,
-    },
+    /// Signal the daemon that new notes are pending in notes-db and should be flushed.
+    #[serde(rename = "notes.flush")]
+    FlushNotes,
     #[serde(rename = "snapshot.watermarks")]
     SnapshotWatermarks { repo_working_dir: String },
+    #[serde(rename = "bash_session.start")]
+    BashSessionStart {
+        repo_work_dir: String,
+        original_cwd: Option<String>,
+        session_id: String,
+        tool_use_id: String,
+        agent_id: AgentId,
+        metadata: HashMap<String, String>,
+        stat_snapshot: Box<StatSnapshot>,
+        trace_id: String,
+        started_at_ns: u128,
+        command: Option<String>,
+    },
+    #[serde(rename = "bash_session.end")]
+    BashSessionEnd {
+        repo_work_dir: String,
+        original_cwd: Option<String>,
+        session_id: String,
+        tool_use_id: String,
+        agent_id: AgentId,
+        metadata: HashMap<String, String>,
+        trace_id: String,
+        ended_at_ns: u128,
+        command: Option<String>,
+    },
+    #[serde(rename = "bash_session.query")]
+    BashSessionQuery { repo_work_dir: String },
+    #[serde(rename = "bash_snapshot.query")]
+    BashSnapshotQuery {
+        session_id: String,
+        tool_use_id: String,
+    },
+    #[serde(rename = "bash_hook_attempt.start")]
+    BashHookAttemptStart {
+        original_cwd: String,
+        discovered_repo_work_dir: Option<String>,
+        repo_discovery_error: Option<String>,
+        session_id: String,
+        tool_use_id: String,
+        agent_id: AgentId,
+        metadata: HashMap<String, String>,
+        trace_id: String,
+        started_at_ns: u128,
+        command: Option<String>,
+    },
+    #[serde(rename = "bash_hook_attempt.end")]
+    BashHookAttemptEnd {
+        original_cwd: String,
+        discovered_repo_work_dir: Option<String>,
+        repo_discovery_error: Option<String>,
+        session_id: String,
+        tool_use_id: String,
+        agent_id: AgentId,
+        metadata: HashMap<String, String>,
+        trace_id: String,
+        ended_at_ns: u128,
+        command: Option<String>,
+    },
     #[serde(rename = "shutdown")]
     Shutdown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "request_type", rename_all = "snake_case")]
-pub enum CheckpointRunRequest {
-    Live(Box<LiveCheckpointRunRequest>),
-    Captured(CapturedCheckpointRunRequest),
-}
-
-impl CheckpointRunRequest {
-    pub fn repo_working_dir(&self) -> &str {
-        match self {
-            Self::Live(request) => &request.repo_working_dir,
-            Self::Captured(request) => &request.repo_working_dir,
-        }
-    }
-
-    pub fn is_pre_commit(&self) -> bool {
-        match self {
-            Self::Live(request) => request.is_pre_commit.unwrap_or(false),
-            Self::Captured(_) => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LiveCheckpointRunRequest {
-    #[serde(default)]
-    pub repo_working_dir: String,
-    /// External control inputs may still send compatibility aliases such as
-    /// `known_human`; daemon execution normalizes them before running a checkpoint.
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub author: Option<String>,
-    #[serde(default)]
-    pub quiet: Option<bool>,
-    #[serde(default)]
-    pub is_pre_commit: Option<bool>,
-    #[serde(default)]
-    pub agent_run_result: Option<AgentRunResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CapturedCheckpointRunRequest {
-    #[serde(default)]
-    pub repo_working_dir: String,
-    #[serde(default)]
-    pub capture_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +117,21 @@ impl ControlResponse {
             error: Some(msg.into()),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BashSessionQueryResponse {
+    pub active: bool,
+    pub agent_id: Option<AgentId>,
+    pub session_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BashSnapshotQueryResponse {
+    pub found: bool,
+    pub stat_snapshot: Option<StatSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

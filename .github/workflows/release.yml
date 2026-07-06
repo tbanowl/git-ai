@@ -1,9 +1,7 @@
 name: Release Build
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 on:
   workflow_dispatch:
@@ -20,22 +18,73 @@ on:
         type: boolean
 
 jobs:
+  authorize-admin:
+    name: Authorize admin release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify workflow actor is a repository admin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_PRODUCTION: ${{ inputs.release_production }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$RELEASE_PRODUCTION" == "true" && "$DRY_RUN" != "true" && "$REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::Production releases must run from ${DEFAULT_BRANCH}, not ${REF_NAME}. Use dry_run=true or release_production=false for branch builds."
+            exit 1
+          fi
+
+          for user in "$ACTOR" "$TRIGGERING_ACTOR"; do
+            permission="$(gh api "repos/${REPOSITORY}/collaborators/${user}/permission" --jq '.permission')"
+            if [[ "$permission" != "admin" ]]; then
+              echo "::error::${user} has ${permission} access. Only repository admins can run or rerun the release workflow."
+              exit 1
+            fi
+          done
+
   build:
     name: Build for ${{ matrix.target }}
+    needs: authorize-admin
     runs-on: ${{ matrix.os }}
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     strategy:
       matrix:
         include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: git-ai-linux-x64
+            use_docker: true
+            docker_image: ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_name: git-ai-linux-arm64
+            use_docker: true
+            docker_image: ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: git-ai-windows-x64
             use_docker: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_name: git-ai-windows-arm64
+            use_docker: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: git-ai-macos-arm64
+            use_docker: false
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Get version from Cargo.toml
         id: get-version
@@ -58,7 +107,7 @@ jobs:
             bash -c "
               apt-get update && \
               apt-get install -y curl build-essential pkg-config musl-tools && \
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }} && \
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 --target ${{ matrix.target }} && \
               . \$HOME/.cargo/env && \
               cargo build --release --target ${{ matrix.target }} && \
               strip target/${{ matrix.target }}/release/git-ai
@@ -66,14 +115,14 @@ jobs:
 
       - name: Install Rust toolchain (non-Docker)
         if: matrix.use_docker == false
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: "1.93.0"
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies (non-Docker)
         if: matrix.use_docker == false
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
@@ -162,21 +211,95 @@ jobs:
           path: release/${{ matrix.artifact_name }}
           retention-days: 30
 
+  build-macos-intel:
+    name: Build for macOS Intel
+    needs: authorize-admin
+    runs-on: macos-15-intel
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Get version from Cargo.toml
+        id: get-version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.93.0"
+          targets: x86_64-apple-darwin
+
+      - name: Cache dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-x86_64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-x86_64-apple-darwin-
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+        env:
+          CARGO_INCREMENTAL: 0
+          SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          OSS_BUILD: "1"
+
+      - name: Verify binary architecture
+        run: |
+          file target/x86_64-apple-darwin/release/git-ai
+          lipo -info target/x86_64-apple-darwin/release/git-ai
+
+      - name: Strip binary
+        run: |
+          strip target/x86_64-apple-darwin/release/git-ai
+
+      - name: Create release directory
+        run: |
+          mkdir -p release
+
+      - name: Copy binary to release directory
+        run: |
+          cp target/x86_64-apple-darwin/release/git-ai release/git-ai-macos-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: git-ai-macos-x64
+          path: release/git-ai-macos-x64
+          retention-days: 30
+
   create-release:
     name: Create Release
-    needs: [build]
+    needs: [build, build-macos-intel]
     runs-on: ubuntu-latest
     if: success() && inputs.dry_run != true
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Determine release metadata
         id: release-meta
         shell: bash
+        env:
+          BASE_VERSION: ${{ needs.build.outputs.version }}
+          IS_PRODUCTION: ${{ inputs.release_production }}
         run: |
           set -euo pipefail
-          BASE_VERSION="${{ needs.build.outputs.version }}"
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          if [[ "${{ inputs.release_production }}" == 'true' ]]; then
+          if [[ "$IS_PRODUCTION" == 'true' ]]; then
             RELEASE_TAG="$BASE_VERSION"
             CHANNEL="latest"
             PRERELEASE="false"
@@ -222,7 +345,7 @@ jobs:
           fi
 
       - name: Checkout code for install script
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           path: repo
 
@@ -279,7 +402,7 @@ jobs:
             release/SHA256SUMS
 
       - name: Create Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ steps.release-meta.outputs.tag_name }}
           name: ${{ steps.release-meta.outputs.release_name }}
@@ -299,13 +422,23 @@ jobs:
             ### Installation
             Install this specific version with checksum verification:
 
+            **macOS/Linux:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.sh | bash
+            ```
+
             **Windows (PowerShell):**
             ```powershell
             irm https://github.com/${{ github.repository }}/releases/download/${{ steps.release-meta.outputs.tag_name }}/install.ps1 | iex
             ```
 
             ### Downloads
+            - **Linux (x64)**: `git-ai-linux-x64`
+            - **Linux (ARM64)**: `git-ai-linux-arm64`
             - **Windows (x64)**: `git-ai-windows-x64.exe`
+            - **Windows (ARM64)**: `git-ai-windows-arm64.exe`
+            - **macOS (Intel)**: `git-ai-macos-x64`
+            - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
 
             ### SHA256 Checksums
             ```
@@ -328,16 +461,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate release bot token
+        if: inputs.release_production == true
+        id: release-bot-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: 3481373
+          private-key: ${{ secrets.GIT_AI_INTERNAL_RELEASE_BOT_PRIVATE_KEY }}
+
       - name: Checkout code for version bump
         if: inputs.release_production == true
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.release-bot-token.outputs.token }}
           fetch-depth: 0
 
       - name: Install Rust toolchain
         if: inputs.release_production == true
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
 
@@ -358,11 +499,11 @@ jobs:
           echo "New version: $NEW_VERSION"
           
           # Update Cargo.toml
-          sed -i.bak "s/^version = \"${CURRENT_VERSION}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+          sed -i.bak "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
           rm Cargo.toml.bak
           
           # Update flake.nix version to match
-          sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NEW_VERSION}\"/" flake.nix
+          sed -i.bak "s/version = \".*\"/version = \"${NEW_VERSION}\"/" flake.nix
           rm flake.nix.bak
           
           # Update Cargo.lock
@@ -377,6 +518,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock flake.nix
           git commit -m "chore: bump version to ${{ steps.bump-version.outputs.new_version }} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
       - name: Trigger release channel update

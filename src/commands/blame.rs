@@ -1,17 +1,16 @@
 use crate::auth::CredentialStore;
-use crate::authorship::authorship_log::PromptRecord;
+use crate::authorship::authorship_log::{HumanRecord, PromptRecord, SessionRecord};
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
-use crate::authorship::prompt_utils::enrich_prompt_messages;
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
-use crate::git::refs::get_reference_as_authorship_log_v3;
+use crate::git::notes_api::read_authorship_v3 as get_reference_as_authorship_log_v3;
 use crate::git::repository::Repository;
 use crate::git::repository::{exec_git, exec_git_stdin};
 #[cfg(windows)]
 use crate::utils::normalize_to_posix;
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::sync::LazyLock;
@@ -55,13 +54,20 @@ pub struct BlameHunk {
     pub committer_tz: String,
     /// Whether this is a boundary commit
     pub is_boundary: bool,
+    /// The filename at the blamed commit (may differ from current if file was renamed)
+    #[serde(default)]
+    pub orig_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BlameAnalysisResult {
     pub line_authors: HashMap<u32, String>,
     pub prompt_records: HashMap<String, PromptRecord>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub session_records: HashMap<String, SessionRecord>,
     pub blame_hunks: Vec<BlameHunk>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub humans: BTreeMap<String, HumanRecord>,
 }
 
 struct PreparedBlameRequest {
@@ -162,6 +168,7 @@ pub struct GitAiBlameOptions {
 
     // Split hunks when lines have different AI human authors
     // When true, a single git blame hunk may be split into multiple hunks
+    // if different lines were authored by different humans working with AI
     pub split_hunks_by_ai_author: bool,
 }
 
@@ -311,7 +318,7 @@ impl Repository {
         } else if let Some(ref commit) = options.newest_commit {
             // Read file content from the specified commit.
             // This ensures blame is independent of which branch is checked out.
-            let commit_obj = self.revparse_single(commit)?.peel_to_commit()?;
+            let commit_obj = self.find_commit(commit.clone())?;
             let tree = commit_obj.tree()?;
 
             match tree.get_path(std::path::Path::new(relative_file_path)) {
@@ -404,14 +411,23 @@ impl Repository {
         let blame_hunks = self.blame_hunks_for_ranges(relative_file_path, line_ranges, options)?;
 
         // Step 2: Overlay AI authorship information.
-        let (line_authors, prompt_records, authorship_logs, prompt_commits, commits_with_notes) =
-            overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
+        let (
+            line_authors,
+            prompt_records,
+            session_records,
+            humans,
+            authorship_logs,
+            prompt_commits,
+            commits_with_notes,
+        ) = overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
 
         Ok((
             BlameAnalysisResult {
                 line_authors,
                 prompt_records,
+                session_records,
                 blame_hunks,
+                humans,
             },
             authorship_logs,
             prompt_commits,
@@ -441,8 +457,6 @@ impl Repository {
         requests_by_len: &HashMap<usize, Vec<String>>,
     ) -> HashMap<(String, usize), String> {
         let mut resolved: HashMap<(String, usize), String> = HashMap::new();
-        let git2_repo = git2::Repository::open(self.path()).ok();
-        let odb = git2_repo.as_ref().and_then(|repo| repo.odb().ok());
 
         for (&requested_len, commit_shas) in requests_by_len {
             if commit_shas.is_empty() {
@@ -450,29 +464,28 @@ impl Repository {
             }
 
             for commit_sha_batch in commit_shas.chunks(Self::BLAME_ABBREV_BATCH_SIZE) {
-                if let Some(odb) = odb.as_ref() {
-                    for commit_sha in commit_sha_batch {
-                        let resolved_abbrev =
-                            git2::Oid::from_str(commit_sha).ok().and_then(|full_oid| {
-                                (requested_len.min(commit_sha.len())..=commit_sha.len()).find_map(
-                                    |len| {
-                                        let prefix = &commit_sha[..len];
-                                        let short_oid = git2::Oid::from_str(prefix).ok()?;
-                                        let found_oid = odb.exists_prefix(short_oid, len).ok()?;
-                                        (found_oid == full_oid).then(|| prefix.to_string())
-                                    },
-                                )
-                            });
+                let mut args = self.global_args_for_exec();
+                args.push("rev-parse".to_string());
+                args.push(format!("--short={requested_len}"));
+                args.extend(commit_sha_batch.iter().cloned());
 
-                        if let Some(short_sha) = resolved_abbrev {
-                            resolved.insert((commit_sha.clone(), requested_len), short_sha);
-                        } else {
-                            resolved
-                                .entry((commit_sha.clone(), requested_len))
-                                .or_insert_with(|| {
-                                    Self::fallback_blame_abbrev_sha(commit_sha, requested_len)
-                                });
-                        }
+                let batched_result = exec_git(&args)
+                    .ok()
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(|stdout| {
+                        stdout
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    });
+
+                if let Some(short_shas) = batched_result
+                    && short_shas.len() == commit_sha_batch.len()
+                {
+                    for (commit_sha, short_sha) in commit_sha_batch.iter().zip(short_shas) {
+                        resolved.insert((commit_sha.clone(), requested_len), short_sha);
                     }
                     continue;
                 }
@@ -542,7 +555,9 @@ impl Repository {
         let BlameAnalysisResult {
             line_authors,
             prompt_records,
+            session_records: _,
             blame_hunks: _,
+            humans: _,
         } = analysis;
 
         if request.options.no_output {
@@ -725,6 +740,7 @@ impl Repository {
             committer_time: i64,
             committer_tz: String,
             boundary: bool,
+            filename: Option<String>,
         }
 
         let mut hunks: Vec<BlameHunk> = Vec::new();
@@ -794,6 +810,10 @@ impl Repository {
                 cur_meta.boundary = true;
                 continue;
             }
+            if let Some(rest) = line.strip_prefix("filename ") {
+                cur_meta.filename = Some(crate::utils::unescape_git_path(rest));
+                continue;
+            }
 
             // Header line: either 4 fields (new hunk) or 3 fields (continuation)
             let mut parts = line.split_whitespace();
@@ -827,6 +847,7 @@ impl Repository {
                         orig_start
                     };
 
+                    let orig_filename = cur_meta.filename.take().filter(|f| f != file_path);
                     hunks.push(BlameHunk {
                         range: (start, end),
                         orig_range: (orig_start, orig_end),
@@ -842,6 +863,7 @@ impl Repository {
                         committer_time: cur_meta.committer_time,
                         committer_tz: cur_meta.committer_tz.clone(),
                         is_boundary: cur_meta.boundary,
+                        orig_filename,
                     });
                 }
 
@@ -885,6 +907,7 @@ impl Repository {
                 orig_start
             };
 
+            let orig_filename = cur_meta.filename.take().filter(|f| f != file_path);
             hunks.push(BlameHunk {
                 range: (start, end),
                 orig_range: (orig_start, orig_end),
@@ -900,6 +923,7 @@ impl Repository {
                 committer_time: cur_meta.committer_time,
                 committer_tz: cur_meta.committer_tz.clone(),
                 is_boundary: cur_meta.boundary,
+                orig_filename,
             });
         }
 
@@ -1026,6 +1050,8 @@ fn overlay_ai_authorship(
     (
         HashMap<u32, String>,
         HashMap<String, PromptRecord>,
+        HashMap<String, SessionRecord>,
+        BTreeMap<String, HumanRecord>, // humans map
         Vec<AuthorshipLog>,
         HashMap<String, Vec<String>>,      // prompt_hash -> commit_shas
         std::collections::HashSet<String>, // commit SHAs with real authorship notes
@@ -1034,6 +1060,8 @@ fn overlay_ai_authorship(
 > {
     let mut line_authors: HashMap<u32, String> = HashMap::new();
     let mut prompt_records: HashMap<String, PromptRecord> = HashMap::new();
+    let mut session_records: HashMap<String, SessionRecord> = HashMap::new();
+    let mut humans: BTreeMap<String, HumanRecord> = BTreeMap::new();
     // Track which commits contain each prompt hash
     let mut prompt_commits: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     // Track commit SHAs that have real (non-simulated) authorship notes
@@ -1062,8 +1090,25 @@ fn overlay_ai_authorship(
         // If we have AI authorship data, look up the author for lines in this hunk
         if let Some(ref authorship_log) = authorship_log {
             commits_with_notes.insert(hunk.commit_sha.clone());
+
+            // Collect humans from this authorship log
+            for (human_id, human_record) in &authorship_log.metadata.humans {
+                humans
+                    .entry(human_id.clone())
+                    .or_insert_with(|| human_record.clone());
+            }
+
+            // Collect session records from this authorship log
+            for (session_id, session_record) in &authorship_log.metadata.sessions {
+                session_records
+                    .entry(session_id.clone())
+                    .or_insert_with(|| session_record.clone());
+            }
+
             // Check each line in this hunk for AI authorship using compact schema
             // IMPORTANT: Use the original line numbers from the commit, not the current line numbers
+            // Use the original filename from git blame (handles renames)
+            let lookup_path = hunk.orig_filename.as_deref().unwrap_or(file_path);
             let num_lines = hunk.range.1 - hunk.range.0 + 1;
             for i in 0..num_lines {
                 let current_line_num = hunk.range.0 + i;
@@ -1071,7 +1116,7 @@ fn overlay_ai_authorship(
 
                 if let Some((author, prompt_hash, prompt)) = authorship_log.get_line_attribution(
                     repo,
-                    file_path,
+                    lookup_path,
                     orig_line_num,
                     &mut foreign_prompts_cache,
                 ) {
@@ -1091,8 +1136,22 @@ fn overlay_ai_authorship(
                         }
 
                         prompt_records.insert(prompt_hash, prompt_record.clone());
+                    } else if let Some(ref hash) = prompt_hash
+                        && hash.starts_with("h_")
+                    {
+                        // Known human attestation (h_-prefixed hash from KnownHuman checkpoint)
+                        if options.use_prompt_hashes_as_names {
+                            line_authors.insert(current_line_num, hash.clone());
+                        } else if options.return_human_authors_as_human {
+                            line_authors.insert(
+                                current_line_num,
+                                CheckpointKind::Human.to_str().to_string(),
+                            );
+                        } else {
+                            line_authors.insert(current_line_num, author.username.clone());
+                        }
                     } else {
-                        // Has authorship log but line not AI
+                        // Has authorship log but line not AI and not KnownHuman = unattested
                         if options.return_human_authors_as_human {
                             line_authors.insert(
                                 current_line_num,
@@ -1208,6 +1267,8 @@ fn overlay_ai_authorship(
     Ok((
         line_authors,
         prompt_records,
+        session_records,
+        humans,
         authorship_logs,
         prompt_commits_vec,
         commits_with_notes,
@@ -1328,12 +1389,8 @@ fn output_json_format(
     // Only include prompts that are actually referenced in lines
     let referenced_prompt_ids: std::collections::HashSet<&String> = lines_map.values().collect();
 
-    // Enrich prompts that have empty messages by falling back through storage layers
-    let mut enriched_prompts = prompt_records.clone();
-    enrich_prompt_messages(&mut enriched_prompts, &referenced_prompt_ids);
-
     // Create read models with other_files and commits populated
-    let filtered_prompts: HashMap<String, PromptRecordWithOtherFiles> = enriched_prompts
+    let filtered_prompts: HashMap<String, PromptRecordWithOtherFiles> = prompt_records
         .iter()
         .filter(|(k, _)| referenced_prompt_ids.contains(k))
         .map(|(k, v)| {
@@ -1358,7 +1415,7 @@ fn output_json_format(
         .map(|creds| !creds.is_refresh_token_expired())
         .unwrap_or(false);
 
-    let current_user = repo.git_author_identity().formatted();
+    let current_user = repo.effective_author_identity().formatted();
 
     let output = JsonBlameOutput {
         lines: lines_map,
@@ -1805,39 +1862,6 @@ fn output_default_format(
         // Append git-like stats lines to output string
         let stats = "num read blob: 1\nnum get patch: 0\nnum commits: 0\n";
         output.push_str(stats);
-    }
-
-    // Append prompt dump for --show-prompt in non-interactive (piped) mode
-    if options.show_prompt && !io::stdout().is_terminal() {
-        let mut referenced_ids: std::collections::HashSet<&String> =
-            std::collections::HashSet::new();
-        for author in line_authors.values() {
-            if prompt_records.contains_key(author) {
-                referenced_ids.insert(author);
-            }
-        }
-
-        if !referenced_ids.is_empty() {
-            let mut enriched_prompts = prompt_records.clone();
-            enrich_prompt_messages(&mut enriched_prompts, &referenced_ids);
-
-            output.push_str("---\n");
-
-            let mut sorted_ids: Vec<&String> = referenced_ids.into_iter().collect();
-            sorted_ids.sort();
-
-            for id in sorted_ids {
-                let short_hash = &id[..7.min(id.len())];
-                output.push_str(&format!("Prompt [{}]\n", short_hash));
-                if let Some(prompt) = enriched_prompts.get(id) {
-                    let json = serde_json::to_string(&prompt.messages)
-                        .unwrap_or_else(|_| "[]".to_string());
-                    output.push_str(&json);
-                    output.push('\n');
-                }
-                output.push('\n');
-            }
-        }
     }
 
     // Output handling - respect pager environment variables

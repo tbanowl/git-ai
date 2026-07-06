@@ -12,68 +12,6 @@ use std::path::PathBuf;
 use std::process::Command;
 #[cfg(not(unix))]
 use std::process::Stdio;
-use uuid::Uuid;
-
-fn shim_mode() -> Option<String> {
-    env::var("GIT_AI_TEST_GIT_SHIM_MODE").ok()
-}
-
-fn write_optional_file(path_var: &str, contents: &str) -> Result<(), String> {
-    let Ok(path) = env::var(path_var) else {
-        return Ok(());
-    };
-    fs::write(path, contents).map_err(|e| format!("write {path_var} failed: {e}"))
-}
-
-fn run_sleep_always_mode() -> Result<(), String> {
-    write_optional_file(
-        "GIT_AI_TEST_GIT_SHIM_PID_FILE",
-        &std::process::id().to_string(),
-    )?;
-
-    let sleep_ms = env::var("GIT_AI_TEST_GIT_SHIM_SLEEP_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1000);
-    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-    Ok(())
-}
-
-fn run_stderr_once_then_success_mode() -> Result<bool, String> {
-    let state_file = env::var("GIT_AI_TEST_GIT_SHIM_STATE_FILE")
-        .map_err(|_| "GIT_AI_TEST_GIT_SHIM_STATE_FILE is required".to_string())?;
-    let current_attempt = fs::read_to_string(&state_file)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    let next_attempt = current_attempt + 1;
-    fs::write(&state_file, next_attempt.to_string())
-        .map_err(|e| format!("write state file failed: {e}"))?;
-
-    if current_attempt == 0 {
-        let stderr = env::var("GIT_AI_TEST_GIT_SHIM_STDERR")
-            .unwrap_or_else(|_| "shim stderr_once_then_success".to_string());
-        let exit_code = env::var("GIT_AI_TEST_GIT_SHIM_EXIT_CODE")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(1);
-        eprintln!("{stderr}");
-        std::process::exit(exit_code);
-    }
-
-    Ok(true)
-}
-
-fn maybe_run_test_mode() -> Result<bool, String> {
-    match shim_mode().as_deref() {
-        Some("sleep_always") => {
-            run_sleep_always_mode()?;
-            Ok(true)
-        }
-        Some("stderr_once_then_success") => run_stderr_once_then_success_mode(),
-        _ => Ok(false),
-    }
-}
 
 #[derive(Serialize)]
 struct StartedGitInvocationLogEntry {
@@ -83,19 +21,17 @@ struct StartedGitInvocationLogEntry {
     test_sync_session: Option<String>,
 }
 
-fn select_target(argv: &[String]) -> Result<(String, bool), String> {
+fn select_target(argv: &[String]) -> Result<String, String> {
     let tracked_target = env::var("GIT_AI_TEST_GIT_SHIM_TARGET")
         .map_err(|_| "GIT_AI_TEST_GIT_SHIM_TARGET is required".to_string())?;
     let fallback_target =
         env::var("GIT_AI_TEST_GIT_SHIM_FALLBACK_TARGET").unwrap_or_else(|_| tracked_target.clone());
-    let tracked_target_uses_git_ai =
-        env::var("GIT_AI_TEST_GIT_SHIM_TARGET_USE_GIT_AI").as_deref() == Ok("1");
     let cwd = env::current_dir().map_err(|e| format!("read shim cwd failed: {e}"))?;
     let parsed = tracked_parsed_git_invocation_for_test_sync(argv, &cwd);
     if tracks_parsed_git_invocation_for_test_sync(&parsed) {
-        Ok((tracked_target, tracked_target_uses_git_ai))
+        Ok(tracked_target)
     } else {
-        Ok((fallback_target, false))
+        Ok(fallback_target)
     }
 }
 
@@ -136,7 +72,7 @@ fn append_started_log(
 }
 
 fn new_test_sync_session() -> String {
-    format!("gt-shim-{}", Uuid::new_v4())
+    format!("gt-shim-{}", git_ai::uuid::generate_v4())
 }
 
 fn argv_with_test_sync_session(argv: &[String], test_sync_session: &str) -> Vec<String> {
@@ -151,28 +87,22 @@ fn argv_with_test_sync_session(argv: &[String], test_sync_session: &str) -> Vec<
 }
 
 #[cfg(unix)]
-fn exec_target(target: &str, argv: &[String], use_git_ai_wrapper_mode: bool) -> ! {
+fn exec_target(target: &str, argv: &[String]) -> ! {
     let mut command = Command::new(target);
     command.args(argv);
-    if use_git_ai_wrapper_mode {
-        command.env("GIT_AI", "git");
-    }
     let error = command.exec();
     eprintln!("git-ai-test-git-shim failed to exec {target}: {error}");
     std::process::exit(127);
 }
 
 #[cfg(not(unix))]
-fn exec_target(target: &str, argv: &[String], use_git_ai_wrapper_mode: bool) -> ! {
+fn exec_target(target: &str, argv: &[String]) -> ! {
     let mut command = Command::new(target);
     command
         .args(argv)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if use_git_ai_wrapper_mode {
-        command.env("GIT_AI", "git");
-    }
     match command.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => {
@@ -185,11 +115,7 @@ fn exec_target(target: &str, argv: &[String], use_git_ai_wrapper_mode: bool) -> 
 #[cfg(unix)]
 fn main() {
     let argv = env::args().skip(1).collect::<Vec<_>>();
-    let (target, use_git_ai_wrapper_mode) =
-        select_target(&argv).unwrap_or_else(|error| panic!("{error}"));
-    if maybe_run_test_mode().unwrap_or_else(|error| panic!("{error}")) {
-        std::process::exit(0);
-    }
+    let target = select_target(&argv).unwrap_or_else(|error| panic!("{error}"));
     let mut effective_argv = argv.clone();
     let mut test_sync_session = None;
     if let Ok(log_path) = env::var("GIT_AI_TEST_SYNC_START_LOG") {
@@ -207,17 +133,13 @@ fn main() {
             panic!("git-ai-test-git-shim failed: {error}");
         }
     }
-    exec_target(&target, &effective_argv, use_git_ai_wrapper_mode);
+    exec_target(&target, &effective_argv);
 }
 
 #[cfg(not(unix))]
 fn main() {
     let argv = env::args().skip(1).collect::<Vec<_>>();
-    let (target, use_git_ai_wrapper_mode) =
-        select_target(&argv).unwrap_or_else(|error| panic!("{error}"));
-    if maybe_run_test_mode().unwrap_or_else(|error| panic!("{error}")) {
-        std::process::exit(0);
-    }
+    let target = select_target(&argv).unwrap_or_else(|error| panic!("{error}"));
     let mut effective_argv = argv.clone();
     let mut test_sync_session = None;
     if let Ok(log_path) = env::var("GIT_AI_TEST_SYNC_START_LOG") {
@@ -235,5 +157,5 @@ fn main() {
             panic!("git-ai-test-git-shim failed: {error}");
         }
     }
-    exec_target(&target, &effective_argv, use_git_ai_wrapper_mode)
+    exec_target(&target, &effective_argv)
 }

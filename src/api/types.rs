@@ -1,7 +1,7 @@
 use crate::authorship::authorship_log::{LineRange, PromptRecord};
 use crate::commands::diff::FileDiffJson;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// File record for API - converts LineRange annotations to API format
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +118,32 @@ pub struct CasMessagesObject {
     pub messages: Vec<crate::authorship::transcript::Message>,
 }
 
+/// A single authorship note entry (commit SHA + content).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NoteEntry {
+    pub commit_sha: String,
+    pub content: String,
+}
+
+/// Request body for uploading notes to the HTTP backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotesUploadRequest {
+    pub entries: Vec<NoteEntry>,
+}
+
+/// Response from a notes upload request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesUploadResponse {
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
+/// Response from a notes read request — maps commit_sha → note content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotesReadResponse {
+    pub notes: std::collections::HashMap<String, String>,
+}
+
 /// Single result from CA prompt store batch read
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CAPromptStoreReadResult {
@@ -137,155 +163,118 @@ pub struct CAPromptStoreReadResponse {
     pub failure_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesListRequest {
-    pub repo_url: String,
+/// Daemon diagnostics upload protocol version.
+pub const DAEMON_LOGS_UPLOAD_VERSION: u8 = 1;
+
+/// Kind of daemon diagnostic event accepted by `/worker/logs/upload`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLogKind {
+    Log,
+    Heartbeat,
+}
+
+/// Log level accepted by `/worker/logs/upload`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DaemonLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Primitive daemon log field value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DaemonLogFieldValue {
+    String(String),
+    Number(serde_json::Number),
+    Bool(bool),
+    Null,
+}
+
+impl From<String> for DaemonLogFieldValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for DaemonLogFieldValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<u64> for DaemonLogFieldValue {
+    fn from(value: u64) -> Self {
+        Self::Number(serde_json::Number::from(value))
+    }
+}
+
+impl From<i64> for DaemonLogFieldValue {
+    fn from(value: i64) -> Self {
+        Self::Number(serde_json::Number::from(value))
+    }
+}
+
+impl From<bool> for DaemonLogFieldValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
+/// Single daemon diagnostic event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonLogEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since_commit_time: Option<i64>,
+    pub id: Option<String>,
+    pub kind: DaemonLogKind,
+    pub timestamp: String,
+    pub level: DaemonLogLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since_change_seq: Option<i64>,
+    pub target: Option<String>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, DaemonLogFieldValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesListItem {
-    pub commit_sha: String,
-    pub content_hash: String,
-    pub change_seq: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesListData {
-    pub commit_shas: Vec<String>,
-    pub note_blob_oids: Option<Vec<String>>,
-    #[serde(default)]
-    pub items: Option<Vec<AuthorshipNotesListItem>>,
-    #[serde(default)]
-    pub next_change_seq: Option<i64>,
-    #[serde(default)]
-    pub has_more: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesListResponse {
-    pub ok: bool,
-    pub data: AuthorshipNotesListData,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesBatchRequest {
-    pub repo_url: String,
-    pub commit_shas: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesBatchItem {
-    pub commit_sha: String,
-    pub content: String,
+    pub repo_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note_blob_oid: Option<String>,
-    #[serde(default)]
-    pub content_hash: Option<String>,
-    #[serde(default)]
-    pub change_seq: Option<i64>,
+    pub git_ai_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesBatchData {
-    pub notes: Vec<AuthorshipNotesBatchItem>,
-    pub missing: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipBatchResponse {
-    pub ok: bool,
-    pub data: AuthorshipNotesBatchData,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesPushItem {
-    pub branch: String,
-    pub commit_sha: String,
-    pub note_blob_oid: String,
-    pub author_name: String,
-    pub author_email: String,
-    pub content: String,
-    pub commit_time: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesPushRequest {
-    pub repo_url: String,
-    pub notes: Vec<AuthorshipNotesPushItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesPushData {
-    pub created: usize,
-    pub updated: usize,
-    #[serde(default)]
-    pub unchanged: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesPushResponse {
-    pub ok: bool,
-    pub data: AuthorshipNotesPushData,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesRewriteMapping {
-    pub source_commit: String,
-    pub target_commit: String,
+/// Request body for uploading daemon diagnostics to the HTTP backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonLogsUploadRequest {
+    pub version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_note_blob_oid: Option<String>,
-    pub target_note_blob_oid: String,
-    pub target_content: String,
-    pub commit_time: i64,
-    pub author_name: String,
-    pub author_email: String,
-    pub disposition: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesRewriteRequest {
-    pub repo_url: String,
-    pub rewrite_id: String,
-    pub operation: String,
-    pub branch: String,
-    pub original_head: String,
-    pub new_head: String,
-    pub mappings: Vec<AuthorshipNotesRewriteMapping>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesRewriteConflict {
-    pub source_commit: String,
-    pub target_commit: String,
-    pub reason: String,
+    pub git_ai_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_content_hash: Option<String>,
+    pub daemon_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_content_hash: Option<String>,
+    pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    pub events: Vec<DaemonLogEvent>,
 }
 
+/// Error entry returned from daemon log upload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesRewriteData {
-    pub created: usize,
-    pub updated: usize,
-    pub superseded: usize,
-    #[serde(default)]
-    pub unchanged: usize,
-    #[serde(default)]
-    pub conflicts: Vec<AuthorshipNotesRewriteConflict>,
+pub struct DaemonLogsUploadError {
+    pub index: Option<usize>,
+    pub error: String,
 }
 
+/// Response from daemon log upload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorshipNotesRewriteResponse {
-    pub ok: bool,
-    pub data: AuthorshipNotesRewriteData,
+pub struct DaemonLogsUploadResponse {
+    pub accepted: usize,
+    pub dropped: usize,
+    pub enqueued: bool,
+    #[serde(default)]
+    pub errors: Vec<DaemonLogsUploadError>,
 }
 
 #[cfg(test)]
@@ -307,35 +296,6 @@ mod tests {
         assert_eq!(api_record.annotations.len(), 0);
         assert_eq!(api_record.diff, "");
         assert_eq!(api_record.base_content, "");
-    }
-
-    #[test]
-    fn authorship_notes_rewrite_request_serializes_expected_shape() {
-        let request = AuthorshipNotesRewriteRequest {
-            repo_url: "https://github.com/org/repo".to_string(),
-            rewrite_id: "rewrite-1".to_string(),
-            operation: "rebase_conflict_manual_commit".to_string(),
-            branch: "main".to_string(),
-            original_head: "b".repeat(40),
-            new_head: "d".repeat(40),
-            mappings: vec![AuthorshipNotesRewriteMapping {
-                source_commit: "b".repeat(40),
-                target_commit: "d".repeat(40),
-                source_note_blob_oid: Some("old-note".to_string()),
-                target_note_blob_oid: "new-note".to_string(),
-                target_content: "{}".to_string(),
-                commit_time: 1710000000,
-                author_name: "User".to_string(),
-                author_email: "user@example.com".to_string(),
-                disposition: "supersede_source".to_string(),
-            }],
-        };
-
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["repo_url"], "https://github.com/org/repo");
-        assert_eq!(value["rewrite_id"], "rewrite-1");
-        assert_eq!(value["mappings"][0]["disposition"], "supersede_source");
-        assert_eq!(value["mappings"][0]["source_note_blob_oid"], "old-note");
     }
 
     #[test]
@@ -572,15 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn test_notes_list_response_has_commit_shas() {
-        let body = r#"{"ok":true,"data":{"commit_shas":["abc123","def456"]}}"#;
-        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
-        assert!(parsed.ok);
-        assert_eq!(parsed.data.commit_shas[0], "abc123");
-        assert_eq!(parsed.data.commit_shas[1], "def456");
-    }
-
-    #[test]
     fn test_api_file_record_clone() {
         let record = ApiFileRecord {
             annotations: HashMap::new(),
@@ -610,176 +561,50 @@ mod tests {
     }
 
     #[test]
-    fn test_notes_list_request_serializes_incremental_fields() {
-        let request = AuthorshipNotesListRequest {
-            repo_url: "https://github.com/example/repo".to_string(),
-            since_commit_time: None,
-            since_change_seq: Some(42),
-            limit: Some(1000),
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["repo_url"], "https://github.com/example/repo");
-        assert_eq!(json["since_change_seq"], 42);
-        assert_eq!(json["limit"], 1000);
-        // since_commit_time is None and skip_serializing_if omits it from output
-        assert!(json.get("since_commit_time").is_none());
-    }
-
-    #[test]
-    fn test_notes_list_request_omits_none_incremental_fields() {
-        let request = AuthorshipNotesListRequest {
-            repo_url: "https://github.com/example/repo".to_string(),
-            since_commit_time: None,
-            since_change_seq: None,
-            limit: None,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["repo_url"], "https://github.com/example/repo");
-        assert!(json.get("since_commit_time").is_none());
-        assert!(json.get("since_change_seq").is_none());
-        assert!(json.get("limit").is_none());
-    }
-
-    #[test]
-    fn test_notes_list_response_deserializes_incremental_items() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "commit_shas": ["abc123"],
-                "items": [
-                    {
-                        "commit_sha": "abc123",
-                        "content_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                        "change_seq": 7,
-                        "updated_at": 1775973635847
-                    }
-                ],
-                "next_change_seq": 7,
-                "has_more": false
-            }
-        }
-        "#;
-
-        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
-        let items = parsed.data.items.expect("items should deserialize");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].commit_sha, "abc123");
-        assert_eq!(items[0].change_seq, 7);
-        assert_eq!(parsed.data.next_change_seq, Some(7));
-        assert_eq!(parsed.data.has_more, Some(false));
-    }
-
-    #[test]
-    fn test_notes_list_response_without_items_remains_compatible() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "commit_shas": ["abc123"],
-                "note_blob_oids": ["def456"]
-            }
-        }
-        "#;
-
-        let parsed: AuthorshipNotesListResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.data.commit_shas, vec!["abc123".to_string()]);
-        assert_eq!(parsed.data.note_blob_oids, Some(vec!["def456".to_string()]));
-        assert!(parsed.data.items.is_none());
-        assert!(parsed.data.next_change_seq.is_none());
-        assert!(parsed.data.has_more.is_none());
-    }
-
-    #[test]
-    fn test_notes_batch_item_deserializes_incremental_metadata() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "notes": [
-                    {
-                        "commit_sha": "abc123",
-                        "content": "{\"version\":\"authorship/3.0.0\"}",
-                        "note_blob_oid": "blob123",
-                        "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                        "change_seq": 9
-                    }
-                ],
-                "missing": []
-            }
-        }
-        "#;
-
-        let parsed: AuthorshipBatchResponse = serde_json::from_str(body).unwrap();
-        let note = &parsed.data.notes[0];
-        assert_eq!(note.commit_sha, "abc123");
-        assert_eq!(
-            note.content_hash.as_deref(),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    fn daemon_logs_upload_request_serializes_contract_fields() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "uptime_seconds".to_string(),
+            DaemonLogFieldValue::from(900_u64),
         );
-        assert_eq!(note.change_seq, Some(9));
+        fields.insert("healthy".to_string(), DaemonLogFieldValue::from(true));
+
+        let request = DaemonLogsUploadRequest {
+            version: DAEMON_LOGS_UPLOAD_VERSION,
+            git_ai_version: Some("1.2.3".to_string()),
+            daemon_id: Some("daemon-1".to_string()),
+            install_id: Some("install-1".to_string()),
+            repo_url: None,
+            events: vec![DaemonLogEvent {
+                id: Some("event-1".to_string()),
+                kind: DaemonLogKind::Heartbeat,
+                timestamp: "2026-06-26T12:00:00.000Z".to_string(),
+                level: DaemonLogLevel::Info,
+                target: Some("git_ai::daemon".to_string()),
+                message: "alive".to_string(),
+                fields,
+                repo_url: None,
+                git_ai_version: None,
+            }],
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["git_ai_version"], "1.2.3");
+        assert_eq!(value["daemon_id"], "daemon-1");
+        assert_eq!(value["events"][0]["kind"], "heartbeat");
+        assert_eq!(value["events"][0]["level"], "info");
+        assert_eq!(value["events"][0]["fields"]["uptime_seconds"], 900);
+        assert_eq!(value["events"][0]["fields"]["healthy"], true);
     }
 
     #[test]
-    fn test_notes_batch_item_without_incremental_metadata_remains_compatible() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "notes": [
-                    {
-                        "commit_sha": "abc123",
-                        "content": "{}",
-                        "note_blob_oid": null
-                    }
-                ],
-                "missing": []
-            }
-        }
-        "#;
+    fn daemon_logs_upload_response_accepts_null_error_index() {
+        let response: DaemonLogsUploadResponse = serde_json::from_str(
+            r#"{"accepted":0,"dropped":0,"enqueued":false,"errors":[{"index":null,"error":"bad"}]}"#,
+        )
+        .unwrap();
 
-        let parsed: AuthorshipBatchResponse = serde_json::from_str(body).unwrap();
-        let note = &parsed.data.notes[0];
-        assert!(note.content_hash.is_none());
-        assert!(note.change_seq.is_none());
-    }
-
-    #[test]
-    fn test_notes_push_response_deserializes_optional_unchanged() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "created": 1,
-                "updated": 2,
-                "unchanged": 3
-            }
-        }
-        "#;
-
-        let parsed: AuthorshipNotesPushResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.data.created, 1);
-        assert_eq!(parsed.data.updated, 2);
-        assert_eq!(parsed.data.unchanged, Some(3));
-    }
-
-    #[test]
-    fn test_notes_push_response_without_unchanged_remains_compatible() {
-        let body = r#"
-        {
-            "ok": true,
-            "data": {
-                "created": 1,
-                "updated": 2
-            }
-        }
-        "#;
-
-        let parsed: AuthorshipNotesPushResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.data.created, 1);
-        assert_eq!(parsed.data.updated, 2);
-        assert!(parsed.data.unchanged.is_none());
+        assert_eq!(response.errors[0].index, None);
     }
 }

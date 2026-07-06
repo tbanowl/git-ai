@@ -44,12 +44,12 @@ if [[ -f "$_PROFILE" ]] && grep -q '\.git-ai-local-dev/gitwrap/bin' "$_PROFILE";
 fi
 
 # Run production installer if ~/.git-ai isn't set up or ~/.git-ai/bin isn't on PATH in the profile
-# if [[ ! -d "$HOME/.git-ai/bin" ]] || [[ ! -f "$HOME/.git-ai/config.json" ]] || \
-#    { [[ -f "$_PROFILE" ]] && ! grep -q '\.git-ai/bin' "$_PROFILE"; } || \
-#    { [[ ! -f "$_PROFILE" ]]; }; then
-#     echo "Running git-ai installer..."
-#     curl -sSL https://usegitai.com/install.sh | bash
-# fi
+if [[ ! -d "$HOME/.git-ai/bin" ]] || [[ ! -f "$HOME/.git-ai/config.json" ]] || \
+   { [[ -f "$_PROFILE" ]] && ! grep -q '\.git-ai/bin' "$_PROFILE"; } || \
+   { [[ ! -f "$_PROFILE" ]]; }; then
+    echo "Running git-ai installer..."
+    curl -sSL https://usegitai.com/install.sh | bash
+fi
 
 # Build the binary
 echo "Building $BUILD_TYPE binary..."

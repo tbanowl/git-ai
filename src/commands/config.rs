@@ -2,6 +2,7 @@ use dirs;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::config::{AuthorConfig, CodexHooksFormat, NotesBackendKind};
 use crate::git::repository::find_repository_in_path;
 
 /// Determines the type of pattern value provided
@@ -85,51 +86,77 @@ fn resolve_path_to_remotes(path: &str) -> Result<Vec<String>, String> {
 }
 
 fn print_config_help() {
-    eprintln!("git-ai config - View and manage git-ai configuration");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  git-ai config                Show all config as formatted JSON");
-    eprintln!("  git-ai config <key>          Show specific config value");
-    eprintln!("  git-ai config set <key> <value>          Set a config value");
-    eprintln!("  git-ai config set <key> <value> --add    Add to array (extends existing)");
-    eprintln!("  git-ai config --add <key> <value>        Add to array or upsert into object");
-    eprintln!("  git-ai config unset <key>    Remove config value (reverts to default)");
-    eprintln!();
-    eprintln!("Configuration Keys:");
-    eprintln!("  git_path                     Path to git binary");
-    eprintln!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
-    eprintln!("  allow_repositories           Allowed repos (array)");
-    eprintln!("  exclude_repositories         Excluded repos (array)");
-    eprintln!("  telemetry_oss                OSS telemetry setting (on/off)");
-    eprintln!("  telemetry_enterprise_dsn     Enterprise telemetry DSN");
-    eprintln!("  disable_version_checks       Disable version checks (bool)");
-    eprintln!("  disable_auto_updates         Disable auto updates (bool)");
-    eprintln!("  update_channel               Update channel (latest/next)");
-    eprintln!("  feature_flags                Feature flags (object)");
-    eprintln!("  api_key                      API key for X-API-Key header");
-    eprintln!("  prompt_storage               Prompt storage mode (default/notes/local)");
-    eprintln!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
-    eprintln!("  default_prompt_storage       Fallback storage mode for non-included repos");
-    eprintln!("  quiet                        Suppress chart output after commits (bool)");
-    eprintln!("  git_ai_hooks                 Hook name -> shell commands map (object)");
-    eprintln!();
-    eprintln!("Repository Patterns:");
-    eprintln!("  For exclude/allow/exclude_prompts_in_repositories, you can provide:");
-    eprintln!("    - A glob pattern: \"*\", \"https://github.com/org/*\"");
-    eprintln!("    - A URL/git protocol: \"git@github.com:org/repo.git\"");
-    eprintln!("    - A file path: \".\" or \"/path/to/repo\" (resolves to repo's remotes)");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  git-ai config exclude_repositories");
-    eprintln!("  git-ai config set disable_auto_updates true");
-    eprintln!("  git-ai config set exclude_repositories \"private/*\"");
-    eprintln!("  git-ai config set exclude_repositories .         # Uses current repo's remotes");
-    eprintln!("  git-ai config --add exclude_repositories \"temp/*\"");
-    eprintln!("  git-ai config --add allow_repositories ~/projects/my-repo");
-    eprintln!("  git-ai config --add feature_flags.my_flag true");
-    eprintln!("  git-ai config --add git_ai_hooks.post_notes_updated \"./my-hook.sh\"");
-    eprintln!("  git-ai config unset exclude_repositories");
-    eprintln!();
+    println!("git-ai config - View and manage git-ai configuration");
+    println!();
+    println!("Usage:");
+    println!("  git-ai config                Show all config as formatted JSON");
+    println!("  git-ai config <key>          Show specific config value");
+    println!("  git-ai config set <key> <value>          Set a config value");
+    println!("  git-ai config set <key> <value> --add    Add to array (extends existing)");
+    println!("  git-ai config --add <key> <value>        Add to array or upsert into object");
+    println!("  git-ai config unset <key>    Remove config value (reverts to default)");
+    println!();
+    println!("Configuration Keys:");
+    println!("  git_path                     Path to git binary");
+    println!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
+    println!("  allow_repositories           Allowed repos (array)");
+    println!("  exclude_repositories         Excluded repos (array)");
+    println!("  telemetry_oss                OSS telemetry setting (on/off)");
+    println!("  telemetry_enterprise_dsn     Enterprise telemetry DSN");
+    println!("  disable_version_checks       Disable version checks (bool)");
+    println!("  disable_auto_updates         Disable auto updates (bool)");
+    println!("  update_channel               Update channel (latest/next)");
+    println!("  feature_flags                Feature flags (object)");
+    println!("  api_base_url                 API base URL (default: https://usegitai.com)");
+    println!("  api_key                      API key for X-API-Key header");
+    println!("  author.name                  git-ai author display name override");
+    println!("  author.email                 git-ai author email override");
+    println!("  prompt_storage               Prompt storage mode (default/notes/local)");
+    println!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
+    println!("  default_prompt_storage       Fallback storage mode for non-included repos");
+    println!("  quiet                        Suppress chart output after commits (bool)");
+    println!("  allow_superuser              Allow running git-ai as root/superuser (bool)");
+    println!(
+        "  transcript_streaming_lookback_days  Days to look back when sweeping transcripts (0 = unlimited)"
+    );
+    println!("  custom_attributes            Custom telemetry attributes, string->string (object)");
+    println!("  git_ai_hooks                 Hook name -> shell commands map (object)");
+    println!("  codex_hooks_format           Codex hook install format (config_toml/hooks_json)");
+    println!("  notes_backend.kind           Notes backend kind (git_notes/http)");
+    println!("  notes_backend.backend_url    Notes backend base URL. Required when kind=http.");
+    println!(
+        "                               May include a path prefix; endpoints are appended to it."
+    );
+    println!(
+        "                               e.g. \"https://app.example.com/api/gitai\" -> requests are"
+    );
+    println!("                               sent to \"<base>/worker/notes/upload\" and");
+    println!("                               \"<base>/worker/notes/?commits=...\".");
+    println!();
+    println!("Repository Patterns:");
+    println!("  For exclude/allow/exclude_prompts_in_repositories, you can provide:");
+    println!("    - A glob pattern: \"*\", \"https://github.com/org/*\"");
+    println!("    - A URL/git protocol: \"git@github.com:org/repo.git\"");
+    println!("    - A file path: \".\" or \"/path/to/repo\" (resolves to repo's remotes)");
+    println!();
+    println!("Examples:");
+    println!("  git-ai config exclude_repositories");
+    println!("  git-ai config set disable_auto_updates true");
+    println!("  git-ai config set author.name \"Alice Example\"");
+    println!("  git-ai config set author.email alice@example.com");
+    println!("  git-ai config set exclude_repositories \"private/*\"");
+    println!("  git-ai config set exclude_repositories .         # Uses current repo's remotes");
+    println!("  git-ai config --add exclude_repositories \"temp/*\"");
+    println!("  git-ai config --add allow_repositories ~/projects/my-repo");
+    println!("  git-ai config --add feature_flags.my_flag true");
+    println!("  git-ai config --add git_ai_hooks.post_notes_updated \"./my-hook.sh\"");
+    println!("  git-ai config set codex_hooks_format hooks_json");
+    println!("  git-ai config set allow_superuser true");
+    println!("  git-ai config set transcript_streaming_lookback_days 1");
+    println!("  git-ai config set custom_attributes '{{\"team\":\"platform\"}}'");
+    println!("  git-ai config --add custom_attributes.team platform");
+    println!("  git-ai config unset exclude_repositories");
+    println!();
     std::process::exit(0);
 }
 
@@ -173,6 +200,12 @@ pub fn handle_config(args: &[String]) {
             if let Err(e) = set_config_value(key, value, is_add_mode) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+            if key == "feature_flags.transcript_streaming"
+                || key == "feature_flags.transcript_sweep"
+                || key == "transcript_streaming_lookback_days"
+            {
+                println!("Run `git-ai bg restart` for changes to take effect.");
             }
         }
         "unset" => {
@@ -308,8 +341,42 @@ fn show_all_config() -> Result<(), String> {
     effective_config.insert("quiet".to_string(), Value::Bool(runtime_config.is_quiet()));
 
     effective_config.insert(
+        "author".to_string(),
+        serde_json::to_value(runtime_config.author())
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+    );
+
+    effective_config.insert(
         "git_ai_hooks".to_string(),
         serde_json::to_value(runtime_config.git_ai_hooks())
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+    );
+
+    effective_config.insert(
+        "codex_hooks_format".to_string(),
+        Value::String(runtime_config.codex_hooks_format().as_str().to_string()),
+    );
+
+    effective_config.insert(
+        "allow_superuser".to_string(),
+        Value::Bool(runtime_config.allow_superuser()),
+    );
+
+    // transcript_streaming_lookback_days: runtime normalizes 0 -> None (unlimited).
+    // Surface unlimited as 0 so it round-trips through `config set`.
+    effective_config.insert(
+        "transcript_streaming_lookback_days".to_string(),
+        Value::Number(
+            runtime_config
+                .transcript_streaming_lookback_days()
+                .unwrap_or(0)
+                .into(),
+        ),
+    );
+
+    effective_config.insert(
+        "custom_attributes".to_string(),
+        serde_json::to_value(runtime_config.custom_attributes())
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
     );
 
@@ -318,10 +385,30 @@ fn show_all_config() -> Result<(), String> {
         .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
     effective_config.insert("feature_flags".to_string(), flags_value);
 
+    // API base URL
+    effective_config.insert(
+        "api_base_url".to_string(),
+        Value::String(runtime_config.api_base_url().to_string()),
+    );
+
     // API key - show masked value if set
     if let Some(ref key) = file_config.api_key {
         let masked = mask_api_key(key);
         effective_config.insert("api_key".to_string(), Value::String(masked));
+    }
+
+    // notes_backend
+    {
+        let nb = runtime_config.notes_backend();
+        let mut nb_map = serde_json::Map::new();
+        nb_map.insert(
+            "kind".to_string(),
+            Value::String(nb.kind.as_str().to_string()),
+        );
+        if let Some(ref url) = nb.backend_url {
+            nb_map.insert("backend_url".to_string(), Value::String(url.clone()));
+        }
+        effective_config.insert("notes_backend".to_string(), Value::Object(nb_map));
     }
 
     let json = serde_json::to_string_pretty(&effective_config)
@@ -378,6 +465,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 serde_json::to_value(runtime_config.get_feature_flags())
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
             }
+            "api_base_url" => Value::String(runtime_config.api_base_url().to_string()),
             "api_key" => {
                 if let Some(ref key) = file_config.api_key {
                     Value::String(mask_api_key(key))
@@ -386,7 +474,6 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "prompt_storage" => Value::String(runtime_config.prompt_storage().to_string()),
-            "notes_store" => Value::String(runtime_config.notes_store().to_string()),
             "include_prompts_in_repositories" => {
                 if let Some(ref repos) = file_config.include_prompts_in_repositories {
                     serde_json::to_value(repos).unwrap()
@@ -402,8 +489,34 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "quiet" => Value::Bool(runtime_config.is_quiet()),
+            "author" => serde_json::to_value(runtime_config.author())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
             "git_ai_hooks" => serde_json::to_value(runtime_config.git_ai_hooks())
                 .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            "codex_hooks_format" => {
+                Value::String(runtime_config.codex_hooks_format().as_str().to_string())
+            }
+            "allow_superuser" => Value::Bool(runtime_config.allow_superuser()),
+            "transcript_streaming_lookback_days" => Value::Number(
+                runtime_config
+                    .transcript_streaming_lookback_days()
+                    .unwrap_or(0)
+                    .into(),
+            ),
+            "custom_attributes" => serde_json::to_value(runtime_config.custom_attributes())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            "notes_backend" => {
+                let nb = runtime_config.notes_backend();
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "kind".to_string(),
+                    Value::String(nb.kind.as_str().to_string()),
+                );
+                if let Some(ref url) = nb.backend_url {
+                    map.insert("backend_url".to_string(), Value::String(url.clone()));
+                }
+                Value::Object(map)
+            }
             _ => return Err(format!("Unknown config key: {}", key)),
         };
 
@@ -436,7 +549,76 @@ fn get_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
+    if key_path[0] == "notes_backend" {
+        if key_path.len() != 2 {
+            return Err(
+                "notes_backend requires a field name (notes_backend.kind or notes_backend.backend_url)"
+                    .to_string(),
+            );
+        }
+        let nb = runtime_config.notes_backend();
+        let value = match key_path[1].as_str() {
+            "kind" => Value::String(nb.kind.as_str().to_string()),
+            "backend_url" => nb
+                .backend_url
+                .as_ref()
+                .map(|u| Value::String(u.clone()))
+                .unwrap_or(Value::Null),
+            other => return Err(format!("Unknown notes_backend field: {}", other)),
+        };
+        let json = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("Failed to serialize value: {}", e))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    if key_path[0] == "author" {
+        if key_path.len() != 2 {
+            return Err("author requires a field name (author.name or author.email)".to_string());
+        }
+        let author = runtime_config.author();
+        let value = match key_path[1].as_str() {
+            "name" => author
+                .name
+                .as_ref()
+                .map(|name| Value::String(name.clone()))
+                .unwrap_or(Value::Null),
+            "email" => author
+                .email
+                .as_ref()
+                .map(|email| Value::String(email.clone()))
+                .unwrap_or(Value::Null),
+            other => return Err(format!("Unknown author field: {}", other)),
+        };
+        let json = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("Failed to serialize value: {}", e))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    if key_path[0] == "custom_attributes" {
+        if key_path.len() != 2 {
+            return Err(
+                "custom_attributes requires an attribute name (e.g., custom_attributes.team)"
+                    .to_string(),
+            );
+        }
+        let attr_key = key_path[1].trim();
+        let value = runtime_config
+            .custom_attributes()
+            .get(attr_key)
+            .map(|v| Value::String(v.clone()))
+            .unwrap_or(Value::Null);
+        let json = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("Failed to serialize value: {}", e))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    Err(
+        "Nested keys are only supported for feature_flags, git_ai_hooks, notes_backend, author, and custom_attributes"
+            .to_string(),
+    )
 }
 
 fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String> {
@@ -449,7 +631,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             "git_path" => {
                 file_config.git_path = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[git_path]: {}", value);
+                println!("[git_path]: {}", value);
             }
             "exclude_prompts_in_repositories" => {
                 let added = set_repository_array_field(
@@ -481,24 +663,24 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             "telemetry_oss" => {
                 file_config.telemetry_oss = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[telemetry_oss]: {}", value);
+                println!("[telemetry_oss]: {}", value);
             }
             "telemetry_enterprise_dsn" => {
                 file_config.telemetry_enterprise_dsn = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[telemetry_enterprise_dsn]: {}", value);
+                println!("[telemetry_enterprise_dsn]: {}", value);
             }
             "disable_version_checks" => {
                 let bool_value = parse_bool(value)?;
                 file_config.disable_version_checks = Some(bool_value);
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[disable_version_checks]: {}", bool_value);
+                println!("[disable_version_checks]: {}", bool_value);
             }
             "disable_auto_updates" => {
                 let bool_value = parse_bool(value)?;
                 file_config.disable_auto_updates = Some(bool_value);
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[disable_auto_updates]: {}", bool_value);
+                println!("[disable_auto_updates]: {}", bool_value);
             }
             "update_channel" => {
                 // Validate update channel
@@ -509,7 +691,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 }
                 file_config.update_channel = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[update_channel]: {}", value);
+                println!("[update_channel]: {}", value);
             }
             "feature_flags" => {
                 if add_mode {
@@ -523,25 +705,24 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 }
                 file_config.feature_flags = Some(json_value);
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[feature_flags]: {}", value);
+                println!("[feature_flags]: {}", value);
+            }
+            "api_base_url" => {
+                file_config.api_base_url = Some(value.to_string());
+                crate::config::save_file_config(&file_config)?;
+                println!("[api_base_url]: {}", value);
             }
             "api_key" => {
                 file_config.api_key = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
                 let masked = mask_api_key(value);
-                eprintln!("[api_key]: {}", masked);
+                println!("[api_key]: {}", masked);
             }
             "prompt_storage" => {
                 validate_prompt_storage_value(value)?;
                 file_config.prompt_storage = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[prompt_storage]: {}", value);
-            }
-            "notes_store" => {
-                validate_notes_store_value(value)?;
-                file_config.notes_store = Some(value.to_string());
-                crate::config::save_file_config(&file_config)?;
-                eprintln!("[notes_store]: {}", value);
+                println!("[prompt_storage]: {}", value);
             }
             "include_prompts_in_repositories" => {
                 let resolved = resolve_repository_value(value)?;
@@ -560,20 +741,40 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 }
                 crate::config::save_file_config(&file_config)?;
                 for pattern in resolved {
-                    eprintln!("[include_prompts_in_repositories]: {}", pattern);
+                    println!("[include_prompts_in_repositories]: {}", pattern);
                 }
             }
             "default_prompt_storage" => {
                 validate_prompt_storage_value(value)?;
                 file_config.default_prompt_storage = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[default_prompt_storage]: {}", value);
+                println!("[default_prompt_storage]: {}", value);
             }
             "quiet" => {
                 let bool_value = parse_bool(value)?;
                 file_config.quiet = Some(bool_value);
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[quiet]: {}", bool_value);
+                println!("[quiet]: {}", bool_value);
+            }
+            "author" => {
+                if add_mode {
+                    return Err(
+                        "Cannot use --add with author. Use author.name or author.email."
+                            .to_string(),
+                    );
+                }
+                let author = parse_author_config_object(value)?;
+                file_config.author = if author.is_empty() {
+                    None
+                } else {
+                    Some(author.clone())
+                };
+                crate::config::save_file_config(&file_config)?;
+                println!(
+                    "[author]: {}",
+                    serde_json::to_string(&author)
+                        .map_err(|e| format!("Failed to serialize author: {}", e))?
+                );
             }
             "git_ai_hooks" => {
                 if add_mode {
@@ -581,7 +782,42 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 }
                 file_config.git_ai_hooks = Some(parse_git_ai_hooks_object(value)?);
                 crate::config::save_file_config(&file_config)?;
-                eprintln!("[git_ai_hooks]: {}", value);
+                println!("[git_ai_hooks]: {}", value);
+            }
+            "codex_hooks_format" => {
+                let format = parse_codex_hooks_format(value)?;
+                file_config.codex_hooks_format = Some(format.as_str().to_string());
+                crate::config::save_file_config(&file_config)?;
+                println!("[codex_hooks_format]: {}", format.as_str());
+            }
+            "allow_superuser" => {
+                let bool_value = parse_bool(value)?;
+                file_config.allow_superuser = Some(bool_value);
+                crate::config::save_file_config(&file_config)?;
+                println!("[allow_superuser]: {}", bool_value);
+            }
+            "transcript_streaming_lookback_days" => {
+                let days = value.trim().parse::<u32>().map_err(|_| {
+                    format!(
+                        "Invalid transcript_streaming_lookback_days value '{}'. Expected a non-negative integer (0 = unlimited)",
+                        value
+                    )
+                })?;
+                file_config.transcript_streaming_lookback_days = Some(days);
+                crate::config::save_file_config(&file_config)?;
+                println!("[transcript_streaming_lookback_days]: {}", days);
+            }
+            "custom_attributes" => {
+                if add_mode {
+                    return Err("Cannot use --add with custom_attributes at top level. Use dot notation: custom_attributes.key".to_string());
+                }
+                let attrs = parse_custom_attributes_object(value)?;
+                // Mirror the `author`/`git_ai_hooks` convention: an empty object
+                // is stored as None so the key is omitted from the config file
+                // rather than persisted as a redundant `{}`.
+                file_config.custom_attributes = if attrs.is_empty() { None } else { Some(attrs) };
+                crate::config::save_file_config(&file_config)?;
+                println!("[custom_attributes]: {}", value);
             }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
@@ -635,7 +871,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
 
         file_config.feature_flags = Some(flags);
         crate::config::save_file_config(&file_config)?;
-        eprintln!("+ [{}]: {}", nested_key, value);
+        println!("+ [{}]: {}", nested_key, value);
         return Ok(());
     }
 
@@ -658,7 +894,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             file_config.git_ai_hooks = Some(hooks);
             crate::config::save_file_config(&file_config)?;
             for command in commands_to_add {
-                eprintln!("+ [{}.{}]: {}", key_path[0], hook_name, command);
+                println!("+ [{}.{}]: {}", key_path[0], hook_name, command);
             }
         } else {
             let commands = parse_hook_command_values(value)?;
@@ -666,14 +902,90 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             file_config.git_ai_hooks = Some(hooks);
             crate::config::save_file_config(&file_config)?;
             for command in commands {
-                eprintln!("[{}.{}]: {}", key_path[0], hook_name, command);
+                println!("[{}.{}]: {}", key_path[0], hook_name, command);
             }
         }
 
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
+    if key_path[0] == "notes_backend" {
+        if key_path.len() != 2 {
+            return Err(
+                "notes_backend requires a field name (notes_backend.kind or notes_backend.backend_url)"
+                    .to_string(),
+            );
+        }
+        let field = key_path[1].as_str();
+        let mut backend = file_config.notes_backend.clone().unwrap_or_default();
+        match field {
+            "kind" => {
+                let kind = parse_notes_backend_kind(value)?;
+                backend.kind = kind;
+                file_config.notes_backend = Some(backend);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[notes_backend.kind]: {}", kind.as_str());
+            }
+            "backend_url" => {
+                backend.backend_url = Some(value.to_string());
+                file_config.notes_backend = Some(backend);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[notes_backend.backend_url]: {}", value);
+            }
+            other => return Err(format!("Unknown notes_backend field: {}", other)),
+        }
+        return Ok(());
+    }
+
+    if key_path[0] == "author" {
+        if add_mode {
+            return Err("Cannot use --add with author fields".to_string());
+        }
+        if key_path.len() != 2 {
+            return Err("author requires a field name (author.name or author.email)".to_string());
+        }
+
+        let mut author = file_config.author.clone().unwrap_or_default().normalized();
+        let normalized_value = value.trim().to_string();
+        if normalized_value.is_empty() {
+            return Err(format!("author.{} cannot be empty", key_path[1]));
+        }
+        match key_path[1].as_str() {
+            "name" => author.name = Some(normalized_value.clone()),
+            "email" => author.email = Some(normalized_value.clone()),
+            other => return Err(format!("Unknown author field: {}", other)),
+        }
+
+        file_config.author = Some(author);
+        crate::config::save_file_config(&file_config)?;
+        println!("[author.{}]: {}", key_path[1], normalized_value);
+        return Ok(());
+    }
+
+    if key_path[0] == "custom_attributes" {
+        if key_path.len() != 2 {
+            return Err(
+                "custom_attributes requires an attribute name (e.g., custom_attributes.team)"
+                    .to_string(),
+            );
+        }
+        let attr_name = key_path[1].trim();
+        if attr_name.is_empty() {
+            return Err("custom_attributes attribute name cannot be empty".to_string());
+        }
+        let mut attrs = file_config.custom_attributes.unwrap_or_default();
+        attrs.insert(attr_name.to_string(), value.to_string());
+        file_config.custom_attributes = Some(attrs);
+        crate::config::save_file_config(&file_config)?;
+        let prefix = if add_mode { "+ " } else { "" };
+        println!("{}[custom_attributes.{}]: {}", prefix, attr_name, value);
+        return Ok(());
+    }
+
+    Err(
+        "Nested keys are only supported for feature_flags, git_ai_hooks, notes_backend, author, and custom_attributes"
+            .to_string(),
+    )
 }
 
 fn unset_config_value(key: &str) -> Result<(), String> {
@@ -687,7 +999,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 let old_value = file_config.git_path.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [git_path]: {}", v);
+                    println!("- [git_path]: {}", v);
                 }
             }
             "exclude_prompts_in_repositories" => {
@@ -715,91 +1027,130 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 let old_value = file_config.telemetry_oss.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [telemetry_oss]: {}", v);
+                    println!("- [telemetry_oss]: {}", v);
                 }
             }
             "telemetry_enterprise_dsn" => {
                 let old_value = file_config.telemetry_enterprise_dsn.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [telemetry_enterprise_dsn]: {}", v);
+                    println!("- [telemetry_enterprise_dsn]: {}", v);
                 }
             }
             "disable_version_checks" => {
                 let old_value = file_config.disable_version_checks.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [disable_version_checks]: {}", v);
+                    println!("- [disable_version_checks]: {}", v);
                 }
             }
             "disable_auto_updates" => {
                 let old_value = file_config.disable_auto_updates.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [disable_auto_updates]: {}", v);
+                    println!("- [disable_auto_updates]: {}", v);
                 }
             }
             "update_channel" => {
                 let old_value = file_config.update_channel.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [update_channel]: {}", v);
+                    println!("- [update_channel]: {}", v);
                 }
             }
             "feature_flags" => {
                 let old_value = file_config.feature_flags.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [feature_flags]: {}", v);
+                    println!("- [feature_flags]: {}", v);
+                }
+            }
+            "api_base_url" => {
+                let old_value = file_config.api_base_url.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [api_base_url]: {}", v);
                 }
             }
             "api_key" => {
                 let old_value = file_config.api_key.take();
                 crate::config::save_file_config(&file_config)?;
                 if old_value.is_some() {
-                    eprintln!("- [api_key]: ****");
+                    println!("- [api_key]: ****");
                 }
             }
             "prompt_storage" => {
                 let old_value = file_config.prompt_storage.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [prompt_storage]: {}", v);
-                }
-            }
-            "notes_store" => {
-                let old_value = file_config.notes_store.take();
-                crate::config::save_file_config(&file_config)?;
-                if let Some(v) = old_value {
-                    eprintln!("- [notes_store]: {}", v);
+                    println!("- [prompt_storage]: {}", v);
                 }
             }
             "include_prompts_in_repositories" => {
                 let old_value = file_config.include_prompts_in_repositories.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [include_prompts_in_repositories]: {:?}", v);
+                    println!("- [include_prompts_in_repositories]: {:?}", v);
                 }
             }
             "default_prompt_storage" => {
                 let old_value = file_config.default_prompt_storage.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [default_prompt_storage]: {}", v);
+                    println!("- [default_prompt_storage]: {}", v);
                 }
             }
             "quiet" => {
                 let old_value = file_config.quiet.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [quiet]: {}", v);
+                    println!("- [quiet]: {}", v);
+                }
+            }
+            "author" => {
+                let old_value = file_config.author.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!(
+                        "- [author]: {}",
+                        serde_json::to_string(&v)
+                            .map_err(|e| format!("Failed to serialize author: {}", e))?
+                    );
                 }
             }
             "git_ai_hooks" => {
                 let old_value = file_config.git_ai_hooks.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
-                    eprintln!("- [git_ai_hooks]: {:?}", v);
+                    println!("- [git_ai_hooks]: {:?}", v);
+                }
+            }
+            "codex_hooks_format" => {
+                let old_value = file_config.codex_hooks_format.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [codex_hooks_format]: {}", v);
+                }
+            }
+            "allow_superuser" => {
+                let old_value = file_config.allow_superuser.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [allow_superuser]: {}", v);
+                }
+            }
+            "transcript_streaming_lookback_days" => {
+                let old_value = file_config.transcript_streaming_lookback_days.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [transcript_streaming_lookback_days]: {}", v);
+                }
+            }
+            "custom_attributes" => {
+                let old_value = file_config.custom_attributes.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [custom_attributes]: {:?}", v);
                 }
             }
             _ => return Err(format!("Unknown config key: {}", key)),
@@ -837,7 +1188,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
             file_config.feature_flags = Some(flags);
             crate::config::save_file_config(&file_config)?;
             if let Some(v) = old_value {
-                eprintln!("- [{}]: {}", nested_key, v);
+                println!("- [{}]: {}", nested_key, v);
             }
         } else {
             // Deep nested key: feature_flags.parent.child...
@@ -855,7 +1206,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
             file_config.feature_flags = Some(flags);
             crate::config::save_file_config(&file_config)?;
             if let Some(v) = old_value {
-                eprintln!("- [{}]: {}", nested_key, v);
+                println!("- [{}]: {}", nested_key, v);
             }
         }
 
@@ -884,13 +1235,100 @@ fn unset_config_value(key: &str) -> Result<(), String> {
 
         if let Some(commands) = old_value {
             for command in commands {
-                eprintln!("- [{}]: {}", key, command);
+                println!("- [{}]: {}", key, command);
             }
         }
         return Ok(());
     }
 
-    Err("Nested keys are only supported for feature_flags and git_ai_hooks".to_string())
+    if key_path[0] == "notes_backend" {
+        if key_path.len() != 2 {
+            return Err(
+                "notes_backend requires a field name (notes_backend.kind or notes_backend.backend_url)"
+                    .to_string(),
+            );
+        }
+        let field = key_path[1].as_str();
+        let mut backend = file_config.notes_backend.clone().unwrap_or_default();
+        match field {
+            "kind" => {
+                let old = backend.kind;
+                backend.kind = NotesBackendKind::GitNotes; // reset to default
+                file_config.notes_backend = Some(backend);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("- [notes_backend.kind]: {}", old.as_str());
+            }
+            "backend_url" => {
+                if let Some(old_url) = backend.backend_url.take() {
+                    file_config.notes_backend = if backend.kind == NotesBackendKind::GitNotes {
+                        None // whole object is back to defaults, omit from file
+                    } else {
+                        Some(backend)
+                    };
+                    crate::config::save_file_config(&file_config)?;
+                    eprintln!("- [notes_backend.backend_url]: {}", old_url);
+                }
+            }
+            other => return Err(format!("Unknown notes_backend field: {}", other)),
+        }
+        return Ok(());
+    }
+
+    if key_path[0] == "author" {
+        if key_path.len() != 2 {
+            return Err("author requires a field name (author.name or author.email)".to_string());
+        }
+
+        let mut author = file_config.author.clone().unwrap_or_default().normalized();
+        let old_value = match key_path[1].as_str() {
+            "name" => author.name.take(),
+            "email" => author.email.take(),
+            other => return Err(format!("Unknown author field: {}", other)),
+        };
+
+        file_config.author = if author.is_empty() {
+            None
+        } else {
+            Some(author)
+        };
+        crate::config::save_file_config(&file_config)?;
+        if let Some(v) = old_value {
+            println!("- [author.{}]: {}", key_path[1], v);
+        }
+        return Ok(());
+    }
+
+    if key_path[0] == "custom_attributes" {
+        if key_path.len() != 2 {
+            return Err(
+                "custom_attributes requires an attribute name (e.g., custom_attributes.team)"
+                    .to_string(),
+            );
+        }
+        // Trim to match the nested `set` path, which stores the trimmed name;
+        // otherwise an attribute set as `custom_attributes. team` (stored as
+        // `team`) could not be removed by the same dotted key.
+        let attr_name = key_path[1].trim();
+        let mut attrs = file_config
+            .custom_attributes
+            .ok_or_else(|| format!("Config key not found: {}", key))?;
+        let old_value = attrs.remove(attr_name);
+        if old_value.is_none() {
+            return Err(format!("Config key not found: {}", key));
+        }
+
+        file_config.custom_attributes = if attrs.is_empty() { None } else { Some(attrs) };
+        crate::config::save_file_config(&file_config)?;
+        if let Some(v) = old_value {
+            println!("- [custom_attributes.{}]: {}", attr_name, v);
+        }
+        return Ok(());
+    }
+
+    Err(
+        "Nested keys are only supported for feature_flags, git_ai_hooks, notes_backend, author, and custom_attributes"
+            .to_string(),
+    )
 }
 
 fn parse_key_path(key: &str) -> Vec<String> {
@@ -971,11 +1409,11 @@ fn log_array_changes(items: &[String], add_mode: bool) {
     #[allow(clippy::if_same_then_else)]
     if add_mode {
         for item in items {
-            eprintln!("+ {}", item);
+            println!("+ {}", item);
         }
     } else {
         for item in items {
-            eprintln!("+ {}", item);
+            println!("+ {}", item);
         }
     }
 }
@@ -983,7 +1421,7 @@ fn log_array_changes(items: &[String], add_mode: bool) {
 /// Log array removals with - prefix
 fn log_array_removals(items: &[String]) {
     for item in items {
-        eprintln!("- {}", item);
+        println!("- {}", item);
     }
 }
 
@@ -1004,6 +1442,42 @@ fn parse_git_ai_hooks_object(value: &str) -> Result<HashMap<String, Vec<String>>
         hooks.insert(name.to_string(), commands);
     }
     Ok(hooks)
+}
+
+/// Parse a JSON object of custom telemetry attributes.
+///
+/// String/number/bool values are coerced to strings using the same rules as the
+/// `GIT_AI_CUSTOM_ATTRIBUTES` env var override (see `build_custom_attributes`).
+/// Unlike the env path, which silently drops non-scalar values, the CLI rejects
+/// them so a malformed `config set` fails loudly rather than persisting a
+/// partially-applied object.
+fn parse_custom_attributes_object(value: &str) -> Result<HashMap<String, String>, String> {
+    let parsed: Value = serde_json::from_str(value)
+        .map_err(|e| format!("Invalid JSON for custom_attributes: {}", e))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "custom_attributes must be a JSON object".to_string())?;
+
+    let mut attrs = HashMap::new();
+    for (attr_name, attr_value) in obj {
+        let name = attr_name.trim();
+        if name.is_empty() {
+            return Err("custom_attributes contains an empty attribute name".to_string());
+        }
+        let coerced = match attr_value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => {
+                return Err(format!(
+                    "custom_attributes value for '{}' must be a string, number, or boolean",
+                    name
+                ));
+            }
+        };
+        attrs.insert(name.to_string(), coerced);
+    }
+    Ok(attrs)
 }
 
 fn parse_hook_command_values(value: &str) -> Result<Vec<String>, String> {
@@ -1071,6 +1545,18 @@ fn parse_value(value: &str) -> Result<Value, String> {
     Ok(Value::String(value.to_string()))
 }
 
+fn parse_author_config_object(value: &str) -> Result<AuthorConfig, String> {
+    let parsed: Value =
+        serde_json::from_str(value).map_err(|e| format!("Invalid JSON for author: {}", e))?;
+    if !parsed.is_object() {
+        return Err("author must be a JSON object".to_string());
+    }
+
+    serde_json::from_value::<AuthorConfig>(parsed)
+        .map(AuthorConfig::normalized)
+        .map_err(|e| format!("Invalid author config: {}", e))
+}
+
 /// Mask an API key for display (show first 4 and last 4 chars if long enough)
 fn mask_api_key(key: &str) -> String {
     if key.len() > 8 {
@@ -1080,21 +1566,34 @@ fn mask_api_key(key: &str) -> String {
     }
 }
 
+/// Parse notes backend kind from a string value
+fn parse_notes_backend_kind(value: &str) -> Result<NotesBackendKind, String> {
+    match value.trim().to_lowercase().as_str() {
+        "git_notes" | "git-notes" => Ok(NotesBackendKind::GitNotes),
+        "http" => Ok(NotesBackendKind::Http),
+        _ => Err(format!(
+            "Invalid notes_backend.kind '{}'. Expected 'git_notes' or 'http'",
+            value
+        )),
+    }
+}
+
+fn parse_codex_hooks_format(value: &str) -> Result<CodexHooksFormat, String> {
+    match value.trim().to_lowercase().as_str() {
+        "config_toml" | "config-toml" => Ok(CodexHooksFormat::ConfigToml),
+        "hooks_json" | "hooks-json" => Ok(CodexHooksFormat::HooksJson),
+        _ => Err(format!(
+            "Invalid codex_hooks_format '{}'. Expected 'config_toml' or 'hooks_json'",
+            value
+        )),
+    }
+}
+
 /// Validate prompt_storage value
 fn validate_prompt_storage_value(value: &str) -> Result<(), String> {
     if value != "default" && value != "notes" && value != "local" {
         return Err(format!(
             "Invalid prompt_storage value '{}'. Expected 'default', 'notes', or 'local'",
-            value
-        ));
-    }
-    Ok(())
-}
-
-fn validate_notes_store_value(value: &str) -> Result<(), String> {
-    if value != "git" && value != "rest" {
-        return Err(format!(
-            "Invalid notes_store value '{}'. Expected 'git' or 'rest'",
             value
         ));
     }
@@ -1130,6 +1629,27 @@ mod tests {
         assert!(err.contains("default"));
         assert!(err.contains("notes"));
         assert!(err.contains("local"));
+    }
+
+    #[test]
+    fn test_codex_hooks_format_valid_values() {
+        assert_eq!(
+            parse_codex_hooks_format("config_toml").unwrap(),
+            CodexHooksFormat::ConfigToml
+        );
+        assert_eq!(
+            parse_codex_hooks_format("hooks_json").unwrap(),
+            CodexHooksFormat::HooksJson
+        );
+    }
+
+    #[test]
+    fn test_codex_hooks_format_invalid_value() {
+        let result = parse_codex_hooks_format("json");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("config_toml"));
+        assert!(err.contains("hooks_json"));
     }
 
     #[test]
@@ -1188,6 +1708,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_custom_attributes_object_string_values() {
+        let attrs = parse_custom_attributes_object(r#"{"team":"platform","env":"prod"}"#).unwrap();
+        assert_eq!(attrs.get("team"), Some(&"platform".to_string()));
+        assert_eq!(attrs.get("env"), Some(&"prod".to_string()));
+    }
+
+    #[test]
+    fn test_parse_custom_attributes_object_coerces_number_and_bool() {
+        let attrs = parse_custom_attributes_object(r#"{"count":3,"enabled":true}"#).unwrap();
+        assert_eq!(attrs.get("count"), Some(&"3".to_string()));
+        assert_eq!(attrs.get("enabled"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn test_parse_custom_attributes_object_rejects_non_object() {
+        let err = parse_custom_attributes_object(r#"["a","b"]"#).unwrap_err();
+        assert!(err.contains("custom_attributes must be a JSON object"));
+    }
+
+    #[test]
+    fn test_parse_custom_attributes_object_rejects_nested_value() {
+        let err = parse_custom_attributes_object(r#"{"team":{"nested":"x"}}"#).unwrap_err();
+        assert!(err.contains("must be a string, number, or boolean"));
+    }
+
+    #[test]
+    fn test_parse_custom_attributes_object_rejects_empty_name() {
+        let err = parse_custom_attributes_object(r#"{"  ":"x"}"#).unwrap_err();
+        assert!(err.contains("empty attribute name"));
+    }
+
     // --- Additional comprehensive tests ---
 
     #[test]
@@ -1226,6 +1778,21 @@ mod tests {
     fn test_parse_value_plain_string() {
         let result = parse_value("plain text").unwrap();
         assert_eq!(result, Value::String("plain text".to_string()));
+    }
+
+    #[test]
+    fn test_parse_author_config_object() {
+        let author =
+            parse_author_config_object(r#"{"name":"  Alice Example  ","email":"a@example.com"}"#)
+                .unwrap();
+        assert_eq!(author.name.as_deref(), Some("Alice Example"));
+        assert_eq!(author.email.as_deref(), Some("a@example.com"));
+    }
+
+    #[test]
+    fn test_parse_author_config_object_rejects_non_object() {
+        let err = parse_author_config_object(r#""Alice""#).unwrap_err();
+        assert!(err.contains("author must be a JSON object"));
     }
 
     #[test]

@@ -136,23 +136,28 @@ fn test_authorship_log_stats() {
     let raw = repo.git_ai(&["stats", "--json"]).unwrap();
     let json = extract_json_object(&raw);
     let stats: CommitStats = serde_json::from_str(&json).unwrap();
+    // The integration harness now uses mock_known_human (CheckpointKind::KnownHuman), which
+    // produces h_-prefixed attestation entries for lines written under a human checkpoint.
+    // Neptune (override) — human-overrides-AI line — gets h_<hash> attestation.
+    // Mercury, Venus, Jupiter also get h_<hash> attestation from the KnownHuman checkpoint.
+    // All 4 human-written lines now count as human_additions; unknown_additions = 0.
+    // Neptune (override) is now h_<hash> attested, so it counts as human_additions only.
     assert_eq!(stats.human_additions, 4);
-    assert_eq!(stats.mixed_additions, 1);
-    assert_eq!(stats.ai_additions, 6); // Neptune (override) no longer counted as mixed AI
+    assert_eq!(stats.unknown_additions, 0);
+    assert_eq!(stats.ai_additions, 5); // Neptune (override) no longer counted as mixed AI
     assert_eq!(stats.ai_accepted, 5);
-    assert_eq!(stats.total_ai_additions, 11);
-    assert_eq!(stats.total_ai_deletions, 11);
     assert_eq!(stats.git_diff_deleted_lines, 0);
     assert_eq!(stats.git_diff_added_lines, 9);
 
     assert_eq!(stats.tool_model_breakdown.len(), 1);
+    // ai_additions = ai_accepted = 5
     assert_eq!(
         stats
             .tool_model_breakdown
             .get("mock_ai::unknown")
             .unwrap()
             .ai_additions,
-        6
+        5
     );
     assert_eq!(
         stats
@@ -161,38 +166,6 @@ fn test_authorship_log_stats() {
             .unwrap()
             .ai_accepted,
         5
-    );
-    assert_eq!(
-        stats
-            .tool_model_breakdown
-            .get("mock_ai::unknown")
-            .unwrap()
-            .total_ai_additions,
-        11
-    );
-    assert_eq!(
-        stats
-            .tool_model_breakdown
-            .get("mock_ai::unknown")
-            .unwrap()
-            .total_ai_deletions,
-        11
-    );
-    assert_eq!(
-        stats
-            .tool_model_breakdown
-            .get("mock_ai::unknown")
-            .unwrap()
-            .mixed_additions,
-        1
-    );
-    assert_eq!(
-        stats
-            .tool_model_breakdown
-            .get("mock_ai::unknown")
-            .unwrap()
-            .time_waiting_for_ai,
-        0
     );
 }
 
@@ -338,7 +311,10 @@ fn test_stats_cli_empty_tree_range() {
     assert_eq!(stats.authorship_stats.total_commits, 2);
     assert_eq!(stats.range_stats.git_diff_added_lines, 2);
     assert_eq!(stats.range_stats.ai_additions, 1);
-    assert_eq!(stats.range_stats.human_additions, 1);
+    // Range stats use legacy Human checkpoints and pass known_human_accepted=0,
+    // so human lines appear as unknown_additions (not human_additions).
+    assert_eq!(stats.range_stats.human_additions, 0);
+    assert_eq!(stats.range_stats.unknown_additions, 1);
 }
 
 #[test]
@@ -348,12 +324,10 @@ fn test_markdown_stats_deletion_only() {
 
     let stats = CommitStats {
         human_additions: 0,
-        mixed_additions: 0,
+        unknown_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
-        total_ai_additions: 0,
-        total_ai_deletions: 5,
-        time_waiting_for_ai: 0,
+
         git_diff_deleted_lines: 5,
         git_diff_added_lines: 0,
         tool_model_breakdown: BTreeMap::new(),
@@ -371,12 +345,10 @@ fn test_markdown_stats_all_human() {
 
     let stats = CommitStats {
         human_additions: 10,
-        mixed_additions: 0,
+        unknown_additions: 0,
         ai_additions: 0,
         ai_accepted: 0,
-        total_ai_additions: 0,
-        total_ai_deletions: 0,
-        time_waiting_for_ai: 0,
+
         git_diff_deleted_lines: 0,
         git_diff_added_lines: 10,
         tool_model_breakdown: BTreeMap::new(),
@@ -394,12 +366,10 @@ fn test_markdown_stats_all_ai() {
 
     let stats = CommitStats {
         human_additions: 0,
-        mixed_additions: 0,
+        unknown_additions: 0,
         ai_additions: 15,
         ai_accepted: 15,
-        total_ai_additions: 15,
-        total_ai_deletions: 0,
-        time_waiting_for_ai: 30,
+
         git_diff_deleted_lines: 0,
         git_diff_added_lines: 15,
         tool_model_breakdown: BTreeMap::new(),
@@ -417,12 +387,10 @@ fn test_markdown_stats_mixed() {
 
     let stats = CommitStats {
         human_additions: 10,
-        mixed_additions: 5,
-        ai_additions: 20,
+        unknown_additions: 0,
+        ai_additions: 15,
         ai_accepted: 15,
-        total_ai_additions: 25,
-        total_ai_deletions: 10,
-        time_waiting_for_ai: 45,
+
         git_diff_deleted_lines: 5,
         git_diff_added_lines: 30,
         tool_model_breakdown: BTreeMap::new(),
@@ -440,12 +408,10 @@ fn test_markdown_stats_no_mixed() {
 
     let stats = CommitStats {
         human_additions: 8,
-        mixed_additions: 0,
+        unknown_additions: 0,
         ai_additions: 12,
         ai_accepted: 12,
-        total_ai_additions: 12,
-        total_ai_deletions: 0,
-        time_waiting_for_ai: 15,
+
         git_diff_deleted_lines: 0,
         git_diff_added_lines: 20,
         tool_model_breakdown: BTreeMap::new(),
@@ -464,12 +430,10 @@ fn test_markdown_stats_minimal_human() {
     // Test that humans get at least 2 visible blocks if they have more than 1 line
     let stats = CommitStats {
         human_additions: 2,
-        mixed_additions: 0,
+        unknown_additions: 0,
         ai_additions: 98,
         ai_accepted: 98,
-        total_ai_additions: 98,
-        total_ai_deletions: 0,
-        time_waiting_for_ai: 10,
+
         git_diff_deleted_lines: 0,
         git_diff_added_lines: 100,
         tool_model_breakdown: BTreeMap::new(),
@@ -489,23 +453,16 @@ fn test_markdown_stats_formatting() {
     tool_model_breakdown.insert(
         "cursor::claude-3.5-sonnet".to_string(),
         ToolModelHeadlineStats {
-            ai_additions: 8,
-            mixed_additions: 2,
+            ai_additions: 6,
             ai_accepted: 6,
-            total_ai_additions: 10,
-            total_ai_deletions: 3,
-            time_waiting_for_ai: 25,
         },
     );
 
     let stats = CommitStats {
         human_additions: 5,
-        mixed_additions: 2,
-        ai_additions: 8,
+        unknown_additions: 0,
+        ai_additions: 6,
         ai_accepted: 6,
-        total_ai_additions: 10,
-        total_ai_deletions: 3,
-        time_waiting_for_ai: 25,
         git_diff_deleted_lines: 2,
         git_diff_added_lines: 13,
         tool_model_breakdown,
@@ -807,34 +764,6 @@ fn test_stats_ignores_renamed_files() {
     assert_eq!(stats.human_additions, 0);
 }
 
-#[test]
-fn test_stats_counts_human_whitespace_edit_of_ai_line_as_ai() {
-    let repo = TestRepo::new();
-    let file_path = repo.path().join("whitespace-ai.txt");
-
-    fs::write(&file_path, "return value;\n").unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "whitespace-ai.txt"])
-        .unwrap();
-    repo.stage_all_and_commit("AI writes line").unwrap();
-
-    let mut file = repo.filename("whitespace-ai.txt");
-    file.assert_committed_lines(crate::lines!["return value;".ai()]);
-
-    fs::write(&file_path, "  return value;  \n").unwrap();
-    repo.git_ai(&["checkpoint", "--", "whitespace-ai.txt"])
-        .unwrap();
-    repo.stage_all_and_commit("Human adds whitespace around AI line")
-        .unwrap();
-
-    file.assert_committed_lines(crate::lines!["  return value;  ".ai()]);
-
-    let stats = stats_from_args(&repo, &["stats", "HEAD", "--json"]);
-    assert_eq!(stats.git_diff_added_lines, 1);
-    assert_eq!(stats.ai_accepted, 1);
-    assert_eq!(stats.ai_additions, 1);
-    assert_eq!(stats.human_additions, 0);
-}
-
 crate::reuse_tests_in_worktree!(
     test_authorship_log_stats,
     test_stats_cli_range,
@@ -855,5 +784,4 @@ crate::reuse_tests_in_worktree!(
     test_stats_range_uses_default_ignores,
     test_post_commit_large_ignored_files_do_not_trigger_skip_warning,
     test_stats_ignores_renamed_files,
-    test_stats_counts_human_whitespace_edit_of_ai_line_as_ai,
 );

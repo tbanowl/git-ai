@@ -7,7 +7,6 @@ use crate::authorship::imara_diff_utils::{ByteDiff, ByteDiffOp, DiffOp, capture_
 use crate::authorship::move_detection::{DeletedLine, InsertedLine, detect_moves};
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -148,9 +147,6 @@ pub(crate) struct Deletion {
     pub(crate) start: usize,
     /// End position in old content
     pub(crate) end: usize,
-    /// The deleted bytes (may not be valid UTF-8)
-    #[allow(dead_code)]
-    pub(crate) bytes: Vec<u8>,
 }
 
 /// Represents an insertion operation from the diff
@@ -160,9 +156,6 @@ pub(crate) struct Insertion {
     pub(crate) start: usize,
     /// End position in new content
     pub(crate) end: usize,
-    /// The inserted bytes (may not be valid UTF-8)
-    #[allow(dead_code)]
-    pub(crate) bytes: Vec<u8>,
 }
 
 /// Information about a detected move operation
@@ -231,8 +224,6 @@ struct Token {
     lexeme: String,
     start: usize,
     end: usize,
-    #[allow(dead_code)]
-    line: usize,
 }
 
 impl PartialEq for Token {
@@ -485,8 +476,6 @@ impl AttributionTracker {
             new_content,
             (old_start, old_end),
             (new_start, new_end),
-            old_start_line + 1,
-            new_start_line + 1,
         );
 
         computation.diffs.append(&mut hunk_diffs);
@@ -575,17 +564,6 @@ impl AttributionTracker {
         ts: u128,
         is_ai_checkpoint: bool,
     ) -> Result<Vec<Attribution>, GitAiError> {
-        if old_content.contains("\r\n") || new_content.contains("\r\n") {
-            return self.update_attributions_for_checkpoint_normalized_line_endings(
-                old_content,
-                new_content,
-                old_attributions,
-                current_author,
-                ts,
-                is_ai_checkpoint,
-            );
-        }
-
         // Cursor-based scans in transform_attributions assume sorted ranges.
         // Normalize once at the boundary so callers can pass ranges in any order.
         let sorted_old_storage = (!is_attribution_list_sorted(old_attributions))
@@ -624,36 +602,6 @@ impl AttributionTracker {
 
         // Phase 5: Merge and clean up
         Ok(self.merge_attributions(new_attributions))
-    }
-
-    fn update_attributions_for_checkpoint_normalized_line_endings(
-        &self,
-        old_content: &str,
-        new_content: &str,
-        old_attributions: &[Attribution],
-        current_author: &str,
-        ts: u128,
-        is_ai_checkpoint: bool,
-    ) -> Result<Vec<Attribution>, GitAiError> {
-        let old_normalized = normalize_crlf_to_lf(old_content);
-        let new_normalized = normalize_crlf_to_lf(new_content);
-        let old_map = OffsetMapper::new(old_content, old_normalized.as_ref());
-        let new_map = OffsetMapper::new(new_content, new_normalized.as_ref());
-        let normalized_old_attributions =
-            map_attributions_to_normalized(old_attributions, &old_map, old_normalized.len());
-
-        let normalized_attributions = self.update_attributions_for_checkpoint(
-            old_normalized.as_ref(),
-            new_normalized.as_ref(),
-            &normalized_old_attributions,
-            current_author,
-            ts,
-            is_ai_checkpoint,
-        )?;
-
-        let mapped_attributions =
-            map_attributions_to_original(&normalized_attributions, &new_map, new_content.len());
-        Ok(self.merge_attributions(mapped_attributions))
     }
 
     fn should_skip_move_detection(
@@ -715,7 +663,6 @@ impl AttributionTracker {
                     deletions.push(Deletion {
                         start: old_pos,
                         end: old_pos + len,
-                        bytes: bytes.to_vec(),
                     });
                     old_pos += len;
                 }
@@ -725,7 +672,6 @@ impl AttributionTracker {
                     insertions.push(Insertion {
                         start: new_pos,
                         end: new_pos + len,
-                        bytes: bytes.to_vec(),
                     });
                     new_pos += len;
                 }
@@ -1363,18 +1309,13 @@ fn try_match_multi_char_op(ch: char, peek: Option<char>) -> Option<&'static str>
 }
 
 /// Code-optimized tokenizer that treats syntactic elements as meaningful units
-fn tokenize_non_whitespace(
-    content: &str,
-    range: (usize, usize),
-    starting_line: usize,
-) -> Vec<Token> {
+fn tokenize_non_whitespace(content: &str, range: (usize, usize)) -> Vec<Token> {
     let (start, end) = range;
     if start >= end {
         return Vec::new();
     }
 
     let mut tokens = Vec::new();
-    let mut line = starting_line;
 
     let mut i = start;
     while i < end {
@@ -1384,11 +1325,8 @@ fn tokenize_non_whitespace(
         };
         let ch_len = ch.len_utf8();
 
-        // Skip whitespace (track newlines for line counting)
+        // Skip whitespace
         if ch.is_whitespace() {
-            if ch == '\n' {
-                line += 1;
-            }
             i += ch_len;
             continue;
         }
@@ -1401,7 +1339,6 @@ fn tokenize_non_whitespace(
                 lexeme: op.to_string(),
                 start: i,
                 end: i + op_len,
-                line,
             });
             i += op_len;
             continue;
@@ -1424,10 +1361,6 @@ fn tokenize_non_whitespace(
                 let str_ch_len = str_ch.len_utf8();
                 lexeme.push(str_ch);
 
-                if str_ch == '\n' {
-                    line += 1;
-                }
-
                 if escaped {
                     escaped = false;
                 } else if str_ch == '\\' {
@@ -1444,7 +1377,6 @@ fn tokenize_non_whitespace(
                 lexeme,
                 start: token_start,
                 end: i,
-                line,
             });
             continue;
         }
@@ -1493,7 +1425,6 @@ fn tokenize_non_whitespace(
                         lexeme,
                         start: token_start,
                         end: i,
-                        line,
                     });
                     continue;
                 }
@@ -1531,7 +1462,6 @@ fn tokenize_non_whitespace(
                 lexeme,
                 start: token_start,
                 end: i,
-                line,
             });
             continue;
         }
@@ -1560,7 +1490,6 @@ fn tokenize_non_whitespace(
                 lexeme,
                 start: token_start,
                 end: i,
-                line,
             });
             continue;
         }
@@ -1571,7 +1500,6 @@ fn tokenize_non_whitespace(
                 lexeme: ch.to_string(),
                 start: i,
                 end: i + ch_len,
-                line,
             });
             i += ch_len;
             continue;
@@ -1582,7 +1510,6 @@ fn tokenize_non_whitespace(
             lexeme: ch.to_string(),
             start: i,
             end: i + ch_len,
-            line,
         });
         i += ch_len;
     }
@@ -1626,8 +1553,6 @@ fn build_token_aligned_diffs(
     new_content: &str,
     old_range: (usize, usize),
     new_range: (usize, usize),
-    old_start_line: usize,
-    new_start_line: usize,
 ) -> (Vec<ByteDiff>, Vec<(usize, usize)>) {
     let (old_start, old_end) = old_range;
     let (new_start, new_end) = new_range;
@@ -1635,8 +1560,8 @@ fn build_token_aligned_diffs(
     let mut diffs = Vec::new();
     let mut substantive_ranges = Vec::new();
 
-    let old_tokens = tokenize_non_whitespace(old_content, old_range, old_start_line);
-    let new_tokens = tokenize_non_whitespace(new_content, new_range, new_start_line);
+    let old_tokens = tokenize_non_whitespace(old_content, old_range);
+    let new_tokens = tokenize_non_whitespace(new_content, new_range);
 
     if old_tokens.is_empty() && new_tokens.is_empty() {
         append_range_diffs(
@@ -1867,113 +1792,6 @@ fn sort_attributions_for_transform(attributions: &[Attribution]) -> Vec<Attribut
     let mut sorted = attributions.to_vec();
     sorted.sort_by(compare_attribution_order);
     sorted
-}
-
-fn normalize_crlf_to_lf(content: &str) -> Cow<'_, str> {
-    if content.contains("\r\n") {
-        Cow::Owned(content.replace("\r\n", "\n"))
-    } else {
-        Cow::Borrowed(content)
-    }
-}
-
-struct OffsetMapper {
-    original_to_normalized: Vec<usize>,
-    normalized_to_original: Vec<usize>,
-}
-
-impl OffsetMapper {
-    fn new(original: &str, normalized: &str) -> Self {
-        let mut original_to_normalized = vec![0; original.len() + 1];
-        let mut normalized_to_original = Vec::with_capacity(normalized.len() + 1);
-        let bytes = original.as_bytes();
-        let mut original_offset = 0usize;
-        let mut normalized_offset = 0usize;
-
-        normalized_to_original.push(0);
-
-        while original_offset < bytes.len() {
-            original_to_normalized[original_offset] = normalized_offset;
-
-            if bytes[original_offset] == b'\r'
-                && original_offset + 1 < bytes.len()
-                && bytes[original_offset + 1] == b'\n'
-            {
-                original_to_normalized[original_offset + 1] = normalized_offset;
-                original_offset += 2;
-                normalized_offset += 1;
-                normalized_to_original.push(original_offset);
-            } else {
-                original_offset += 1;
-                normalized_offset += 1;
-                normalized_to_original.push(original_offset);
-            }
-        }
-
-        original_to_normalized[original.len()] = normalized_offset;
-
-        debug_assert_eq!(normalized_offset, normalized.len());
-        debug_assert_eq!(normalized_to_original.len(), normalized.len() + 1);
-
-        Self {
-            original_to_normalized,
-            normalized_to_original,
-        }
-    }
-
-    fn to_normalized(&self, original_offset: usize) -> usize {
-        self.original_to_normalized
-            .get(original_offset)
-            .copied()
-            .unwrap_or_else(|| *self.original_to_normalized.last().unwrap_or(&0))
-    }
-
-    fn to_original(&self, normalized_offset: usize) -> usize {
-        self.normalized_to_original
-            .get(normalized_offset)
-            .copied()
-            .unwrap_or_else(|| *self.normalized_to_original.last().unwrap_or(&0))
-    }
-}
-
-fn map_attributions_to_normalized(
-    attributions: &[Attribution],
-    mapper: &OffsetMapper,
-    normalized_len: usize,
-) -> Vec<Attribution> {
-    attributions
-        .iter()
-        .map(|attr| {
-            let start = mapper.to_normalized(attr.start).min(normalized_len);
-            let end = mapper.to_normalized(attr.end).min(normalized_len);
-            Attribution::new(
-                start.min(end),
-                end.max(start),
-                attr.author_id.clone(),
-                attr.ts,
-            )
-        })
-        .collect()
-}
-
-fn map_attributions_to_original(
-    attributions: &[Attribution],
-    mapper: &OffsetMapper,
-    original_len: usize,
-) -> Vec<Attribution> {
-    attributions
-        .iter()
-        .map(|attr| {
-            let start = mapper.to_original(attr.start).min(original_len);
-            let end = mapper.to_original(attr.end).min(original_len);
-            Attribution::new(
-                start.min(end),
-                end.max(start),
-                attr.author_id.clone(),
-                attr.ts,
-            )
-        })
-        .collect()
 }
 
 fn find_attribution_for_insertion<'a>(
@@ -2266,13 +2084,12 @@ fn find_dominant_author_for_line_candidates(
         // Zero-length attributions are deletion markers - they indicate the author
         // deleted content at this position, so they should influence line attribution
         let is_deletion_marker = attribution.start == attribution.end;
-        let is_ai_author = attribution.author_id != CheckpointKind::Human.to_str();
-        let include_ai_whitespace = is_ai_checkpoint
-            && is_ai_author
-            && slice_start < slice_end
-            && full_content[slice_start..slice_end]
-                .chars()
-                .any(|c| c.is_whitespace() && c != '\n' && c != '\r');
+        // h_<hash> IDs are known-human attestations; treat them like "human" for
+        // whitespace-inclusion purposes so their newline ranges don't bleed into
+        // adjacent lines during an AI checkpoint.
+        let is_ai_author = attribution.author_id != CheckpointKind::Human.to_str()
+            && !attribution.author_id.starts_with("h_");
+        let include_ai_whitespace = is_ai_checkpoint && is_ai_author;
         if has_non_whitespace || is_line_empty || is_deletion_marker || include_ai_whitespace {
             candidate_attrs.push(attribution);
         } else {
@@ -2296,9 +2113,8 @@ fn find_dominant_author_for_line_candidates(
     let mut last_ai_edit: Option<&Attribution> = None;
     let mut last_human_edit: Option<&Attribution> = None;
     for attr in &candidate_attrs {
-        // Legacy "human" is the canonical human checkpoint sentinel. Historical
-        // h_<hash> human attestation markers are preserved by compatibility reads.
-        if attr.author_id == CheckpointKind::Human.to_str() {
+        // Both legacy "human" and KnownHuman h_<hash> IDs are human edits.
+        if attr.author_id == CheckpointKind::Human.to_str() || attr.author_id.starts_with("h_") {
             last_human_edit = Some(attr);
         } else {
             last_ai_edit = Some(attr);
@@ -2546,37 +2362,6 @@ mod tests {
 
         let footer_pos = new.find("// Footer").unwrap();
         assert_range_owned_by(&updated, footer_pos, footer_pos + "// Footer".len(), "Bob");
-    }
-
-    #[test]
-    fn ai_checkpoint_newline_only_attribution_does_not_mark_previous_line_ai() {
-        let content = "header\nbody\nfooter\n// AI session 2";
-        let footer_pos = content.find("footer").unwrap();
-        let newline_pos = footer_pos + "footer".len();
-        let ai_pos = content.find("// AI session 2").unwrap();
-
-        let attributions = vec![
-            Attribution::new(0, newline_pos, "human".into(), TEST_TS),
-            Attribution::new(newline_pos, newline_pos + 1, "mock_ai".into(), TEST_TS + 1),
-            Attribution::new(
-                ai_pos,
-                ai_pos + "// AI session 2".len(),
-                "mock_ai".into(),
-                TEST_TS + 1,
-            ),
-        ];
-        let line_attrs =
-            attributions_to_line_attributions_for_checkpoint(&attributions, content, true);
-
-        assert_eq!(
-            line_attrs,
-            vec![LineAttribution {
-                start_line: 4,
-                end_line: 4,
-                author_id: "mock_ai".into(),
-                overrode: None,
-            }]
-        );
     }
 
     #[test]
@@ -2907,45 +2692,6 @@ mod tests {
         let line3_start = "line1\nmodified\n".len();
         let line3_end = "line1\nmodified\nline3".len();
         assert_range_owned_by(&updated, line3_start, line3_end, "Alice");
-    }
-
-    #[test]
-    fn large_crlf_to_lf_with_real_edit_preserves_unchanged_attribution() {
-        let tracker = AttributionTracker::new();
-        let old = (1..=1800)
-            .map(|idx| format!("int value_{idx:04} = {idx};"))
-            .collect::<Vec<_>>()
-            .join("\r\n")
-            + "\r\n";
-
-        let mut new_lines = (1..=1800)
-            .map(|idx| format!("int value_{idx:04} = {idx};"))
-            .collect::<Vec<_>>();
-        new_lines[899] = "int value_0900 = 42;".to_string();
-        let new = new_lines.join("\n") + "\n";
-
-        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
-        let updated = tracker
-            .update_attributions_for_checkpoint(&old, &new, &old_attrs, "Bob", TEST_TS + 1, false)
-            .unwrap();
-
-        assert_range_owned_by(&updated, 0, "int value_0001 = 1;".len(), "Alice");
-
-        let edited_start = new
-            .find("int value_0900 = 42;")
-            .expect("edited line should exist")
-            + "int value_0900 = ".len();
-        assert_range_owned_by(&updated, edited_start, edited_start + "42".len(), "Bob");
-
-        let tail_start = new
-            .find("int value_1800 = 1800;")
-            .expect("tail line should exist");
-        assert_range_owned_by(
-            &updated,
-            tail_start,
-            tail_start + "int value_1800 = 1800;".len(),
-            "Alice",
-        );
     }
 
     #[test]

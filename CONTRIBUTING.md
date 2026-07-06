@@ -7,7 +7,9 @@ Thank you for your interest in contributing to `git-ai`. This is a cool moment f
 ### Prerequisites
 
 - Rust https://rustup.rs/ (compiler and tooling)
-- Taskfile https://taskfile.dev/ (modern make)
+- Taskfile https://taskfile.dev/ (modern make; required for setup commands)
+
+On Windows, use a native PowerShell or Windows Terminal session for setup. If you are working in WSL, follow the Mac/Linux shell examples instead.
 
 ### Development Setup
 
@@ -21,39 +23,43 @@ Thank you for your interest in contributing to `git-ai`. This is a cool moment f
 
 3. **Build the project**:
    ```bash
-   cargo build
+   task build
    ```
 
 4. **Run the tests**:
    ```bash
-   cargo test
+   task test
    ```
 
-5. **Check code coverage** (optional but recommended):
-   ```bash
-   task coverage
-   ```
-
-   The project maintains a minimum code coverage threshold of **50%** (enforced in CI). This threshold is based on the current coverage rounded down to the nearest 5%. Pull requests that reduce coverage below this threshold will fail CI checks.
-
-### (Option 1) Putting a development build on your path
+### Using a development build locally
 
 It's often helpful to point your `git-ai` to a development build. The dev script builds the binary and installs it to `~/.git-ai/bin/git-ai`, replacing the production binary so you can test changes with real git repositories.
 
 ```bash
-sh scripts/dev.sh          # debug build (default)
-sh scripts/dev.sh --release  # release build
+task dev
 ```
 
 If `~/.git-ai` isn't set up yet, the script will run the installer automatically first.
 
-### (Option 2) Running with Cargo
+On Windows, `task dev` runs the Windows development script, installs the current branch build, updates the `git.exe` shim, runs install hooks, and restarts the daemon.
 
-You can run specific `git-ai` commands directly with cargo. Because you're not addressing `git` or `git-ai` you need to tell `cargo` which codepath it should hit:
+Use `task dev` before testing Windows behavior locally. `cargo build` only produces `target\debug\git-ai.exe`; it does not replace the installed `git-ai.exe`, update the `git.exe` shim, run install hooks, or restart the daemon. Testing setup, daemon startup, or git proxy behavior against only `target\debug\git-ai.exe` can give misleading results.
 
-```bash
-GIT_AI=git cargo run -- status
-GIT_AI=git-ai cargo run -- checkpoint
+For changes that affect Windows setup or daemon startup, verify the installed development build in a fresh daemon session:
+
+```powershell
+# 1. Install the current branch build first.
+task dev
+
+# 2. Stop any daemon that was already running.
+~\.git-ai\bin\git-ai.exe bg shutdown --hard
+
+# 3. Trigger daemon startup through the installed git-ai.
+git-ai status
+
+# 4. Confirm the daemon is running.
+git-ai bg status
+Get-Process git-ai -ErrorAction SilentlyContinue
 ```
 
 ## Contributing Changes
@@ -85,7 +91,7 @@ GIT_AI=git-ai cargo run -- checkpoint
 
 ## Code Style
 
-The project uses standard Rust formatting. Please run `cargo fmt` before committing your changes.
+The project uses standard Rust formatting. Please run `task fmt` and `task lint` before committing your changes.
 
 
 ## Getting Help

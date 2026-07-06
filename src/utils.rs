@@ -1,78 +1,13 @@
 use crate::error::GitAiError;
-use crate::git::diff_tree_to_tree::Diff;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 static IS_TERMINAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static IS_IN_BACKGROUND_AGENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub fn is_debug_enabled() -> bool {
-    *DEBUG_ENABLED.get_or_init(|| {
-        (cfg!(debug_assertions)
-            || std::env::var("GIT_AI_DEBUG").unwrap_or_default() == "1"
-            || std::env::var("GIT_AI_DEBUG_PERFORMANCE").unwrap_or_default() != "")
-            && std::env::var("GIT_AI_DEBUG").unwrap_or_default() != "0"
-    })
-}
-/// Print a git diff in a readable format
-///
-/// Prints the diff between two commits/trees showing which files changed and their status.
-/// This is useful for debugging and understanding what changes occurred.
-///
-/// # Arguments
-///
-/// * `diff` - The git diff object to print
-/// * `old_label` - Label for the "old" side (e.g., commit SHA or description)
-/// * `new_label` - Label for the "new" side (e.g., commit SHA or description)
-pub fn _print_diff(diff: &Diff, old_label: &str, new_label: &str) {
-    println!("Diff between {} and {}:", old_label, new_label);
-
-    let mut file_count = 0;
-    for delta in diff.deltas() {
-        file_count += 1;
-        let old_file = delta.old_file().path().unwrap_or(std::path::Path::new(""));
-        let new_file = delta.new_file().path().unwrap_or(std::path::Path::new(""));
-        let status = delta.status();
-
-        println!(
-            "  File {}: {} -> {} (status: {:?})",
-            file_count,
-            old_file.display(),
-            new_file.display(),
-            status
-        );
-    }
-
-    if file_count == 0 {
-        println!("  No changes between {} and {}", old_label, new_label);
-    }
-}
 
 #[inline]
 pub fn normalize_to_posix(path: &str) -> String {
     path.replace('\\', "/")
-}
-
-/// Returns true when async/daemon checkpoint delegation is enabled.
-///
-/// Checks the `async_mode` feature flag first, then falls back to the
-/// `GIT_AI_DAEMON_CHECKPOINT_DELEGATE` environment variable.  Used by both
-/// the main hook handler and the bash tool to skip capture work when the
-/// daemon will not be available to consume captured checkpoint files.
-pub fn checkpoint_delegation_enabled() -> bool {
-    if crate::config::Config::get().feature_flags().async_mode {
-        return true;
-    }
-    matches!(
-        std::env::var("GIT_AI_DAEMON_CHECKPOINT_DELEGATE")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
 }
 
 fn resolve_git_ai_exe_from_invocation_path(path: PathBuf) -> PathBuf {
@@ -175,17 +110,10 @@ pub fn is_interactive_terminal() -> bool {
 
 /// Returns true if the process is running inside a background AI agent environment.
 pub fn is_in_background_agent() -> bool {
-    *IS_IN_BACKGROUND_AGENT.get_or_init(|| {
-        // Claude Code remote agent (Anthropic)
-        std::env::var("CLAUDE_CODE_REMOTE").map(|v| v == "true").unwrap_or(false)
-            // Cursor background agent
-            || std::env::var("CURSOR_AGENT").map(|v| v == "1").unwrap_or(false)
-            // Cloud agent environment (CLOUD_AGENT_* prefix)
-            || std::env::vars().any(|(k, _)| k.starts_with("CLOUD_AGENT_"))
-            || std::path::Path::new("/opt/.devin").is_dir()
-            // Explicit opt-in for cloud/background agent environments
-            || std::env::var("GIT_AI_CLOUD_AGENT").map(|v| v == "1").unwrap_or(false)
-    })
+    !matches!(
+        crate::authorship::background_agent::detect(),
+        crate::authorship::background_agent::BackgroundAgent::None
+    )
 }
 
 /// Returns true if the current process is running with elevated privileges
@@ -415,36 +343,9 @@ pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// Windows-specific flag to start a new process group
 #[cfg(windows)]
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-#[cfg(windows)]
-pub const DETACHED_PROCESS: u32 = 0x00000008;
 /// Windows-specific flag to allow a child process to break away from the current job object
 #[cfg(windows)]
 pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-
-#[cfg(windows)]
-pub fn kill_process_tree_windows(pid: u32) -> Result<(), String> {
-    let output = Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("failed to run taskkill: {}", e))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr_trimmed = stderr.trim();
-    if stderr_trimmed.contains("not found")
-        || stderr_trimmed.contains("There is no running instance")
-    {
-        return Ok(());
-    }
-
-    Err(format!(
-        "taskkill /F /T /PID {} failed: {}",
-        pid, stderr_trimmed
-    ))
-}
 /// Unescape a git-quoted path that may contain octal escape sequences.
 ///
 /// Git quotes filenames containing non-ASCII characters (and some special characters)
@@ -665,12 +566,12 @@ mod tests {
     #[test]
     fn test_internal_git_ai_command_sets_skip_all_hooks_env() {
         let exe = PathBuf::from("/tmp/git-ai-test");
-        let cmd = internal_git_ai_command_with_exe(exe.clone(), "flush-cas");
+        let cmd = internal_git_ai_command_with_exe(exe.clone(), "status");
 
         assert_eq!(cmd.get_program(), exe.as_os_str());
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("flush-cas")]
+            vec![std::ffi::OsStr::new("status")]
         );
         assert!(
             cmd.get_envs().any(|(k, v)| {
@@ -687,7 +588,7 @@ mod tests {
         unsafe {
             std::env::set_var(key, "1");
         }
-        let spawned = spawn_internal_git_ai_subcommand("flush-cas", &[], key, &[]);
+        let spawned = spawn_internal_git_ai_subcommand("status", &[], key, &[]);
         unsafe {
             std::env::remove_var(key);
         }
@@ -699,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_spawn_internal_git_ai_subcommand_requires_non_empty_guard_env() {
-        let spawned = spawn_internal_git_ai_subcommand("flush-cas", &[], "", &[]);
+        let spawned = spawn_internal_git_ai_subcommand("status", &[], "", &[]);
         assert!(!spawned, "spawn should be skipped when guard env is empty");
     }
 
@@ -1289,5 +1190,48 @@ mod tests {
     #[test]
     fn test_create_breakaway_from_job_constant() {
         assert_eq!(CREATE_BREAKAWAY_FROM_JOB, 0x01000000);
+    }
+
+    // =========================================================================
+    // Superuser Guard Tests
+    // =========================================================================
+
+    #[test]
+    #[serial_test::serial]
+    fn test_is_superuser_expected_environment_ci() {
+        let had_ci = std::env::var_os("CI");
+        unsafe { std::env::set_var("CI", "true") };
+        assert!(is_superuser_expected_environment());
+        match had_ci {
+            Some(v) => unsafe { std::env::set_var("CI", v) },
+            None => unsafe { std::env::remove_var("CI") },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_superuser_is_allowed_env_var() {
+        let had_var = std::env::var_os("GIT_AI_ALLOW_SUPERUSER");
+        unsafe { std::env::set_var("GIT_AI_ALLOW_SUPERUSER", "1") };
+        assert!(superuser_is_allowed());
+        unsafe { std::env::set_var("GIT_AI_ALLOW_SUPERUSER", "true") };
+        assert!(superuser_is_allowed());
+        unsafe { std::env::set_var("GIT_AI_ALLOW_SUPERUSER", "TRUE") };
+        assert!(superuser_is_allowed());
+        unsafe { std::env::set_var("GIT_AI_ALLOW_SUPERUSER", "0") };
+        assert!(!superuser_is_allowed());
+        unsafe { std::env::remove_var("GIT_AI_ALLOW_SUPERUSER") };
+        assert!(!superuser_is_allowed());
+        match had_var {
+            Some(v) => unsafe { std::env::set_var("GIT_AI_ALLOW_SUPERUSER", v) },
+            None => unsafe { std::env::remove_var("GIT_AI_ALLOW_SUPERUSER") },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_running_as_superuser_reports_correctly() {
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(is_running_as_superuser(), euid == 0);
     }
 }

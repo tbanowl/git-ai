@@ -5,7 +5,7 @@
 //!
 //! 1. Detecting git repository from file paths when workspace root isn't a git repo
 //! 2. Grouping files by their containing repository
-//! 3. Handling submodules correctly (content files route to the submodule repo)
+//! 3. Handling submodules correctly (should be ignored in favor of parent repo)
 //! 4. Edge cases with nested git directories
 //! 5. Cross-repo checkpoints: AI edits from one repo to files in another repo
 
@@ -16,7 +16,7 @@ use git_ai::git::repository::{
     find_repository_for_file, find_repository_in_path, group_files_by_repository,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,58 +87,6 @@ fn create_file(path: &PathBuf, content: &str) -> Result<(), GitAiError> {
     }
     fs::write(path, content)?;
     Ok(())
-}
-
-fn run_git(path: &Path, args: &[&str]) -> Result<String, GitAiError> {
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(args)
-        .output()
-        .map_err(|e| GitAiError::Generic(format!("Failed to run git {:?}: {}", args, e)))?;
-
-    if !output.status.success() {
-        return Err(GitAiError::Generic(format!(
-            "git {:?} failed in {}:\nstdout:\n{}\nstderr:\n{}",
-            args,
-            path.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn create_parent_with_submodule(
-    workspace: &Path,
-) -> Result<(PathBuf, PathBuf, PathBuf), GitAiError> {
-    let remote_submodule = workspace.join("remote-submodule");
-    init_git_repo(&remote_submodule)?;
-    create_file(&remote_submodule.join("README.md"), "# Remote Submodule\n")?;
-    run_git(&remote_submodule, &["add", "-A"])?;
-    run_git(&remote_submodule, &["commit", "-m", "initial submodule"])?;
-
-    let parent_repo = workspace.join("parent");
-    init_git_repo(&parent_repo)?;
-    create_file(&parent_repo.join("README.md"), "# Parent\n")?;
-    run_git(&parent_repo, &["add", "-A"])?;
-    run_git(&parent_repo, &["commit", "-m", "initial parent"])?;
-
-    run_git(
-        &parent_repo,
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            remote_submodule.to_str().unwrap(),
-            "vendor/submodule",
-        ],
-    )?;
-    run_git(&parent_repo, &["commit", "-m", "add submodule"])?;
-
-    let submodule_path = parent_repo.join("vendor").join("submodule");
-    Ok((parent_repo, submodule_path, remote_submodule))
 }
 
 /// Clean up a temporary directory
@@ -638,94 +586,6 @@ fn test_find_repository_for_file_nested_repos() {
         "Inner file should be in inner repo, got: {}",
         inner_workdir.display()
     );
-
-    cleanup_tmp_dir(&workspace);
-}
-
-#[test]
-fn test_find_repository_for_file_real_submodule_prefers_submodule() {
-    let workspace = create_unique_tmp_dir("git-ai-real-submodule-detect-test").unwrap();
-    let (parent_repo, submodule_path, _remote_submodule) =
-        create_parent_with_submodule(&workspace).unwrap();
-
-    let submodule_file = submodule_path.join("src").join("lib.rs");
-    create_file(&submodule_file, "pub fn generated() {}\n").unwrap();
-
-    let result = find_repository_for_file(
-        submodule_file.to_str().unwrap(),
-        Some(workspace.to_str().unwrap()),
-    );
-
-    assert!(
-        result.is_ok(),
-        "Should find a repository for a file inside an initialized submodule"
-    );
-    let repo = result.unwrap();
-    let workdir = repo.workdir().unwrap().canonicalize().unwrap();
-    assert_eq!(
-        workdir,
-        submodule_path.canonicalize().unwrap(),
-        "Submodule content file should resolve to the submodule repository"
-    );
-
-    let parent_file = parent_repo.join(".gitmodules");
-    let parent_result = find_repository_for_file(
-        parent_file.to_str().unwrap(),
-        Some(workspace.to_str().unwrap()),
-    )
-    .expect(".gitmodules should resolve to the parent repository");
-    assert_eq!(
-        parent_result.workdir().unwrap().canonicalize().unwrap(),
-        parent_repo.canonicalize().unwrap(),
-        ".gitmodules should remain owned by the parent repository"
-    );
-
-    cleanup_tmp_dir(&workspace);
-}
-
-#[test]
-fn test_group_files_by_repository_splits_parent_and_real_submodule() {
-    let workspace = create_unique_tmp_dir("git-ai-real-submodule-group-test").unwrap();
-    let (parent_repo, submodule_path, _remote_submodule) =
-        create_parent_with_submodule(&workspace).unwrap();
-
-    let parent_file = parent_repo.join("parent.txt");
-    let submodule_file = submodule_path.join("src").join("lib.rs");
-    create_file(&parent_file, "parent content\n").unwrap();
-    create_file(&submodule_file, "submodule content\n").unwrap();
-
-    let paths = vec![
-        parent_file.to_str().unwrap().to_string(),
-        submodule_file.to_str().unwrap().to_string(),
-    ];
-    let (repo_files, orphan_files) =
-        group_files_by_repository(&paths, Some(workspace.to_str().unwrap()));
-
-    assert!(
-        orphan_files.is_empty(),
-        "Parent and submodule files should both be associated with repositories: {:?}",
-        orphan_files
-    );
-    assert_eq!(
-        repo_files.len(),
-        2,
-        "Parent and initialized submodule files should be grouped into separate repositories"
-    );
-
-    let parent_key = parent_repo.canonicalize().unwrap();
-    let submodule_key = submodule_path.canonicalize().unwrap();
-    let parent_files = repo_files
-        .iter()
-        .find(|(workdir, _)| workdir.canonicalize().unwrap() == parent_key)
-        .map(|(_, (_repo, files))| files)
-        .expect("Expected parent repo group");
-    let submodule_files = repo_files
-        .iter()
-        .find(|(workdir, _)| workdir.canonicalize().unwrap() == submodule_key)
-        .map(|(_, (_repo, files))| files)
-        .expect("Expected submodule repo group");
-    assert_eq!(parent_files.len(), 1);
-    assert_eq!(submodule_files.len(), 1);
 
     cleanup_tmp_dir(&workspace);
 }

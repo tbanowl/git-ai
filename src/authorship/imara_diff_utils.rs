@@ -185,22 +185,7 @@ pub fn compute_line_changes<'a>(old: &'a str, new: &'a str) -> Vec<LineChange<'a
     let old_norm = normalize_line_endings(old);
     let new_norm = normalize_line_endings(new);
 
-    // Trim leading/trailing whitespace from each line before comparison so
-    // that pure whitespace differences (indent changes, trailing spaces) don't
-    // show as content changes.
-    let old_trimmed: Vec<&str> = split_lines_with_terminators(&old_norm)
-        .into_iter()
-        .map(|l| l.trim())
-        .collect();
-    let new_trimmed: Vec<&str> = split_lines_with_terminators(&new_norm)
-        .into_iter()
-        .map(|l| l.trim())
-        .collect();
-
-    let input = InternedInput::new(
-        SliceTokenSource::new(&old_trimmed),
-        SliceTokenSource::new(&new_trimmed),
-    );
+    let input = InternedInput::new(old_norm.as_ref(), new_norm.as_ref());
     let mut diff = Diff::compute(Algorithm::Myers, &input);
     diff.postprocess_lines(&input);
 
@@ -657,106 +642,6 @@ mod tests {
             crlf_lines.len(),
             lf_lines.len(),
             "CRLF and LF content should produce the same number of lines"
-        );
-    }
-
-    // ====================================================================
-    // Whitespace trimming tests
-    // ====================================================================
-
-    #[test]
-    fn test_whitespace_indent_change_is_equal() {
-        let old = "line1\n  line2\nline3\n";
-        let new = "line1\nline2\nline3\n";
-
-        let changes = compute_line_changes(old, new);
-
-        let tags: Vec<_> = changes.iter().map(|c| c.tag().clone()).collect();
-        assert_eq!(
-            tags,
-            vec![
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-            ],
-            "Indent-only changes should be ignored"
-        );
-    }
-
-    #[test]
-    fn test_whitespace_trailing_spaces_is_equal() {
-        let old = "line1\nline2   \nline3\n";
-        let new = "line1\nline2\nline3\n";
-
-        let changes = compute_line_changes(old, new);
-
-        let tags: Vec<_> = changes.iter().map(|c| c.tag().clone()).collect();
-        assert_eq!(
-            tags,
-            vec![
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-            ],
-            "Trailing-space-only changes should be ignored"
-        );
-    }
-
-    #[test]
-    fn test_whitespace_tab_indent_change_is_equal() {
-        let old = "line1\n\tline2\nline3\n";
-        let new = "line1\nline2\nline3\n";
-
-        let changes = compute_line_changes(old, new);
-
-        let tags: Vec<_> = changes.iter().map(|c| c.tag().clone()).collect();
-        assert_eq!(
-            tags,
-            vec![
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-            ],
-            "Tab-indent changes should be ignored"
-        );
-    }
-
-    #[test]
-    fn test_whitespace_real_change_detected() {
-        let old = "line1\n  line2\nline3\n";
-        let new = "line1\nmodified\nline3\n";
-
-        let changes = compute_line_changes(old, new);
-
-        let tags: Vec<_> = changes.iter().map(|c| c.tag().clone()).collect();
-        assert_eq!(
-            tags,
-            vec![
-                LineChangeTag::Equal,
-                LineChangeTag::Delete,
-                LineChangeTag::Insert,
-                LineChangeTag::Equal,
-            ],
-            "Real content changes should still be detected despite whitespace differences"
-        );
-    }
-
-    #[test]
-    fn test_whitespace_mixed_indent_with_addition() {
-        let old = "  line1\n\tline2\n";
-        let new = "line1\nline2\nline3\n";
-
-        let changes = compute_line_changes(old, new);
-
-        let tags: Vec<_> = changes.iter().map(|c| c.tag().clone()).collect();
-        assert_eq!(
-            tags,
-            vec![
-                LineChangeTag::Equal,
-                LineChangeTag::Equal,
-                LineChangeTag::Insert,
-            ],
-            "Only the genuinely new line should be Insert, indent changes should be Equal"
         );
     }
 }

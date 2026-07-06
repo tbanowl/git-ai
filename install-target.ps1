@@ -582,31 +582,30 @@ if (-not $arch) { Write-ErrorAndExit "Unsupported architecture: $([System.Runtim
 $os = 'windows'
 
 # Determine binary name and download URLs
-$binaryName = "git-ai"
-# $binaryName = "git-ai-$os-$arch"
+# $binaryName = "git-ai"
+$binaryName = "git-ai-$os-$arch"
 
 # Determine release tag
 # Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
-$abstractBinary = Join-Path (Get-Location) "target\release\$binaryName.exe"
-if (Test-Path -LiteralPath $abstractBinary) {
+$abstractBinary = Join-Path (Get-Location) "$binaryName.exe"
+if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
     $releaseTag = 'local'
-} elseif (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
-    $releaseTag = 'local'
+    $abstractBinary = Join-Path (Get-Location) "$binaryName.exe"
 } elseif ($PinnedVersion -ne '__VERSION_PLACEHOLDER__') {
     # Version-pinned install script from a release
     $releaseTag = $PinnedVersion
-    $downloadUrlExe = "$API_PATH/releases/download/$releaseTag/$binaryName.exe"
-    $downloadUrlNoExt = "$API_PATH/releases/download/$releaseTag/$binaryName"
+    $downloadUrlExe = "$API_PATH/worker/releases/download/$releaseTag/$binaryName.exe"
+    $downloadUrlNoExt = "$API_PATH/worker/releases/download/$releaseTag/$binaryName"
 } elseif (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_RELEASE_TAG) -and $env:GIT_AI_RELEASE_TAG -ne 'latest') {
     # Environment variable override
     $releaseTag = $env:GIT_AI_RELEASE_TAG
-    $downloadUrlExe = "$API_PATH/releases/download/$releaseTag/$binaryName.exe"
-    $downloadUrlNoExt = "$API_PATH/releases/download/$releaseTag/$binaryName"
+    $downloadUrlExe = "$API_PATH/worker/releases/download/$releaseTag/$binaryName.exe"
+    $downloadUrlNoExt = "$API_PATH/worker/releases/download/$releaseTag/$binaryName"
 } else {
     # Default to latest
     $releaseTag = 'latest'
-    $downloadUrlExe = "$API_PATH/releases/latest/download/$binaryName.exe"
-    $downloadUrlNoExt = "$API_PATH/releases/latest/download/$binaryName"
+    $downloadUrlExe = "$API_PATH/worker/releases/latest/download/$binaryName.exe"
+    $downloadUrlNoExt = "$API_PATH/worker/releases/latest/download/$binaryName"
 }
 
 # Install directory: %USERPROFILE%\.git-ai\bin
@@ -638,6 +637,7 @@ function Try-Download {
 
 # Track which download URL succeeded for checksum verification
 $downloadedBinaryName = $null
+Write-Host ("Attempting to download from: $downloadUrlExe")
 if (Test-Path -LiteralPath $abstractBinary) {
     Copy-Item -Force -Path $abstractBinary -Destination $tmpFile
     $downloadedBinaryName = "$binaryName.exe"
@@ -653,7 +653,7 @@ if (Test-Path -LiteralPath $abstractBinary) {
 } elseif (Try-Download -Url $downloadUrlNoExt) {
     $downloadedBinaryName = $binaryName
 }
-
+Write-Host ("Downloaded binary: {0}" -f $downloadedBinaryName)
 if (-not $downloadedBinaryName) {
     Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
     Write-ErrorAndExit 'Failed to download binary (HTTP error)'
@@ -876,11 +876,6 @@ try {
 } catch {
     Write-Success 'Warning: Failed config telemetry_enterprise_dsn.'
 }
-
-# If nonce exchange failed, run interactive login
-Write-Host ''
-Write-Host 'Launching login...'
-# & $finalExe login
 
 Write-Host "Config notes_store to rest"
 try {

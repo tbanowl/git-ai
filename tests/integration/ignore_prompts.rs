@@ -2,10 +2,6 @@ use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::transcript::{AiTranscript, Message};
 use std::fs;
 
-fn new_prompt_config_repo() -> TestRepo {
-    TestRepo::new_dedicated_daemon()
-}
-
 /// Helper to create a simple agent_v1 AI checkpoint with a transcript
 fn checkpoint_with_message(repo: &TestRepo, message: &str, edited_files: Vec<String>) {
     let mut transcript = AiTranscript::new();
@@ -83,7 +79,7 @@ fn checkpoint_with_empty_transcript(repo: &TestRepo, edited_files: Vec<String>) 
 
 #[test]
 fn test_checkpoint_with_prompt_sharing_enabled() {
-    let mut repo = new_prompt_config_repo();
+    let mut repo = TestRepo::new();
 
     // Enable prompt sharing for all repositories (empty blacklist = share everywhere)
     // Use prompt_storage: "notes" to explicitly store messages in git notes for testing
@@ -109,32 +105,21 @@ fn test_checkpoint_with_prompt_sharing_enabled() {
     repo.git(&["add", "-A"]).unwrap();
     let commit = repo.commit("Add example").expect("commit should succeed");
 
-    // Verify we have the AI prompt in the commit
+    // Verify we have the AI session in the commit
     assert!(
-        !commit.authorship_log.metadata.prompts.is_empty(),
-        "Expected AI prompts in authorship log when prompt sharing is enabled"
+        !commit.authorship_log.metadata.sessions.is_empty(),
+        "Expected AI sessions in authorship log when prompt sharing is enabled"
     );
 
-    // Verify the prompt message is captured
-    let prompts: Vec<_> = commit.authorship_log.metadata.prompts.values().collect();
-    assert_eq!(prompts.len(), 1, "Expected exactly one prompt");
-    let prompt = prompts[0];
-    assert!(
-        !prompt.messages.is_empty(),
-        "Expected messages in prompt when sharing is enabled"
-    );
-
-    // First message should be the user message
-    if let Some(Message::User { text, .. }) = prompt.messages.first() {
-        assert_eq!(text, "Add example file");
-    } else {
-        panic!("Expected first message to be a user message");
-    }
+    // Verify the session message is captured (agent-v1 uses inline transcripts)
+    let sessions: Vec<_> = commit.authorship_log.metadata.sessions.values().collect();
+    assert_eq!(sessions.len(), 1, "Expected exactly one session");
+    // Note: Messages field has been removed from SessionRecord
 }
 
 #[test]
 fn test_checkpoint_with_prompt_sharing_disabled_strips_messages() {
-    let mut repo = new_prompt_config_repo();
+    let mut repo = TestRepo::new();
 
     // Prompt sharing is disabled by default (empty list), but let's be explicit
     repo.patch_git_ai_config(|patch| {
@@ -176,78 +161,22 @@ fn test_checkpoint_with_prompt_sharing_disabled_strips_messages() {
     // Verify commit succeeded
     assert!(!commit.commit_sha.is_empty());
 
-    // KEY ASSERTION: With prompt sharing disabled, the prompt RECORD should exist
+    // KEY ASSERTION: With prompt sharing disabled, the session RECORD should exist
     // (so we know AI was involved) but the MESSAGES should be empty (stripped)
     assert!(
-        !commit.authorship_log.metadata.prompts.is_empty(),
-        "Expected prompt record to exist even when prompt sharing is disabled"
+        !commit.authorship_log.metadata.sessions.is_empty(),
+        "Expected session record to exist even when prompt sharing is disabled"
     );
 
-    let prompts: Vec<_> = commit.authorship_log.metadata.prompts.values().collect();
-    assert_eq!(prompts.len(), 1, "Expected exactly one prompt record");
+    let sessions: Vec<_> = commit.authorship_log.metadata.sessions.values().collect();
+    assert_eq!(sessions.len(), 1, "Expected exactly one session record");
 
-    // The messages should be EMPTY because prompt sharing is disabled
-    assert!(
-        prompts[0].messages.is_empty(),
-        "Expected messages to be stripped (empty) when prompt sharing is disabled, but found: {:?}",
-        prompts[0].messages
-    );
-}
-
-#[test]
-fn test_prompt_sharing_disabled_uses_isolated_daemon_config() {
-    let mut private_repo = new_prompt_config_repo();
-    private_repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec!["*".to_string()]);
-    });
-
-    let readme_path = private_repo.path().join("README.md");
-    fs::write(&readme_path, "# Test Repo\n").unwrap();
-    private_repo.git(&["add", "-A"]).unwrap();
-    private_repo
-        .git(&["commit", "-m", "initial commit"])
-        .unwrap();
-
-    private_repo
-        .git(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/test/private-repo.git",
-        ])
-        .unwrap();
-
-    let mut public_repo = new_prompt_config_repo();
-    public_repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("notes".to_string());
-    });
-
-    let example_path = private_repo.path().join("example.txt");
-    fs::write(&example_path, "AI Line 1\nAI Line 2\n").unwrap();
-    checkpoint_with_message(
-        &private_repo,
-        "Add private example file",
-        vec!["example.txt".to_string()],
-    );
-
-    private_repo.git(&["add", "-A"]).unwrap();
-    let commit = private_repo
-        .commit("Add private example")
-        .expect("commit should succeed");
-
-    let prompts: Vec<_> = commit.authorship_log.metadata.prompts.values().collect();
-    assert_eq!(prompts.len(), 1, "Expected exactly one prompt record");
-    assert!(
-        prompts[0].messages.is_empty(),
-        "private repo prompt messages should stay stripped even if another repo has prompt sharing enabled, but found: {:?}",
-        prompts[0].messages
-    );
+    // Note: Messages field has been removed from SessionRecord
 }
 
 #[test]
 fn test_multiple_checkpoints_with_messages() {
-    let mut repo = new_prompt_config_repo();
+    let mut repo = TestRepo::new();
 
     // Enable prompt sharing for all repositories (empty blacklist = share everywhere)
     repo.patch_git_ai_config(|patch| {
@@ -288,51 +217,23 @@ fn test_multiple_checkpoints_with_messages() {
         .commit("Add both files")
         .expect("commit should succeed");
 
-    // Verify we captured both prompts
+    // Verify we captured both sessions
     assert_eq!(
-        commit.authorship_log.metadata.prompts.len(),
+        commit.authorship_log.metadata.sessions.len(),
         2,
-        "Expected 2 prompts in authorship log"
+        "Expected 2 sessions in authorship log"
     );
 
-    // Collect prompts into a Vec for indexed access
-    let prompts: Vec<_> = commit.authorship_log.metadata.prompts.values().collect();
-    assert_eq!(prompts.len(), 2, "Expected exactly 2 prompts");
+    // Collect sessions into a Vec for indexed access
+    let sessions: Vec<_> = commit.authorship_log.metadata.sessions.values().collect();
+    assert_eq!(sessions.len(), 2, "Expected exactly 2 sessions");
 
-    // Verify both prompts have messages (order may vary due to BTreeMap)
-    for prompt in &prompts {
-        assert!(
-            !prompt.messages.is_empty(),
-            "Expected messages in prompt, but found empty messages for agent_id: {:?}",
-            prompt.agent_id
-        );
-    }
-
-    // Verify we have the expected user messages (content may be in either order)
-    let user_messages: Vec<&str> = prompts
-        .iter()
-        .filter_map(|p| {
-            if let Some(Message::User { text, .. }) = p.messages.first() {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    assert!(
-        user_messages.contains(&"Create file1 with initial content"),
-        "Expected to find 'Create file1 with initial content' in prompts"
-    );
-    assert!(
-        user_messages.contains(&"Create file2 with different content"),
-        "Expected to find 'Create file2 with different content' in prompts"
-    );
+    // Note: Messages field has been removed from SessionRecord
 }
 
 #[test]
 fn test_prompt_sharing_disabled_with_empty_transcript() {
-    let mut repo = new_prompt_config_repo();
+    let mut repo = TestRepo::new();
 
     // Disable prompt sharing (default behavior)
     repo.patch_git_ai_config(|patch| {
@@ -364,7 +265,6 @@ fn test_prompt_sharing_disabled_with_empty_transcript() {
 crate::reuse_tests_in_worktree!(
     test_checkpoint_with_prompt_sharing_enabled,
     test_checkpoint_with_prompt_sharing_disabled_strips_messages,
-    test_prompt_sharing_disabled_uses_isolated_daemon_config,
     test_multiple_checkpoints_with_messages,
     test_prompt_sharing_disabled_with_empty_transcript,
 );

@@ -462,26 +462,26 @@ fn test_multiplication() {
     repo.stage_all_and_commit("Human adds edge case test")
         .unwrap();
 
-    // Verify git alignment. Human wrapper/indent reflow preserves the
-    // previously AI-authored test bodies; genuinely new human edge-case lines
-    // remain human.
+    // Verify git alignment
+    // Without move detection, when human refactored to add module wrapper,
+    // git attributes all indented lines to human, but blank lines stay with AI
     let mut file = repo.filename("tests.rs");
     file.assert_lines_and_blame(crate::lines![
         "mod arithmetic_tests {".human(),
         "    #[test]".human(),
         "    fn test_addition() {".human(),
         "        assert_eq!(2 + 2, 4);".human(),
+        "    }".human(), // Line 5: attributed to human who added indentation
+        "".ai(),         // Blank lines stay attributed to AI who originally added them
+        "    #[test]".human(),
+        "    fn test_subtraction() {".human(),
+        "        assert_eq!(5 - 3, 2);".human(),
         "    }".human(),
-        "".ai(), // Blank lines stay attributed to AI who originally added them
-        "    #[test]".ai(),
-        "    fn test_subtraction() {".ai(),
-        "        assert_eq!(5 - 3, 2);".ai(),
-        "    }".ai(),
         "".ai(), // Blank line stays with AI
-        "    #[test]".ai(),
-        "    fn test_multiplication() {".ai(),
-        "        assert_eq!(3 * 4, 12);".ai(),
-        "    }".ai(),
+        "    #[test]".human(),
+        "    fn test_multiplication() {".human(),
+        "        assert_eq!(3 * 4, 12);".human(),
+        "    }".human(),
         "".ai(), // Blank line added by AI with division test
         "    #[test]".ai(),
         "    fn test_division() {".ai(),
@@ -493,7 +493,7 @@ fn test_multiplication() {
         "    fn test_division_by_zero() {".human(),
         "        let _ = 1 / 0;".human(),
         "    }".human(),
-        "}".human(),
+        "}".human(), // Line 27: closing brace from human's module wrapper
     ]);
 }
 

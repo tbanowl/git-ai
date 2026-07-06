@@ -50,6 +50,9 @@ unsafe extern "system" {
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
+#[cfg(windows)]
+const GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV: &str = "GIT_AI_RESTART_DAEMON_AFTER_INSTALL";
+const GIT_AI_DAEMON_UPGRADE_ENV: &str = "GIT_AI_DAEMON_UPGRADE";
 const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
 const ENV_BACKGROUND_UPGRADE_WORKER: &str = "GIT_AI_BACKGROUND_UPGRADE_WORKER";
 
@@ -111,10 +114,8 @@ impl UpdateCache {
 
 #[derive(Debug, Deserialize)]
 struct ChannelInfo {
-    tag: String,
     version: String,
     checksum: String,
-    platforms: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,47 +282,12 @@ fn should_check_for_updates(channel: UpdateChannel, cache: Option<&UpdateCache>)
     }
 }
 
-#[cfg(test)]
 fn semver_from_tag(tag: &str) -> String {
     let trimmed = tag
         .trim()
         .trim_start_matches("enterprise-")
         .trim_start_matches('v');
     trimmed.split(['-', '+']).next().unwrap_or("").to_string()
-}
-
-fn is_valid_version(version: &str) -> bool {
-    let parts: Vec<&str> = version.split('.').collect();
-    parts.len() >= 2
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-}
-
-fn current_platform() -> &'static str {
-    #[cfg(windows)]
-    {
-        "windows-x64"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "linux-x64"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "macos-x64"
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        "unknown"
-    }
-}
-
-fn release_supports_current_platform(channel_info: &ChannelInfo) -> bool {
-    channel_info
-        .platforms
-        .as_ref()
-        .is_none_or(|platforms| platforms.iter().any(|platform| platform == current_platform()))
 }
 
 fn determine_action(force: bool, release: &ChannelRelease, current_version: &str) -> UpgradeAction {
@@ -346,6 +312,11 @@ fn persist_update_state(channel: UpdateChannel, release: Option<&ChannelRelease>
         cache.available_semver = Some(release.semver.clone());
     }
     write_update_cache(&cache);
+}
+
+pub(crate) fn clear_cached_update_state() {
+    let channel = config::Config::fresh().update_channel();
+    persist_update_state(channel, None);
 }
 
 fn releases_endpoint() -> &'static str {
@@ -401,10 +372,9 @@ fn fetch_and_verify_checksums(
         crate::http::send(request).map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
 
     if response.status_code != 200 {
-        return Err(release_artifact_http_error(
-            "SHA256SUMS",
-            channel,
-            response.status_code,
+        return Err(format!(
+            "Failed to fetch SHA256SUMS: HTTP {}",
+            response.status_code
         ));
     }
 
@@ -442,10 +412,9 @@ fn fetch_and_verify_install_script(
         .map_err(|e| format!("Failed to fetch {}: {}", script_name, e))?;
 
     if response.status_code != 200 {
-        return Err(release_artifact_http_error(
-            script_name,
-            channel,
-            response.status_code,
+        return Err(format!(
+            "Failed to fetch {}: HTTP {}",
+            script_name, response.status_code
         ));
     }
 
@@ -458,13 +427,6 @@ fn fetch_and_verify_install_script(
         .map_err(|e| format!("{} is not valid UTF-8: {}", script_name, e))?;
 
     Ok(script.to_string())
-}
-
-fn release_artifact_http_error(filename: &str, channel: &str, status_code: u16) -> String {
-    format!(
-        "Release artifact '{}' is not available for channel '{}' (HTTP {})",
-        filename, channel, status_code
-    )
 }
 
 fn fetch_release_for_channel(
@@ -502,22 +464,14 @@ fn release_from_response(
         .get(channel_name)
         .ok_or_else(|| format!("Channel '{}' not found in releases", channel_name))?;
 
-    if !release_supports_current_platform(channel_info) {
-        return Err(format!(
-            "Release for channel '{}' is not available for platform '{}'",
-            channel_name,
-            current_platform()
-        ));
-    }
-
-    let tag = channel_info.tag.trim().to_string();
+    let tag = channel_info.version.trim().to_string();
     if tag.is_empty() {
         return Err("Release tag not found in response".to_string());
     }
 
-    let semver = channel_info.version.trim().to_string();
-    if !is_valid_version(&semver) {
-        return Err(format!("Unable to parse semver from release '{}'", tag));
+    let semver = semver_from_tag(&tag);
+    if semver.is_empty() {
+        return Err(format!("Unable to parse semver from tag '{}'", tag));
     }
 
     let checksum = channel_info.checksum.trim().to_string();
@@ -584,17 +538,21 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
              Start-Transcript -Path $logFile -Append -Force | Out-Null; \
              Write-Host 'Running verified install script...'; \
              try {{ \
-                 $ErrorActionPreference = 'Continue'; \
-                 & '{}'; \
-                 Write-Host 'Install script completed'; \
-             }} catch {{ \
-                 Write-Host \"Error: $_\"; \
-                 Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
-             }} finally {{ \
-                 Stop-Transcript | Out-Null; \
-                 Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
-             }}",
-            log_path_str, script_path_str, script_path_str
+                  $ErrorActionPreference = 'Continue'; \
+                  & '{}'; \
+                  Write-Host 'Install script completed'; \
+              }} catch {{ \
+                  Write-Host \"Error: $_\"; \
+                  Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
+              }} finally {{ \
+                  if ($env:{} -eq '1') {{ \
+                      $daemonExe = Join-Path $HOME '.git-ai\\bin\\git-ai.exe'; \
+                      if (Test-Path $daemonExe) {{ try {{ & $daemonExe bg start *> $null }} catch {{ }} }} \
+                  }}; \
+                  Stop-Transcript | Out-Null; \
+                  Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
+              }}",
+            log_path_str, script_path_str, GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV, script_path_str
         );
 
         let spawn_powershell = |exe: &str| -> std::io::Result<std::process::Child> {
@@ -610,6 +568,8 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
             cmd.creation_flags(CREATE_NO_WINDOW);
 
             if silent {
+                cmd.env(GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV, "1");
+                cmd.env(GIT_AI_DAEMON_UPGRADE_ENV, "1");
                 cmd.stdout(Stdio::null()).stderr(Stdio::null());
             }
 
@@ -668,6 +628,7 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
         cmd.arg(&script_path_str).env(GIT_AI_RELEASE_ENV, tag);
 
         if silent {
+            cmd.env(GIT_AI_DAEMON_UPGRADE_ENV, "1");
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
 
@@ -715,7 +676,7 @@ pub fn run_with_args(args: &[String]) {
 }
 
 fn run_impl(force: bool, background: bool) {
-    let config = config::Config::get();
+    let config = config::Config::fresh();
     let channel = config.update_channel();
     let skip_install = background && config.auto_updates_disabled();
     let _ = run_impl_with_url(force, config.api_base_url(), channel, skip_install);
@@ -1180,8 +1141,8 @@ mod tests {
         let action = run_impl_with_url(
             false,
             &mock_url(&format!(
-                r#"{{"channels":{{"latest":{{"tag":"v999.0.0","version":"999.0.0","checksum":"{}","platforms":["{}"]}},"next":{{"tag":"v999.0.0-next-deadbeef","version":"999.0.0","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"latest":{{"version":"v999.0.0","checksum":"{}"}},"next":{{"version":"v999.0.0-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::Latest,
             true,
@@ -1190,15 +1151,8 @@ mod tests {
 
         // Same version without --force - already latest
         let same_version_payload = format!(
-            "{{\"channels\":{{\"latest\":{{\"tag\":\"v{}\",\"version\":\"{}\",\"checksum\":\"{}\",\"platforms\":[\"{}\"]}},\"next\":{{\"tag\":\"v{}-next-deadbeef\",\"version\":\"{}\",\"checksum\":\"{}\",\"platforms\":[\"{}\"]}}}}}}",
-            current,
-            current,
-            test_checksum,
-            current_platform(),
-            current,
-            current,
-            test_checksum,
-            current_platform()
+            "{{\"channels\":{{\"latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
+            current, test_checksum, current, test_checksum
         );
         let action = run_impl_with_url(
             false,
@@ -1221,8 +1175,8 @@ mod tests {
         let action = run_impl_with_url(
             false,
             &mock_url(&format!(
-                r#"{{"channels":{{"latest":{{"tag":"v1.0.9","version":"1.0.9","checksum":"{}","platforms":["{}"]}},"next":{{"tag":"v1.0.9-next-deadbeef","version":"1.0.9","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"latest":{{"version":"v1.0.9","checksum":"{}"}},"next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::Latest,
             true,
@@ -1233,8 +1187,8 @@ mod tests {
         let action = run_impl_with_url(
             true,
             &mock_url(&format!(
-                r#"{{"channels":{{"latest":{{"tag":"v1.0.9","version":"1.0.9","checksum":"{}","platforms":["{}"]}},"next":{{"tag":"v1.0.9-next-deadbeef","version":"1.0.9","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"latest":{{"version":"v1.0.9","checksum":"{}"}},"next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::Latest,
             true,
@@ -1258,8 +1212,8 @@ mod tests {
         let action = run_impl_with_url(
             false,
             &mock_url(&format!(
-                r#"{{"channels":{{"enterprise-latest":{{"tag":"v999.0.0","version":"999.0.0","checksum":"{}","platforms":["{}"]}},"enterprise-next":{{"tag":"v999.0.0-next-deadbeef","version":"999.0.0","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v999.0.0","checksum":"{}"}},"enterprise-next":{{"version":"v999.0.0-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::EnterpriseLatest,
             true,
@@ -1268,15 +1222,8 @@ mod tests {
 
         // Same version without --force - already latest
         let same_version_payload = format!(
-            "{{\"channels\":{{\"enterprise-latest\":{{\"tag\":\"v{}\",\"version\":\"{}\",\"checksum\":\"{}\",\"platforms\":[\"{}\"]}},\"enterprise-next\":{{\"tag\":\"v{}-next-deadbeef\",\"version\":\"{}\",\"checksum\":\"{}\",\"platforms\":[\"{}\"]}}}}}}",
-            current,
-            current,
-            test_checksum,
-            current_platform(),
-            current,
-            current,
-            test_checksum,
-            current_platform()
+            "{{\"channels\":{{\"enterprise-latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"enterprise-next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
+            current, test_checksum, current, test_checksum
         );
         let action = run_impl_with_url(
             false,
@@ -1299,8 +1246,8 @@ mod tests {
         let action = run_impl_with_url(
             false,
             &mock_url(&format!(
-                r#"{{"channels":{{"enterprise-latest":{{"tag":"v1.0.9","version":"1.0.9","checksum":"{}","platforms":["{}"]}},"enterprise-next":{{"tag":"v1.0.9-next-deadbeef","version":"1.0.9","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v1.0.9","checksum":"{}"}},"enterprise-next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::EnterpriseLatest,
             true,
@@ -1311,8 +1258,8 @@ mod tests {
         let action = run_impl_with_url(
             true,
             &mock_url(&format!(
-                r#"{{"channels":{{"enterprise-latest":{{"tag":"v1.0.9","version":"1.0.9","checksum":"{}","platforms":["{}"]}},"enterprise-next":{{"tag":"v1.0.9-next-deadbeef","version":"1.0.9","checksum":"{}","platforms":["{}"]}}}}}}"#,
-                test_checksum, current_platform(), test_checksum, current_platform()
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v1.0.9","checksum":"{}"}},"enterprise-next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
             )),
             UpdateChannel::EnterpriseLatest,
             true,
@@ -1446,14 +1393,6 @@ mod tests {
         assert!(checksums.contains_key("file1"));
         assert!(checksums.contains_key("file3"));
         assert!(!checksums.contains_key("file2"));
-    }
-
-    #[test]
-    fn test_release_artifact_http_error_names_channel_and_file() {
-        let message = release_artifact_http_error("install.ps1", "latest", 404);
-        assert!(message.contains("install.ps1"));
-        assert!(message.contains("latest"));
-        assert!(message.contains("HTTP 404"));
     }
 
     // --- Additional comprehensive tests ---
@@ -1630,10 +1569,8 @@ mod tests {
         channels.insert(
             "latest".to_string(),
             ChannelInfo {
-                tag: "".to_string(),
                 version: "".to_string(),
                 checksum: "abc123".to_string(),
-                platforms: Some(vec![current_platform().to_string()]),
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1648,10 +1585,8 @@ mod tests {
         channels.insert(
             "latest".to_string(),
             ChannelInfo {
-                tag: "v1.0.0".to_string(),
-                version: "1.0.0".to_string(),
+                version: "v1.0.0".to_string(),
                 checksum: "".to_string(),
-                platforms: Some(vec![current_platform().to_string()]),
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1666,10 +1601,8 @@ mod tests {
         channels.insert(
             "latest".to_string(),
             ChannelInfo {
-                tag: "v-invalid-version".to_string(),
-                version: "invalid".to_string(),
+                version: "v-invalid-version".to_string(),
                 checksum: "abc123".to_string(),
-                platforms: Some(vec![current_platform().to_string()]),
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1684,10 +1617,8 @@ mod tests {
         channels.insert(
             "latest".to_string(),
             ChannelInfo {
-                tag: "v1.2.3".to_string(),
-                version: "1.2.3".to_string(),
+                version: "v1.2.3".to_string(),
                 checksum: "abc123def456".to_string(),
-                platforms: Some(vec![current_platform().to_string()]),
             },
         );
         let releases = ReleasesResponse { channels };
@@ -1697,47 +1628,6 @@ mod tests {
         assert_eq!(release.tag, "v1.2.3");
         assert_eq!(release.semver, "1.2.3");
         assert_eq!(release.checksum, "abc123def456");
-    }
-
-    #[test]
-    fn test_release_from_response_uses_tag_not_version() {
-        let mut channels = HashMap::new();
-        channels.insert(
-            "latest".to_string(),
-            ChannelInfo {
-                tag: "v1.2.3".to_string(),
-                version: "1.2.3".to_string(),
-                checksum: "abc123def456".to_string(),
-                platforms: Some(vec![current_platform().to_string()]),
-            },
-        );
-
-        let release = release_from_response(ReleasesResponse { channels }, UpdateChannel::Latest)
-            .expect("release should parse");
-
-        assert_eq!(release.tag, "v1.2.3");
-        assert_eq!(release.semver, "1.2.3");
-    }
-
-    #[test]
-    fn test_release_from_response_rejects_missing_current_platform() {
-        let mut channels = HashMap::new();
-        channels.insert(
-            "latest".to_string(),
-            ChannelInfo {
-                tag: "v1.2.3".to_string(),
-                version: "1.2.3".to_string(),
-                checksum: "abc123def456".to_string(),
-                platforms: Some(vec!["windows-x64".to_string()]),
-            },
-        );
-
-        let result = release_from_response(ReleasesResponse { channels }, UpdateChannel::Latest);
-
-        #[cfg(windows)]
-        assert!(result.is_ok());
-        #[cfg(not(windows))]
-        assert!(result.unwrap_err().contains("not available for platform"));
     }
 
     #[test]
@@ -1851,11 +1741,9 @@ mod tests {
 
         let test_checksum = "a".repeat(64);
         let mock_payload = format!(
-            r#"{{"channels":{{"latest":{{"tag":"v999.0.0","version":"999.0.0","checksum":"{}","platforms":["{}"]}}}}}}"#,
-            test_checksum,
-            current_platform()
+            r#"{{"channels":{{"latest":{{"version":"v999.0.0","checksum":"{}"}}}}}}"#,
+            test_checksum
         );
-
         // check_for_update_available uses Config::fresh() which reads the real config,
         // but fetch_release_for_channel respects mock:// URLs only in tests.
         // We can't easily inject a mock URL into Config::fresh(), so we test the
@@ -1880,11 +1768,8 @@ mod tests {
         let current = env!("CARGO_PKG_VERSION");
         let test_checksum = "a".repeat(64);
         let mock_payload = format!(
-            r#"{{"channels":{{"latest":{{"tag":"v{}","version":"{}","checksum":"{}","platforms":["{}"]}}}}}}"#,
-            current,
-            current,
-            test_checksum,
-            current_platform()
+            r#"{{"channels":{{"latest":{{"version":"v{}","checksum":"{}"}}}}}}"#,
+            current, test_checksum
         );
         let release =
             fetch_release_for_channel(&format!("mock://{}", mock_payload), UpdateChannel::Latest)
@@ -1909,5 +1794,65 @@ mod tests {
             UpdateChannel::Latest,
             Some(&cache)
         ));
+    }
+
+    fn with_update_check_env(
+        cache_has_update: bool,
+        auto_updates_disabled: bool,
+        f: impl FnOnce(),
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.last_checked_at = current_timestamp();
+        if cache_has_update {
+            cache.available_tag = Some("v99.99.99".to_string());
+            cache.available_semver = Some("99.99.99".to_string());
+        }
+        write_update_cache(&cache);
+
+        let patch = serde_json::json!({
+            "disable_version_checks": false,
+            "disable_auto_updates": auto_updates_disabled
+        })
+        .to_string();
+        unsafe { std::env::set_var("GIT_AI_TEST_CONFIG_PATCH", &patch) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        unsafe { std::env::remove_var("GIT_AI_TEST_CONFIG_PATCH") };
+        clear_test_cache_dir();
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn check_for_update_available_returns_update_ready_when_cache_has_pending_update() {
+        with_update_check_env(true, false, || {
+            let result = check_for_update_available().unwrap();
+            assert_eq!(result, DaemonUpdateCheckResult::UpdateReady);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn check_for_update_available_returns_no_update_when_auto_updates_disabled() {
+        with_update_check_env(true, true, || {
+            let result = check_for_update_available().unwrap();
+            assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn check_for_update_available_returns_no_update_when_cache_has_no_pending_update() {
+        with_update_check_env(false, false, || {
+            let result = check_for_update_available().unwrap();
+            assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+        });
     }
 }

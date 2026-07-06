@@ -2,8 +2,8 @@
 
 use super::pos_encoded::{
     PosEncoded, PosField, sparse_get_string, sparse_get_u32, sparse_get_u64, sparse_get_vec_string,
-    sparse_get_vec_u32, sparse_get_vec_u64, sparse_set, string_to_json, u32_to_json, u64_to_json,
-    vec_string_to_json, vec_u32_to_json, vec_u64_to_json,
+    sparse_get_vec_u32, sparse_set, string_to_json, u32_to_json, u64_to_json, vec_string_to_json,
+    vec_u32_to_json,
 };
 use super::types::{EventValues, MetricEventId, SparseArray};
 
@@ -21,12 +21,17 @@ pub mod committed_pos {
     pub const AI_ACCEPTED: usize = 6;
     pub const TOTAL_AI_ADDITIONS: usize = 7;
     pub const TOTAL_AI_DELETIONS: usize = 8;
-    pub const TIME_WAITING_FOR_AI: usize = 9;
+    // Position 9 was time_waiting_for_ai (removed)
 
     // New scalar fields
     pub const FIRST_CHECKPOINT_TS: usize = 10; // u64 (null if no checkpoints)
     pub const COMMIT_SUBJECT: usize = 11; // String
     pub const COMMIT_BODY: usize = 12; // String (null if empty)
+    pub const AUTHORSHIP_NOTE: usize = 13; // String (full serialized authorship note)
+    pub const HUNKS: usize = 14; // String (JSON array of DiffJsonHunk)
+    pub const AUTHOR_TS: usize = 15; // u64 (git author timestamp, %at)
+    pub const COMMIT_TS: usize = 16; // u64 (git committer timestamp, %ct)
+    pub const PATCH_ID: usize = 17; // String (git patch-id --stable)
 }
 
 /// Values for Event ID 1: committed
@@ -44,15 +49,20 @@ pub mod committed_pos {
 /// | Position | Name | Type |
 /// |----------|------|------|
 /// | 3 | tool_model_pairs | `Vec<String>` |
-/// | 4 | mixed_additions | `Vec<u32>` |
+/// | 4 | (removed) | - |
 /// | 5 | ai_additions | `Vec<u32>` |
 /// | 6 | ai_accepted | `Vec<u32>` |
-/// | 7 | total_ai_additions | `Vec<u32>` |
-/// | 8 | total_ai_deletions | `Vec<u32>` |
-/// | 9 | time_waiting_for_ai | `Vec<u64>` |
+/// | 7 | (removed) | - |
+/// | 8 | (removed) | - |
+/// | 9 | (removed) | - |
 /// | 10 | first_checkpoint_ts | u64 |
 /// | 11 | commit_subject | String |
 /// | 12 | commit_body | String |
+/// | 13 | authorship_note | String |
+/// | 14 | hunks | String |
+/// | 15 | author_ts | u64 |
+/// | 16 | commit_ts | u64 |
+/// | 17 | patch_id | String |
 #[derive(Debug, Clone, Default)]
 pub struct CommittedValues {
     // Scalar fields
@@ -62,17 +72,18 @@ pub struct CommittedValues {
 
     // Array fields (parallel arrays)
     pub tool_model_pairs: PosField<Vec<String>>,
-    pub mixed_additions: PosField<Vec<u32>>,
     pub ai_additions: PosField<Vec<u32>>,
     pub ai_accepted: PosField<Vec<u32>>,
-    pub total_ai_additions: PosField<Vec<u32>>,
-    pub total_ai_deletions: PosField<Vec<u32>>,
-    pub time_waiting_for_ai: PosField<Vec<u64>>,
 
     // New scalar fields
     pub first_checkpoint_ts: PosField<u64>,
     pub commit_subject: PosField<String>,
     pub commit_body: PosField<String>,
+    pub authorship_note: PosField<String>,
+    pub hunks: PosField<String>,
+    pub author_ts: PosField<u64>,
+    pub commit_ts: PosField<u64>,
+    pub patch_id: PosField<String>,
 }
 
 impl CommittedValues {
@@ -128,17 +139,6 @@ impl CommittedValues {
         self
     }
 
-    pub fn mixed_additions(mut self, value: Vec<u32>) -> Self {
-        self.mixed_additions = Some(Some(value));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn mixed_additions_null(mut self) -> Self {
-        self.mixed_additions = Some(None);
-        self
-    }
-
     pub fn ai_additions(mut self, value: Vec<u32>) -> Self {
         self.ai_additions = Some(Some(value));
         self
@@ -158,39 +158,6 @@ impl CommittedValues {
     #[allow(dead_code)]
     pub fn ai_accepted_null(mut self) -> Self {
         self.ai_accepted = Some(None);
-        self
-    }
-
-    pub fn total_ai_additions(mut self, value: Vec<u32>) -> Self {
-        self.total_ai_additions = Some(Some(value));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn total_ai_additions_null(mut self) -> Self {
-        self.total_ai_additions = Some(None);
-        self
-    }
-
-    pub fn total_ai_deletions(mut self, value: Vec<u32>) -> Self {
-        self.total_ai_deletions = Some(Some(value));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn total_ai_deletions_null(mut self) -> Self {
-        self.total_ai_deletions = Some(None);
-        self
-    }
-
-    pub fn time_waiting_for_ai(mut self, value: Vec<u64>) -> Self {
-        self.time_waiting_for_ai = Some(Some(value));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn time_waiting_for_ai_null(mut self) -> Self {
-        self.time_waiting_for_ai = Some(None);
         self
     }
 
@@ -225,6 +192,56 @@ impl CommittedValues {
         self.commit_body = Some(None);
         self
     }
+
+    pub fn authorship_note(mut self, value: impl Into<String>) -> Self {
+        self.authorship_note = Some(Some(value.into()));
+        self
+    }
+
+    pub fn authorship_note_null(mut self) -> Self {
+        self.authorship_note = Some(None);
+        self
+    }
+
+    pub fn hunks(mut self, value: impl Into<String>) -> Self {
+        self.hunks = Some(Some(value.into()));
+        self
+    }
+
+    pub fn hunks_null(mut self) -> Self {
+        self.hunks = Some(None);
+        self
+    }
+
+    pub fn author_ts(mut self, value: u64) -> Self {
+        self.author_ts = Some(Some(value));
+        self
+    }
+
+    pub fn author_ts_null(mut self) -> Self {
+        self.author_ts = Some(None);
+        self
+    }
+
+    pub fn commit_ts(mut self, value: u64) -> Self {
+        self.commit_ts = Some(Some(value));
+        self
+    }
+
+    pub fn commit_ts_null(mut self) -> Self {
+        self.commit_ts = Some(None);
+        self
+    }
+
+    pub fn patch_id(mut self, value: impl Into<String>) -> Self {
+        self.patch_id = Some(Some(value.into()));
+        self
+    }
+
+    pub fn patch_id_null(mut self) -> Self {
+        self.patch_id = Some(None);
+        self
+    }
 }
 
 impl PosEncoded for CommittedValues {
@@ -256,11 +273,6 @@ impl PosEncoded for CommittedValues {
         );
         sparse_set(
             &mut map,
-            committed_pos::MIXED_ADDITIONS,
-            vec_u32_to_json(&self.mixed_additions),
-        );
-        sparse_set(
-            &mut map,
             committed_pos::AI_ADDITIONS,
             vec_u32_to_json(&self.ai_additions),
         );
@@ -268,21 +280,6 @@ impl PosEncoded for CommittedValues {
             &mut map,
             committed_pos::AI_ACCEPTED,
             vec_u32_to_json(&self.ai_accepted),
-        );
-        sparse_set(
-            &mut map,
-            committed_pos::TOTAL_AI_ADDITIONS,
-            vec_u32_to_json(&self.total_ai_additions),
-        );
-        sparse_set(
-            &mut map,
-            committed_pos::TOTAL_AI_DELETIONS,
-            vec_u32_to_json(&self.total_ai_deletions),
-        );
-        sparse_set(
-            &mut map,
-            committed_pos::TIME_WAITING_FOR_AI,
-            vec_u64_to_json(&self.time_waiting_for_ai),
         );
 
         // New scalar fields
@@ -301,6 +298,27 @@ impl PosEncoded for CommittedValues {
             committed_pos::COMMIT_BODY,
             string_to_json(&self.commit_body),
         );
+        sparse_set(
+            &mut map,
+            committed_pos::AUTHORSHIP_NOTE,
+            string_to_json(&self.authorship_note),
+        );
+        sparse_set(&mut map, committed_pos::HUNKS, string_to_json(&self.hunks));
+        sparse_set(
+            &mut map,
+            committed_pos::AUTHOR_TS,
+            u64_to_json(&self.author_ts),
+        );
+        sparse_set(
+            &mut map,
+            committed_pos::COMMIT_TS,
+            u64_to_json(&self.commit_ts),
+        );
+        sparse_set(
+            &mut map,
+            committed_pos::PATCH_ID,
+            string_to_json(&self.patch_id),
+        );
 
         map
     }
@@ -314,17 +332,18 @@ impl PosEncoded for CommittedValues {
 
             // Array fields
             tool_model_pairs: sparse_get_vec_string(arr, committed_pos::TOOL_MODEL_PAIRS),
-            mixed_additions: sparse_get_vec_u32(arr, committed_pos::MIXED_ADDITIONS),
             ai_additions: sparse_get_vec_u32(arr, committed_pos::AI_ADDITIONS),
             ai_accepted: sparse_get_vec_u32(arr, committed_pos::AI_ACCEPTED),
-            total_ai_additions: sparse_get_vec_u32(arr, committed_pos::TOTAL_AI_ADDITIONS),
-            total_ai_deletions: sparse_get_vec_u32(arr, committed_pos::TOTAL_AI_DELETIONS),
-            time_waiting_for_ai: sparse_get_vec_u64(arr, committed_pos::TIME_WAITING_FOR_AI),
 
             // New scalar fields
             first_checkpoint_ts: sparse_get_u64(arr, committed_pos::FIRST_CHECKPOINT_TS),
             commit_subject: sparse_get_string(arr, committed_pos::COMMIT_SUBJECT),
             commit_body: sparse_get_string(arr, committed_pos::COMMIT_BODY),
+            authorship_note: sparse_get_string(arr, committed_pos::AUTHORSHIP_NOTE),
+            hunks: sparse_get_string(arr, committed_pos::HUNKS),
+            author_ts: sparse_get_u64(arr, committed_pos::AUTHOR_TS),
+            commit_ts: sparse_get_u64(arr, committed_pos::COMMIT_TS),
+            patch_id: sparse_get_string(arr, committed_pos::PATCH_ID),
         }
     }
 }
@@ -332,6 +351,286 @@ impl PosEncoded for CommittedValues {
 impl EventValues for CommittedValues {
     fn event_id() -> MetricEventId {
         MetricEventId::Committed
+    }
+
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
+/// Value positions for "rewrite_committed" event.
+pub mod rewrite_committed_pos {
+    pub const HUMAN_ADDITIONS: usize = 0;
+    pub const GIT_DIFF_DELETED_LINES: usize = 1;
+    pub const GIT_DIFF_ADDED_LINES: usize = 2;
+    pub const TOOL_MODEL_PAIRS: usize = 3;
+    // Keep positions 0-14 aligned with committed_pos for ingestion consistency.
+    // Position 4 mirrors committed_pos::MIXED_ADDITIONS, which is no longer emitted.
+    pub const AI_ADDITIONS: usize = 5;
+    pub const AI_ACCEPTED: usize = 6;
+    // Positions 7-9 mirror removed committed event fields.
+    // Position 10 is intentionally omitted: rewrite events have no first checkpoint timestamp.
+    pub const COMMIT_SUBJECT: usize = 11;
+    pub const COMMIT_BODY: usize = 12;
+    pub const AUTHORSHIP_NOTE: usize = 13;
+    pub const HUNKS: usize = 14;
+    pub const OPERATION_KIND: usize = 15;
+    pub const ORIGINAL_COMMIT_SHAS: usize = 16;
+}
+
+/// Values for Event ID 7: rewrite_committed.
+///
+/// Recorded after rewrite operations create new commit SHAs and authorship
+/// notes have been migrated to those post-rewrite commits.
+#[derive(Debug, Clone, Default)]
+pub struct RewriteCommittedValues {
+    pub human_additions: PosField<u32>,
+    pub git_diff_deleted_lines: PosField<u32>,
+    pub git_diff_added_lines: PosField<u32>,
+    pub tool_model_pairs: PosField<Vec<String>>,
+    pub ai_additions: PosField<Vec<u32>>,
+    pub ai_accepted: PosField<Vec<u32>>,
+    pub commit_subject: PosField<String>,
+    pub commit_body: PosField<String>,
+    pub authorship_note: PosField<String>,
+    pub hunks: PosField<String>,
+    pub operation_kind: PosField<String>,
+    pub original_commit_shas: PosField<Vec<String>>,
+}
+
+impl RewriteCommittedValues {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn human_additions(mut self, value: u32) -> Self {
+        self.human_additions = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn human_additions_null(mut self) -> Self {
+        self.human_additions = Some(None);
+        self
+    }
+
+    pub fn git_diff_deleted_lines(mut self, value: u32) -> Self {
+        self.git_diff_deleted_lines = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn git_diff_deleted_lines_null(mut self) -> Self {
+        self.git_diff_deleted_lines = Some(None);
+        self
+    }
+
+    pub fn git_diff_added_lines(mut self, value: u32) -> Self {
+        self.git_diff_added_lines = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn git_diff_added_lines_null(mut self) -> Self {
+        self.git_diff_added_lines = Some(None);
+        self
+    }
+
+    pub fn tool_model_pairs(mut self, value: Vec<String>) -> Self {
+        self.tool_model_pairs = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn tool_model_pairs_null(mut self) -> Self {
+        self.tool_model_pairs = Some(None);
+        self
+    }
+
+    pub fn ai_additions(mut self, value: Vec<u32>) -> Self {
+        self.ai_additions = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn ai_additions_null(mut self) -> Self {
+        self.ai_additions = Some(None);
+        self
+    }
+
+    pub fn ai_accepted(mut self, value: Vec<u32>) -> Self {
+        self.ai_accepted = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn ai_accepted_null(mut self) -> Self {
+        self.ai_accepted = Some(None);
+        self
+    }
+
+    pub fn commit_subject(mut self, value: impl Into<String>) -> Self {
+        self.commit_subject = Some(Some(value.into()));
+        self
+    }
+
+    pub fn commit_subject_null(mut self) -> Self {
+        self.commit_subject = Some(None);
+        self
+    }
+
+    pub fn commit_body(mut self, value: impl Into<String>) -> Self {
+        self.commit_body = Some(Some(value.into()));
+        self
+    }
+
+    pub fn commit_body_null(mut self) -> Self {
+        self.commit_body = Some(None);
+        self
+    }
+
+    pub fn authorship_note(mut self, value: impl Into<String>) -> Self {
+        self.authorship_note = Some(Some(value.into()));
+        self
+    }
+
+    pub fn authorship_note_null(mut self) -> Self {
+        self.authorship_note = Some(None);
+        self
+    }
+
+    pub fn hunks(mut self, value: impl Into<String>) -> Self {
+        self.hunks = Some(Some(value.into()));
+        self
+    }
+
+    pub fn hunks_null(mut self) -> Self {
+        self.hunks = Some(None);
+        self
+    }
+
+    pub fn operation_kind(mut self, value: impl Into<String>) -> Self {
+        self.operation_kind = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn operation_kind_null(mut self) -> Self {
+        self.operation_kind = Some(None);
+        self
+    }
+
+    pub fn original_commit_shas(mut self, value: Vec<String>) -> Self {
+        self.original_commit_shas = Some(Some(value));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn original_commit_shas_null(mut self) -> Self {
+        self.original_commit_shas = Some(None);
+        self
+    }
+}
+
+impl PosEncoded for RewriteCommittedValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::HUMAN_ADDITIONS,
+            u32_to_json(&self.human_additions),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::GIT_DIFF_DELETED_LINES,
+            u32_to_json(&self.git_diff_deleted_lines),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::GIT_DIFF_ADDED_LINES,
+            u32_to_json(&self.git_diff_added_lines),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::TOOL_MODEL_PAIRS,
+            vec_string_to_json(&self.tool_model_pairs),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::AI_ADDITIONS,
+            vec_u32_to_json(&self.ai_additions),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::AI_ACCEPTED,
+            vec_u32_to_json(&self.ai_accepted),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::COMMIT_SUBJECT,
+            string_to_json(&self.commit_subject),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::COMMIT_BODY,
+            string_to_json(&self.commit_body),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::AUTHORSHIP_NOTE,
+            string_to_json(&self.authorship_note),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::HUNKS,
+            string_to_json(&self.hunks),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::OPERATION_KIND,
+            string_to_json(&self.operation_kind),
+        );
+        sparse_set(
+            &mut map,
+            rewrite_committed_pos::ORIGINAL_COMMIT_SHAS,
+            vec_string_to_json(&self.original_commit_shas),
+        );
+
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        Self {
+            human_additions: sparse_get_u32(arr, rewrite_committed_pos::HUMAN_ADDITIONS),
+            git_diff_deleted_lines: sparse_get_u32(
+                arr,
+                rewrite_committed_pos::GIT_DIFF_DELETED_LINES,
+            ),
+            git_diff_added_lines: sparse_get_u32(arr, rewrite_committed_pos::GIT_DIFF_ADDED_LINES),
+            tool_model_pairs: sparse_get_vec_string(arr, rewrite_committed_pos::TOOL_MODEL_PAIRS),
+            ai_additions: sparse_get_vec_u32(arr, rewrite_committed_pos::AI_ADDITIONS),
+            ai_accepted: sparse_get_vec_u32(arr, rewrite_committed_pos::AI_ACCEPTED),
+            commit_subject: sparse_get_string(arr, rewrite_committed_pos::COMMIT_SUBJECT),
+            commit_body: sparse_get_string(arr, rewrite_committed_pos::COMMIT_BODY),
+            authorship_note: sparse_get_string(arr, rewrite_committed_pos::AUTHORSHIP_NOTE),
+            hunks: sparse_get_string(arr, rewrite_committed_pos::HUNKS),
+            operation_kind: sparse_get_string(arr, rewrite_committed_pos::OPERATION_KIND),
+            original_commit_shas: sparse_get_vec_string(
+                arr,
+                rewrite_committed_pos::ORIGINAL_COMMIT_SHAS,
+            ),
+        }
+    }
+}
+
+impl EventValues for RewriteCommittedValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::RewriteCommitted
     }
 
     fn to_sparse(&self) -> SparseArray {
@@ -383,7 +682,7 @@ impl EventValues for AgentUsageValues {
 /// Value positions for "install_hooks" event.
 /// One event per tool attempted during install-hooks.
 pub mod install_hooks_pos {
-    pub const TOOL_ID: usize = 0; // String - tool id (e.g., "cursor", "fork")
+    pub const TOOL_ID: usize = 0; // String - tool id (e.g., "cursor", "vscode")
     pub const STATUS: usize = 1; // String - "not_found", "installed", "already_installed", "failed"
     pub const MESSAGE: usize = 2; // Option<String> - error message or warnings
 }
@@ -488,6 +787,10 @@ pub mod checkpoint_pos {
     pub const LINES_DELETED: usize = 4; // u32 - for this file
     pub const LINES_ADDED_SLOC: usize = 5; // u32 - for this file
     pub const LINES_DELETED_SLOC: usize = 6; // u32 - for this file
+    pub const TOOL_USE_ID: usize = 7; // String - nullable
+    pub const EDIT_KIND: usize = 8; // String - nullable ("file_edit" | "bash")
+    pub const CHECKPOINT_TYPE: usize = 9; // String - nullable ("recovered_bash", etc.)
+    pub const ATTRIBUTION_RECOVERY_METADATA: usize = 10; // String - nullable JSON
 }
 
 /// Values for Event ID 4: checkpoint
@@ -505,6 +808,10 @@ pub mod checkpoint_pos {
 /// | 4 | lines_deleted | u32 |
 /// | 5 | lines_added_sloc | u32 |
 /// | 6 | lines_deleted_sloc | u32 |
+/// | 7 | external_tool_use_id | String (nullable) |
+/// | 8 | edit_kind | String (nullable) |
+/// | 9 | checkpoint_type | String (nullable) |
+/// | 10 | attribution_recovery_metadata | String (nullable JSON) |
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointValues {
     pub checkpoint_ts: PosField<u64>,
@@ -514,6 +821,10 @@ pub struct CheckpointValues {
     pub lines_deleted: PosField<u32>,
     pub lines_added_sloc: PosField<u32>,
     pub lines_deleted_sloc: PosField<u32>,
+    pub external_tool_use_id: PosField<String>,
+    pub edit_kind: PosField<String>,
+    pub checkpoint_type: PosField<String>,
+    pub attribution_recovery_metadata: PosField<String>,
 }
 
 impl CheckpointValues {
@@ -597,6 +908,50 @@ impl CheckpointValues {
         self.lines_deleted_sloc = Some(None);
         self
     }
+
+    pub fn external_tool_use_id(mut self, value: impl Into<String>) -> Self {
+        self.external_tool_use_id = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn external_tool_use_id_null(mut self) -> Self {
+        self.external_tool_use_id = Some(None);
+        self
+    }
+
+    pub fn edit_kind(mut self, value: impl Into<String>) -> Self {
+        self.edit_kind = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn edit_kind_null(mut self) -> Self {
+        self.edit_kind = Some(None);
+        self
+    }
+
+    pub fn checkpoint_type(mut self, value: impl Into<String>) -> Self {
+        self.checkpoint_type = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn checkpoint_type_null(mut self) -> Self {
+        self.checkpoint_type = Some(None);
+        self
+    }
+
+    pub fn attribution_recovery_metadata(mut self, value: impl Into<String>) -> Self {
+        self.attribution_recovery_metadata = Some(Some(value.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn attribution_recovery_metadata_null(mut self) -> Self {
+        self.attribution_recovery_metadata = Some(None);
+        self
+    }
 }
 
 impl PosEncoded for CheckpointValues {
@@ -634,6 +989,26 @@ impl PosEncoded for CheckpointValues {
             checkpoint_pos::LINES_DELETED_SLOC,
             u32_to_json(&self.lines_deleted_sloc),
         );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::TOOL_USE_ID,
+            string_to_json(&self.external_tool_use_id),
+        );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::EDIT_KIND,
+            string_to_json(&self.edit_kind),
+        );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::CHECKPOINT_TYPE,
+            string_to_json(&self.checkpoint_type),
+        );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::ATTRIBUTION_RECOVERY_METADATA,
+            string_to_json(&self.attribution_recovery_metadata),
+        );
 
         map
     }
@@ -647,6 +1022,13 @@ impl PosEncoded for CheckpointValues {
             lines_deleted: sparse_get_u32(arr, checkpoint_pos::LINES_DELETED),
             lines_added_sloc: sparse_get_u32(arr, checkpoint_pos::LINES_ADDED_SLOC),
             lines_deleted_sloc: sparse_get_u32(arr, checkpoint_pos::LINES_DELETED_SLOC),
+            external_tool_use_id: sparse_get_string(arr, checkpoint_pos::TOOL_USE_ID),
+            edit_kind: sparse_get_string(arr, checkpoint_pos::EDIT_KIND),
+            checkpoint_type: sparse_get_string(arr, checkpoint_pos::CHECKPOINT_TYPE),
+            attribution_recovery_metadata: sparse_get_string(
+                arr,
+                checkpoint_pos::ATTRIBUTION_RECOVERY_METADATA,
+            ),
         }
     }
 }
@@ -677,12 +1059,8 @@ mod tests {
             .git_diff_deleted_lines(20)
             .git_diff_added_lines(150)
             .tool_model_pairs(vec!["all".to_string(), "claude-code:claude-3".to_string()])
-            .mixed_additions(vec![30, 20])
             .ai_additions(vec![100, 70])
-            .ai_accepted(vec![80, 55])
-            .total_ai_additions(vec![120, 80])
-            .total_ai_deletions(vec![25, 15])
-            .time_waiting_for_ai(vec![5000, 3000]);
+            .ai_accepted(vec![80, 55]);
 
         assert_eq!(values.human_additions, Some(Some(50)));
         assert_eq!(
@@ -728,6 +1106,28 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_values_with_commit_timestamps_and_patch_id() {
+        use super::PosEncoded;
+
+        let values = CommittedValues::new()
+            .author_ts(1_704_067_200)
+            .commit_ts(1_704_067_260)
+            .patch_id("abc123");
+
+        let sparse = PosEncoded::to_sparse(&values);
+
+        assert_eq!(
+            sparse.get("15"),
+            Some(&Value::Number(1_704_067_200u64.into()))
+        );
+        assert_eq!(
+            sparse.get("16"),
+            Some(&Value::Number(1_704_067_260u64.into()))
+        );
+        assert_eq!(sparse.get("17"), Some(&Value::String("abc123".to_string())));
+    }
+
+    #[test]
     fn test_committed_values_from_sparse() {
         use super::PosEncoded;
 
@@ -760,6 +1160,53 @@ mod tests {
     fn test_committed_values_event_id() {
         assert_eq!(CommittedValues::event_id(), MetricEventId::Committed);
         assert_eq!(CommittedValues::event_id() as u16, 1);
+    }
+
+    #[test]
+    fn test_rewrite_committed_values_event_id() {
+        assert_eq!(
+            RewriteCommittedValues::event_id(),
+            MetricEventId::RewriteCommitted
+        );
+        assert_eq!(RewriteCommittedValues::event_id() as u16, 7);
+    }
+
+    #[test]
+    fn test_rewrite_committed_values_sparse_roundtrip() {
+        let original = RewriteCommittedValues::new()
+            .human_additions(5)
+            .git_diff_deleted_lines(2)
+            .git_diff_added_lines(7)
+            .tool_model_pairs(vec!["all".to_string(), "codex:gpt-5".to_string()])
+            .ai_additions(vec![3, 3])
+            .ai_accepted(vec![3, 3])
+            .commit_subject("rebased commit")
+            .commit_body_null()
+            .authorship_note("note")
+            .hunks("[]")
+            .operation_kind("rebase")
+            .original_commit_shas(vec!["old1".to_string()]);
+
+        let sparse = PosEncoded::to_sparse(&original);
+
+        assert!(!sparse.contains_key("10"));
+        assert_eq!(sparse.get("15"), Some(&Value::String("rebase".to_string())));
+        assert_eq!(
+            sparse.get("16"),
+            Some(&Value::Array(vec![Value::String("old1".to_string())]))
+        );
+
+        let restored = <RewriteCommittedValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.human_additions, Some(Some(5)));
+        assert_eq!(
+            restored.tool_model_pairs,
+            Some(Some(vec!["all".to_string(), "codex:gpt-5".to_string()]))
+        );
+        assert_eq!(restored.operation_kind, Some(Some("rebase".to_string())));
+        assert_eq!(
+            restored.original_commit_shas,
+            Some(Some(vec!["old1".to_string()]))
+        );
     }
 
     #[test]
@@ -803,7 +1250,10 @@ mod tests {
             .human_additions(25)
             .first_checkpoint_ts(1700000000)
             .commit_subject("Test commit")
-            .commit_body_null();
+            .commit_body_null()
+            .author_ts(1700000100)
+            .commit_ts(1700000200)
+            .patch_id("stable-patch-id");
 
         let sparse = PosEncoded::to_sparse(&original);
         let restored = <CommittedValues as PosEncoded>::from_sparse(&sparse);
@@ -815,6 +1265,40 @@ mod tests {
             Some(Some("Test commit".to_string()))
         );
         assert_eq!(restored.commit_body, Some(None));
+        assert_eq!(restored.author_ts, Some(Some(1700000100)));
+        assert_eq!(restored.commit_ts, Some(Some(1700000200)));
+        assert_eq!(restored.patch_id, Some(Some("stable-patch-id".to_string())));
+    }
+
+    #[test]
+    fn test_committed_values_with_hunks() {
+        let hunks_json = r#"[{"commit_sha":"abc123","content_hash":"def456","hunk_kind":"addition","start_line":1,"end_line":5,"file_path":"src/main.rs"}]"#;
+        let values = CommittedValues::new().human_additions(10).hunks(hunks_json);
+
+        assert_eq!(values.hunks, Some(Some(hunks_json.to_string())));
+    }
+
+    #[test]
+    fn test_committed_values_hunks_null() {
+        let values = CommittedValues::new().hunks_null();
+        assert_eq!(values.hunks, Some(None));
+    }
+
+    #[test]
+    fn test_committed_values_hunks_roundtrip() {
+        use super::PosEncoded;
+
+        let hunks_json = r#"[{"commit_sha":"abc","content_hash":"def","hunk_kind":"addition","start_line":1,"end_line":3,"file_path":"test.rs"}]"#;
+        let original = CommittedValues::new().human_additions(5).hunks(hunks_json);
+
+        let sparse = PosEncoded::to_sparse(&original);
+        assert_eq!(
+            sparse.get("14"),
+            Some(&Value::String(hunks_json.to_string()))
+        );
+
+        let restored = <CommittedValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.hunks, Some(Some(hunks_json.to_string())));
     }
 
     #[test]
@@ -858,7 +1342,7 @@ mod tests {
     #[test]
     fn test_install_hooks_values_with_null_message() {
         let values = InstallHooksValues::new()
-            .tool_id("fork".to_string())
+            .tool_id("vscode".to_string())
             .status("not_found".to_string())
             .message_null();
 
@@ -1000,38 +1484,739 @@ mod tests {
     fn test_committed_values_with_all_arrays() {
         let values = CommittedValues::new()
             .tool_model_pairs(vec!["all".to_string(), "cursor:gpt-4".to_string()])
-            .mixed_additions(vec![10, 5])
             .ai_additions(vec![100, 50])
-            .ai_accepted(vec![80, 40])
-            .total_ai_additions(vec![120, 60])
-            .total_ai_deletions(vec![20, 10])
-            .time_waiting_for_ai(vec![5000, 3000]);
+            .ai_accepted(vec![80, 40]);
 
         assert_eq!(
             values.tool_model_pairs,
             Some(Some(vec!["all".to_string(), "cursor:gpt-4".to_string()]))
         );
-        assert_eq!(values.mixed_additions, Some(Some(vec![10, 5])));
         assert_eq!(values.ai_additions, Some(Some(vec![100, 50])));
         assert_eq!(values.ai_accepted, Some(Some(vec![80, 40])));
-        assert_eq!(values.total_ai_additions, Some(Some(vec![120, 60])));
-        assert_eq!(values.total_ai_deletions, Some(Some(vec![20, 10])));
-        assert_eq!(values.time_waiting_for_ai, Some(Some(vec![5000, 3000])));
     }
 
     #[test]
     fn test_committed_values_array_nulls() {
-        let values = CommittedValues::new()
-            .mixed_additions_null()
-            .ai_accepted_null()
-            .total_ai_additions_null()
-            .total_ai_deletions_null()
-            .time_waiting_for_ai_null();
+        let values = CommittedValues::new().ai_accepted_null();
 
-        assert_eq!(values.mixed_additions, Some(None));
         assert_eq!(values.ai_accepted, Some(None));
-        assert_eq!(values.total_ai_additions, Some(None));
-        assert_eq!(values.total_ai_deletions, Some(None));
-        assert_eq!(values.time_waiting_for_ai, Some(None));
+    }
+
+    #[test]
+    fn test_checkpoint_values_with_external_tool_use_id() {
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1704067200)
+            .kind("ai_agent")
+            .file_path("src/main.rs")
+            .lines_added(50)
+            .external_tool_use_id("tool-use-123");
+
+        assert_eq!(
+            values.external_tool_use_id,
+            Some(Some("tool-use-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_values_external_tool_use_id_null() {
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1704067200)
+            .kind("human")
+            .external_tool_use_id_null();
+
+        assert_eq!(values.external_tool_use_id, Some(None));
+    }
+
+    #[test]
+    fn test_checkpoint_values_to_sparse_with_external_tool_use_id() {
+        use super::PosEncoded;
+
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1700000000)
+            .kind("ai_agent")
+            .file_path("tests/test.rs")
+            .lines_added(100)
+            .external_tool_use_id("tool-xyz");
+
+        let sparse = PosEncoded::to_sparse(&values);
+
+        assert_eq!(sparse.get("0"), Some(&Value::Number(1700000000.into())));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&Value::String("ai_agent".to_string()))
+        );
+        assert_eq!(
+            sparse.get("2"),
+            Some(&Value::String("tests/test.rs".to_string()))
+        );
+        assert_eq!(sparse.get("3"), Some(&Value::Number(100.into())));
+        assert_eq!(
+            sparse.get("7"),
+            Some(&Value::String("tool-xyz".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_values_from_sparse_with_external_tool_use_id() {
+        use super::PosEncoded;
+
+        let mut sparse = SparseArray::new();
+        sparse.insert("0".to_string(), Value::Number(1704067200.into()));
+        sparse.insert("1".to_string(), Value::String("ai_tab".to_string()));
+        sparse.insert("2".to_string(), Value::String("lib.rs".to_string()));
+        sparse.insert("3".to_string(), Value::Number(75.into()));
+        sparse.insert("7".to_string(), Value::String("tool-abc".to_string()));
+
+        let values = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(values.checkpoint_ts, Some(Some(1704067200)));
+        assert_eq!(values.kind, Some(Some("ai_tab".to_string())));
+        assert_eq!(values.file_path, Some(Some("lib.rs".to_string())));
+        assert_eq!(values.lines_added, Some(Some(75)));
+        assert_eq!(
+            values.external_tool_use_id,
+            Some(Some("tool-abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_values_roundtrip_with_external_tool_use_id() {
+        use super::PosEncoded;
+
+        let original = CheckpointValues::new()
+            .checkpoint_ts(1700000000)
+            .kind("ai_agent")
+            .file_path("src/lib.rs")
+            .lines_added(50)
+            .external_tool_use_id_null();
+
+        let sparse = PosEncoded::to_sparse(&original);
+        let restored = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(restored.checkpoint_ts, Some(Some(1700000000)));
+        assert_eq!(restored.kind, Some(Some("ai_agent".to_string())));
+        assert_eq!(restored.file_path, Some(Some("src/lib.rs".to_string())));
+        assert_eq!(restored.lines_added, Some(Some(50)));
+        assert_eq!(restored.external_tool_use_id, Some(None)); // explicitly null
+    }
+
+    #[test]
+    fn test_checkpoint_values_external_tool_use_id_not_set() {
+        use super::PosEncoded;
+
+        let mut sparse = SparseArray::new();
+        sparse.insert("0".to_string(), Value::Number(1700000000.into()));
+        sparse.insert("1".to_string(), Value::String("human".to_string()));
+        // external_tool_use_id not included
+
+        let values = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(values.external_tool_use_id, None); // not set
+    }
+
+    #[test]
+    fn test_checkpoint_values_with_edit_kind() {
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1704067200)
+            .kind("ai_agent")
+            .file_path("src/main.rs")
+            .edit_kind("file_edit");
+
+        assert_eq!(values.edit_kind, Some(Some("file_edit".to_string())));
+    }
+
+    #[test]
+    fn test_checkpoint_values_edit_kind_null() {
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1704067200)
+            .kind("ai_agent")
+            .edit_kind_null();
+
+        assert_eq!(values.edit_kind, Some(None));
+    }
+
+    #[test]
+    fn test_checkpoint_values_with_recovery_metadata() {
+        use super::PosEncoded;
+
+        let values = CheckpointValues::new()
+            .checkpoint_type("recovered_bash")
+            .attribution_recovery_metadata(r#"{"solver":"bash_mtime"}"#);
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(
+            sparse.get("9"),
+            Some(&Value::String("recovered_bash".to_string()))
+        );
+        assert_eq!(
+            sparse.get("10"),
+            Some(&Value::String(r#"{"solver":"bash_mtime"}"#.to_string()))
+        );
+
+        let restored = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(
+            restored.checkpoint_type,
+            Some(Some("recovered_bash".to_string()))
+        );
+        assert_eq!(
+            restored.attribution_recovery_metadata,
+            Some(Some(r#"{"solver":"bash_mtime"}"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_values_to_sparse_with_edit_kind() {
+        use super::PosEncoded;
+
+        let values = CheckpointValues::new()
+            .checkpoint_ts(1700000000)
+            .kind("ai_agent")
+            .file_path("tests/test.rs")
+            .edit_kind("bash");
+
+        let sparse = PosEncoded::to_sparse(&values);
+
+        assert_eq!(sparse.get("0"), Some(&Value::Number(1700000000.into())));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&Value::String("ai_agent".to_string()))
+        );
+        assert_eq!(sparse.get("8"), Some(&Value::String("bash".to_string())));
+    }
+
+    #[test]
+    fn test_checkpoint_values_from_sparse_with_edit_kind() {
+        use super::PosEncoded;
+
+        let mut sparse = SparseArray::new();
+        sparse.insert("0".to_string(), Value::Number(1704067200.into()));
+        sparse.insert("1".to_string(), Value::String("ai_agent".to_string()));
+        sparse.insert("2".to_string(), Value::String("lib.rs".to_string()));
+        sparse.insert("8".to_string(), Value::String("file_edit".to_string()));
+
+        let values = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(values.checkpoint_ts, Some(Some(1704067200)));
+        assert_eq!(values.kind, Some(Some("ai_agent".to_string())));
+        assert_eq!(values.edit_kind, Some(Some("file_edit".to_string())));
+    }
+
+    #[test]
+    fn test_checkpoint_values_roundtrip_with_edit_kind() {
+        use super::PosEncoded;
+
+        let original = CheckpointValues::new()
+            .checkpoint_ts(1700000000)
+            .kind("ai_agent")
+            .file_path("src/lib.rs")
+            .lines_added(50)
+            .edit_kind("bash");
+
+        let sparse = PosEncoded::to_sparse(&original);
+        let restored = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(restored.checkpoint_ts, Some(Some(1700000000)));
+        assert_eq!(restored.kind, Some(Some("ai_agent".to_string())));
+        assert_eq!(restored.file_path, Some(Some("src/lib.rs".to_string())));
+        assert_eq!(restored.lines_added, Some(Some(50)));
+        assert_eq!(restored.edit_kind, Some(Some("bash".to_string())));
+    }
+
+    #[test]
+    fn test_checkpoint_values_edit_kind_not_set() {
+        use super::PosEncoded;
+
+        let mut sparse = SparseArray::new();
+        sparse.insert("0".to_string(), Value::Number(1700000000.into()));
+        sparse.insert("1".to_string(), Value::String("human".to_string()));
+
+        let values = <CheckpointValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(values.edit_kind, None);
+    }
+}
+
+/// Value positions for "session_event" event.
+pub mod session_event_pos {
+    pub const RAW_JSON: usize = 0;
+    pub const EXTERNAL_EVENT_ID: usize = 1;
+    pub const EXTERNAL_PARENT_EVENT_ID: usize = 2;
+    pub const EXTERNAL_TOOL_USE_ID: usize = 3;
+}
+
+/// Values for Event ID 5: session_event
+///
+/// Each event is the raw JSON from the agent's transcript file, stored at position 0.
+/// Uses EventAttributes for session_id, trace_id, tool metadata.
+#[derive(Debug, Clone, Default)]
+pub struct SessionEventValues {
+    pub raw_json: serde_json::Value,
+    pub external_event_id: Option<String>,
+    pub external_parent_event_id: Option<String>,
+    pub external_tool_use_id: Option<String>,
+}
+
+impl SessionEventValues {
+    pub fn new(raw_json: serde_json::Value) -> Self {
+        Self {
+            raw_json,
+            external_event_id: None,
+            external_parent_event_id: None,
+            external_tool_use_id: None,
+        }
+    }
+
+    pub fn with_ids(
+        raw_json: serde_json::Value,
+        external_event_id: Option<String>,
+        external_parent_event_id: Option<String>,
+        external_tool_use_id: Option<String>,
+    ) -> Self {
+        Self {
+            raw_json,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id,
+        }
+    }
+}
+
+impl PosEncoded for SessionEventValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+        map.insert(
+            session_event_pos::RAW_JSON.to_string(),
+            self.raw_json.clone(),
+        );
+        if let Some(ref id) = self.external_event_id {
+            map.insert(
+                session_event_pos::EXTERNAL_EVENT_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        if let Some(ref id) = self.external_parent_event_id {
+            map.insert(
+                session_event_pos::EXTERNAL_PARENT_EVENT_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        if let Some(ref id) = self.external_tool_use_id {
+            map.insert(
+                session_event_pos::EXTERNAL_TOOL_USE_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        let raw_json = arr
+            .get(&session_event_pos::RAW_JSON.to_string())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let external_event_id = arr
+            .get(&session_event_pos::EXTERNAL_EVENT_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let external_parent_event_id = arr
+            .get(&session_event_pos::EXTERNAL_PARENT_EVENT_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let external_tool_use_id = arr
+            .get(&session_event_pos::EXTERNAL_TOOL_USE_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Self {
+            raw_json,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id,
+        }
+    }
+}
+
+impl EventValues for SessionEventValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::SessionEvent
+    }
+
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+
+    fn into_sparse(self) -> SparseArray {
+        let mut map = SparseArray::new();
+        map.insert(session_event_pos::RAW_JSON.to_string(), self.raw_json);
+        if let Some(id) = self.external_event_id {
+            map.insert(
+                session_event_pos::EXTERNAL_EVENT_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        if let Some(id) = self.external_parent_event_id {
+            map.insert(
+                session_event_pos::EXTERNAL_PARENT_EVENT_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        if let Some(id) = self.external_tool_use_id {
+            map.insert(
+                session_event_pos::EXTERNAL_TOOL_USE_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
+pub mod otel_trace_pos {
+    pub const RAW_JSON: usize = 0;
+    pub const EXTERNAL_EVENT_ID: usize = 1;
+    pub const EXTERNAL_PARENT_EVENT_ID: usize = 2;
+    pub const EXTERNAL_TOOL_USE_ID: usize = 3;
+}
+
+/// Values for Event ID 6: otel_trace
+///
+/// Each event is an OTEL span from a Copilot traces SQLite DB, stored as JSON at position 0.
+/// Uses EventAttributes for session_id, trace_id, tool metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OtelTraceValues {
+    pub raw_json: serde_json::Value,
+    pub external_event_id: Option<String>,
+    pub external_parent_event_id: Option<String>,
+    pub external_tool_use_id: Option<String>,
+}
+
+impl OtelTraceValues {
+    pub fn new(raw_json: serde_json::Value) -> Self {
+        Self {
+            raw_json,
+            external_event_id: None,
+            external_parent_event_id: None,
+            external_tool_use_id: None,
+        }
+    }
+
+    pub fn with_ids(
+        raw_json: serde_json::Value,
+        external_event_id: Option<String>,
+        external_parent_event_id: Option<String>,
+        external_tool_use_id: Option<String>,
+    ) -> Self {
+        Self {
+            raw_json,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id,
+        }
+    }
+}
+
+impl PosEncoded for OtelTraceValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+        map.insert(otel_trace_pos::RAW_JSON.to_string(), self.raw_json.clone());
+        if let Some(ref id) = self.external_event_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_EVENT_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        if let Some(ref id) = self.external_parent_event_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_PARENT_EVENT_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        if let Some(ref id) = self.external_tool_use_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_TOOL_USE_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        let raw_json = arr
+            .get(&otel_trace_pos::RAW_JSON.to_string())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let external_event_id = arr
+            .get(&otel_trace_pos::EXTERNAL_EVENT_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let external_parent_event_id = arr
+            .get(&otel_trace_pos::EXTERNAL_PARENT_EVENT_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let external_tool_use_id = arr
+            .get(&otel_trace_pos::EXTERNAL_TOOL_USE_ID.to_string())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Self {
+            raw_json,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id,
+        }
+    }
+}
+
+impl EventValues for OtelTraceValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::OtelTrace
+    }
+
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+
+    fn into_sparse(self) -> SparseArray {
+        let mut map = SparseArray::new();
+        map.insert(otel_trace_pos::RAW_JSON.to_string(), self.raw_json);
+        if let Some(id) = self.external_event_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_EVENT_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        if let Some(id) = self.external_parent_event_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_PARENT_EVENT_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        if let Some(id) = self.external_tool_use_id {
+            map.insert(
+                otel_trace_pos::EXTERNAL_TOOL_USE_ID.to_string(),
+                serde_json::Value::String(id),
+            );
+        }
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
+#[cfg(test)]
+mod session_event_tests {
+    use super::*;
+
+    #[test]
+    fn test_session_event_values_new() {
+        let raw = serde_json::json!({"type": "user", "uuid": "abc"});
+        let values = SessionEventValues::new(raw.clone());
+        assert_eq!(values.raw_json, raw);
+        assert_eq!(values.external_event_id, None);
+        assert_eq!(values.external_parent_event_id, None);
+        assert_eq!(values.external_tool_use_id, None);
+    }
+
+    #[test]
+    fn test_session_event_values_with_ids() {
+        let raw = serde_json::json!({"type": "assistant"});
+        let values = SessionEventValues::with_ids(
+            raw.clone(),
+            Some("evt-123".to_string()),
+            Some("parent-456".to_string()),
+            Some("toolu_789".to_string()),
+        );
+
+        assert_eq!(values.raw_json, raw);
+        assert_eq!(values.external_event_id, Some("evt-123".to_string()));
+        assert_eq!(
+            values.external_parent_event_id,
+            Some("parent-456".to_string())
+        );
+        assert_eq!(values.external_tool_use_id, Some("toolu_789".to_string()));
+    }
+
+    #[test]
+    fn test_session_event_values_sparse_roundtrip_with_ids() {
+        let raw = serde_json::json!({"type": "assistant", "data": 42});
+        let values = SessionEventValues::with_ids(
+            raw.clone(),
+            Some("event-id".to_string()),
+            Some("parent-id".to_string()),
+            Some("tool-use-id".to_string()),
+        );
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&serde_json::Value::String("event-id".to_string()))
+        );
+        assert_eq!(
+            sparse.get("2"),
+            Some(&serde_json::Value::String("parent-id".to_string()))
+        );
+        assert_eq!(
+            sparse.get("3"),
+            Some(&serde_json::Value::String("tool-use-id".to_string()))
+        );
+
+        let restored = <SessionEventValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.raw_json, raw);
+        assert_eq!(restored.external_event_id, Some("event-id".to_string()));
+        assert_eq!(
+            restored.external_parent_event_id,
+            Some("parent-id".to_string())
+        );
+        assert_eq!(
+            restored.external_tool_use_id,
+            Some("tool-use-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_session_event_values_sparse_none_ids_omitted() {
+        let raw = serde_json::json!({"type": "user"});
+        let values = SessionEventValues::new(raw.clone());
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(sparse.get("1"), None);
+        assert_eq!(sparse.get("2"), None);
+        assert_eq!(sparse.get("3"), None);
+    }
+
+    #[test]
+    fn test_session_event_values_into_sparse_with_ids() {
+        let raw = serde_json::json!({"msg": "hello"});
+        let values = SessionEventValues::with_ids(
+            raw.clone(),
+            Some("eid".to_string()),
+            None,
+            Some("tid".to_string()),
+        );
+
+        let sparse = EventValues::into_sparse(values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&serde_json::Value::String("eid".to_string()))
+        );
+        assert_eq!(sparse.get("2"), None);
+        assert_eq!(
+            sparse.get("3"),
+            Some(&serde_json::Value::String("tid".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_otel_trace_values_new() {
+        let raw = serde_json::json!({"span": {"span_id": "abc", "trace_id": "t1"}});
+        let values = OtelTraceValues::new(raw.clone());
+        assert_eq!(values.raw_json, raw);
+        assert_eq!(values.external_event_id, None);
+        assert_eq!(values.external_parent_event_id, None);
+        assert_eq!(values.external_tool_use_id, None);
+    }
+
+    #[test]
+    fn test_otel_trace_values_with_ids() {
+        let raw = serde_json::json!({"span": {"span_id": "s1", "trace_id": "t1"}});
+        let values = OtelTraceValues::with_ids(
+            raw.clone(),
+            Some("span-123".to_string()),
+            Some("parent-456".to_string()),
+            Some("call-789".to_string()),
+        );
+
+        assert_eq!(values.raw_json, raw);
+        assert_eq!(values.external_event_id, Some("span-123".to_string()));
+        assert_eq!(
+            values.external_parent_event_id,
+            Some("parent-456".to_string())
+        );
+        assert_eq!(values.external_tool_use_id, Some("call-789".to_string()));
+    }
+
+    #[test]
+    fn test_otel_trace_values_sparse_roundtrip_with_ids() {
+        let raw = serde_json::json!({"span": {"span_id": "s1", "trace_id": "t1"}, "attributes": {"key": "val"}});
+        let values = OtelTraceValues::with_ids(
+            raw.clone(),
+            Some("span-id".to_string()),
+            Some("parent-id".to_string()),
+            Some("tool-call-id".to_string()),
+        );
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&serde_json::Value::String("span-id".to_string()))
+        );
+        assert_eq!(
+            sparse.get("2"),
+            Some(&serde_json::Value::String("parent-id".to_string()))
+        );
+        assert_eq!(
+            sparse.get("3"),
+            Some(&serde_json::Value::String("tool-call-id".to_string()))
+        );
+
+        let restored = <OtelTraceValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.raw_json, raw);
+        assert_eq!(restored.external_event_id, Some("span-id".to_string()));
+        assert_eq!(
+            restored.external_parent_event_id,
+            Some("parent-id".to_string())
+        );
+        assert_eq!(
+            restored.external_tool_use_id,
+            Some("tool-call-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_otel_trace_values_sparse_none_ids_omitted() {
+        let raw = serde_json::json!({"span": {"span_id": "s1"}});
+        let values = OtelTraceValues::new(raw.clone());
+
+        let sparse = PosEncoded::to_sparse(&values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(sparse.get("1"), None);
+        assert_eq!(sparse.get("2"), None);
+        assert_eq!(sparse.get("3"), None);
+    }
+
+    #[test]
+    fn test_otel_trace_values_into_sparse_with_ids() {
+        let raw = serde_json::json!({"data": "test"});
+        let values = OtelTraceValues::with_ids(
+            raw.clone(),
+            Some("eid".to_string()),
+            None,
+            Some("tid".to_string()),
+        );
+
+        let sparse = EventValues::into_sparse(values);
+        assert_eq!(sparse.get("0"), Some(&raw));
+        assert_eq!(
+            sparse.get("1"),
+            Some(&serde_json::Value::String("eid".to_string()))
+        );
+        assert_eq!(sparse.get("2"), None);
+        assert_eq!(
+            sparse.get("3"),
+            Some(&serde_json::Value::String("tid".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_otel_trace_values_event_id() {
+        assert_eq!(OtelTraceValues::event_id(), MetricEventId::OtelTrace);
+        assert_eq!(OtelTraceValues::event_id() as u16, 6);
     }
 }

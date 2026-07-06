@@ -1,6 +1,6 @@
 //! Global daemon telemetry handle for sending events over the control socket.
 //!
-//! When async_mode is enabled, this handle is initialized once on process start
+//! When daemon mode is active, this handle is initialized once on process start
 //! and used by the observability and metrics modules to route events through the
 //! daemon instead of writing to per-PID log files.
 //!
@@ -11,7 +11,6 @@
 use crate::daemon::control_api::{
     CasSyncPayload, ControlRequest, ControlResponse, TelemetryEnvelope,
 };
-use crate::daemon::domain::RepoContext;
 use crate::daemon::{DaemonClientStream, open_local_socket_stream_with_timeout};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -20,11 +19,11 @@ use std::time::Duration;
 
 /// Read/write timeout for the persistent daemon socket.
 /// Prevents indefinite blocking if the daemon becomes unresponsive.
-const DAEMON_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum time to wait for the daemon socket on process start.
 #[cfg(not(any(test, feature = "test-support")))]
-const DAEMON_TELEMETRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_TELEMETRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Global handle to the daemon control socket for telemetry submission.
 static DAEMON_TELEMETRY_HANDLE: OnceLock<Mutex<Option<DaemonTelemetryHandle>>> = OnceLock::new();
@@ -107,7 +106,7 @@ pub enum DaemonTelemetryInitResult {
 
 /// Initialize the global daemon telemetry handle.
 ///
-/// Should be called once on process start when `async_mode` is enabled.
+/// Should be called once on process start when daemon mode is active.
 /// Attempts to connect to the daemon control socket (starting the daemon if needed)
 /// with a 2-second timeout. The connection is kept open and reused for all
 /// subsequent telemetry and CAS submissions.
@@ -120,8 +119,7 @@ pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
         return DaemonTelemetryInitResult::Skipped;
     }
 
-    // In test builds, only connect if the daemon control socket is explicitly set
-    // (i.e., wrapper-daemon mode where the test harness manages the daemon).
+    // In test builds, only connect if the daemon control socket is explicitly set.
     #[cfg(any(test, feature = "test-support"))]
     {
         let socket_path = std::env::var("GIT_AI_DAEMON_CONTROL_SOCKET")
@@ -244,32 +242,12 @@ pub fn submit_cas(records: Vec<CasSyncPayload>) {
     let _ = send_via_daemon(&request);
 }
 
-/// Send wrapper pre-command state to the daemon.
-/// Returns an error if the send fails (caller decides whether to log/ignore).
-pub fn send_wrapper_pre_state(
-    invocation_id: &str,
-    repo_working_dir: &str,
-    repo_context: RepoContext,
-) -> Result<(), String> {
-    let request = ControlRequest::WrapperPreState {
-        invocation_id: invocation_id.to_string(),
-        repo_working_dir: repo_working_dir.to_string(),
-        repo_context,
-    };
-    send_via_daemon(&request).map(|_| ())
-}
-
-/// Send wrapper post-command state to the daemon.
-/// Returns an error if the send fails (caller decides whether to log/ignore).
-pub fn send_wrapper_post_state(
-    invocation_id: &str,
-    repo_working_dir: &str,
-    repo_context: RepoContext,
-) -> Result<(), String> {
-    let request = ControlRequest::WrapperPostState {
-        invocation_id: invocation_id.to_string(),
-        repo_working_dir: repo_working_dir.to_string(),
-        repo_context,
-    };
-    send_via_daemon(&request).map(|_| ())
+/// Signal the daemon that new notes are pending in `notes-db` and should be
+/// flushed to the remote backend.
+///
+/// Fire-and-forget: silently drops on failure (flush will happen on the next
+/// periodic tick regardless).
+pub fn submit_notes() {
+    let request = ControlRequest::FlushNotes;
+    let _ = send_via_daemon(&request);
 }

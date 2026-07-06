@@ -1,5 +1,8 @@
 name: End-to-End Tests
 
+permissions:
+  contents: read
+
 on:
   schedule:
     - cron: '0 3 * * *'  # 3 AM UTC nightly
@@ -20,12 +23,12 @@ on:
   workflow_dispatch:
 
 env:
-  # Async mode: each Unix job starts a per-job daemon via
-  # start-async-daemon.sh which exports GIT_AI_TEST_FORCE_TTY and
-  # GIT_AI_POST_COMMIT_TIMEOUT_MS so the wrapper polls for authorship
-  # notes after commits.  Windows jobs override this to "false" because
-  # Unix-domain sockets are not available there.
-  GIT_AI_ASYNC_MODE: "true"
+  # The daemon is always required — the git proxy only performs attribution
+  # when connected to a daemon (see git_handlers.rs). Each job starts a
+  # per-job daemon via start-async-daemon.sh (Unix) or inline PowerShell
+  # (Windows, using named pipes).
+  GIT_AI_TEST_FORCE_TTY: "1"
+  GIT_AI_POST_COMMIT_TIMEOUT_MS: "30000"
 
 jobs:
   install-local-unix:
@@ -53,20 +56,19 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
-          override: true
 
       - name: Build git-ai
         run: cargo build --release --bin git-ai
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -99,10 +101,10 @@ jobs:
               grep -F "checkpoint claude" "$HOME/.claude/settings.json"
               ;;
             codex)
-              # Codex writes a feature flag to config.toml and the actual hook
-              # commands to hooks.json (separate file since the hooks refactor).
-              grep -F "codex_hooks" "$HOME/.codex/config.toml"
-              grep -F "checkpoint" "$HOME/.codex/hooks.json"
+              # Codex writes inline hooks directly in config.toml (no separate hooks.json).
+              # The feature flag is [features].hooks = true.
+              grep -F 'hooks = true' "$HOME/.codex/config.toml"
+              grep -F "checkpoint codex" "$HOME/.codex/config.toml"
               ;;
             gemini)
               grep -F "checkpoint gemini" "$HOME/.gemini/settings.json"
@@ -169,7 +171,7 @@ jobs:
 
       - name: Upload E2E test results
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-install-${{ matrix.agent.name }}-${{ matrix.os }}
           path: /tmp/e2e-results/
@@ -179,9 +181,6 @@ jobs:
   install-local-windows:
     name: E2E ${{ matrix.agent.name }} on windows-latest
     runs-on: windows-latest
-    env:
-      # Windows does not support Unix-domain sockets for the async daemon.
-      GIT_AI_ASYNC_MODE: "false"
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -203,20 +202,19 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
-          override: true
 
       - name: Build git-ai
         run: cargo build --release --bin git-ai
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -262,12 +260,11 @@ jobs:
               if (-not (Select-String -Path $settings -Pattern "checkpoint claude")) { throw "Claude hooks not configured" }
             }
             "codex" {
-              # Codex writes a feature flag to config.toml and the actual hook
-              # commands to hooks.json (separate file since the hooks refactor).
+              # Codex writes inline hooks directly in config.toml (no separate hooks.json).
+              # The feature flag is [features].hooks = true.
               $config = Join-Path $env:USERPROFILE ".codex\config.toml"
-              if (-not (Select-String -Path $config -Pattern "codex_hooks")) { throw "Codex feature flag not set in config.toml" }
-              $hooks = Join-Path $env:USERPROFILE ".codex\hooks.json"
-              if (-not (Select-String -Path $hooks -Pattern "checkpoint")) { throw "Codex hooks not configured in hooks.json" }
+              if (-not (Select-String -Path $config -Pattern "hooks = true")) { throw "Codex hooks feature flag not set in config.toml" }
+              if (-not (Select-String -Path $config -Pattern "checkpoint codex")) { throw "Codex hooks not configured in config.toml" }
             }
             "gemini" {
               $settings = Join-Path $env:USERPROFILE ".gemini\settings.json"
@@ -310,6 +307,47 @@ jobs:
           # Run git-ai install in the test repo
           & $gitAiExe install
           if ($LASTEXITCODE -ne 0) { throw "git-ai install failed with exit code $LASTEXITCODE" }
+
+      - name: Start async daemon (Windows)
+        shell: pwsh
+        env:
+          HOME: ${{ env.TEST_HOME }}
+          USERPROFILE: ${{ env.TEST_HOME }}
+          HOMEDRIVE: ${{ env.TEST_HOME_DRIVE }}
+          HOMEPATH: ${{ env.TEST_HOME_PATH }}
+        run: |
+          $installDir = Join-Path $env:USERPROFILE ".git-ai\bin"
+          $gitAiExe = Join-Path $installDir "git-ai.exe"
+          # Create daemon home with config
+          $daemonHome = Join-Path $env:RUNNER_TEMP "git-ai-daemon"
+          New-Item -ItemType Directory -Force -Path (Join-Path $daemonHome ".git-ai") | Out-Null
+          # Find the real git (not the proxy)
+          $realGit = (Get-Command git -CommandType Application | Where-Object { $_.Source -notlike "*\.git-ai\*" } | Select-Object -First 1).Source
+          if (-not $realGit) { $realGit = "C:\Program Files\Git\cmd\git.exe" }
+          $config = @{
+            git_path = $realGit
+            disable_auto_updates = $true
+            feature_flags = @{ git_hooks_enabled = $false }
+            quiet = $false
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path (Join-Path $daemonHome ".git-ai\config.json") -Value $config
+          # Export daemon env vars
+          Add-Content -Path $env:GITHUB_ENV -Value "GIT_AI_DAEMON_HOME=$daemonHome"
+          $env:GIT_AI_DAEMON_HOME = $daemonHome
+          # Start the daemon in the background
+          $proc = Start-Process -FilePath $gitAiExe -ArgumentList "bg","run" -PassThru -NoNewWindow
+          Add-Content -Path $env:GITHUB_ENV -Value "ASYNC_DAEMON_PID=$($proc.Id)"
+          # Wait for the daemon to be ready (up to 15s)
+          $waited = 0
+          while ($waited -lt 15000) {
+            # Test connectivity by running a simple command that requires the daemon
+            $testResult = & $gitAiExe bg status 2>&1
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Milliseconds 250
+            $waited += 250
+          }
+          if ($waited -ge 15000) { throw "Daemon did not start within 15 seconds" }
+          Write-Host "Async daemon started (PID=$($proc.Id))"
 
       - name: Run synthetic agent commit (Windows)
         shell: pwsh
@@ -406,24 +444,40 @@ jobs:
             throw "Verification failed: wrong schema_version"
           }
           Write-Log "PASS: schema_version = $schema"
-          # ── 4. Prompts non-empty ──────────────────────────────────────────────
-          $promptCount = ($metaJson.prompts | Get-Member -MemberType NoteProperty).Count
-          if ($promptCount -lt 1) {
-            Write-Log "FAIL: No prompt sessions in authorship note — checkpoint data was not stored"
-            $lines | Set-Content -Path $log
-            throw "Verification failed: no prompts recorded"
+          # ── 4. Sessions non-empty ─────────────────────────────────────────────
+          $promptCount = 0
+          if ($metaJson.prompts) {
+            $promptCount = ($metaJson.prompts | Get-Member -MemberType NoteProperty).Count
           }
-          Write-Log "PASS: $promptCount prompt session(s) recorded"
+          $sessionCount = 0
+          if ($metaJson.sessions) {
+            $sessionCount = ($metaJson.sessions | Get-Member -MemberType NoteProperty).Count
+          }
+          $totalCount = $promptCount + $sessionCount
+          if ($totalCount -lt 1) {
+            Write-Log "FAIL: No prompt/session entries in authorship note — checkpoint data was not stored"
+            $lines | Set-Content -Path $log
+            throw "Verification failed: no prompts or sessions recorded"
+          }
+          Write-Log "PASS: $totalCount AI session(s) recorded"
           # ── 5. Transcript messages ────────────────────────────────────────────
           $msgCount = 0
-          foreach ($key in ($metaJson.prompts | Get-Member -MemberType NoteProperty).Name) {
-            $record = $metaJson.prompts.$key
-            if ($record.messages) { $msgCount += $record.messages.Count }
+          if ($metaJson.prompts) {
+            foreach ($key in ($metaJson.prompts | Get-Member -MemberType NoteProperty).Name) {
+              $record = $metaJson.prompts.$key
+              if ($record.messages) { $msgCount += $record.messages.Count }
+            }
+          }
+          if ($metaJson.sessions) {
+            foreach ($key in ($metaJson.sessions | Get-Member -MemberType NoteProperty).Name) {
+              $record = $metaJson.sessions.$key
+              if ($record.messages) { $msgCount += $record.messages.Count }
+            }
           }
           if ($msgCount -gt 0) {
             Write-Log "PASS: Transcript captured: $msgCount message(s) recorded"
           } else {
-            Write-Log "WARN: No transcript messages in authorship note — conversation capture is only available in live agent runs, not synthetic checkpoints"
+            Write-Log "WARN: No transcript messages — sessions format does not embed transcripts inline"
           }
           # ── 6. git-ai stats reports AI additions ──────────────────────────────
           $statsRaw = & $gitAiExe stats HEAD --json 2>&1
@@ -467,9 +521,30 @@ jobs:
           $lines | Set-Content -Path $log
           Write-Log "=== Synthetic attribution verification COMPLETE: $agent ==="
 
+      - name: Stop async daemon (Windows)
+        if: always()
+        shell: pwsh
+        env:
+          HOME: ${{ env.TEST_HOME }}
+          USERPROFILE: ${{ env.TEST_HOME }}
+          HOMEDRIVE: ${{ env.TEST_HOME_DRIVE }}
+          HOMEPATH: ${{ env.TEST_HOME_PATH }}
+        run: |
+          $installDir = Join-Path $env:USERPROFILE ".git-ai\bin"
+          $gitAiExe = Join-Path $installDir "git-ai.exe"
+          if (Test-Path $gitAiExe) {
+            & $gitAiExe bg shutdown 2>&1 | Out-Null
+          }
+          if ($env:ASYNC_DAEMON_PID) {
+            $proc = Get-Process -Id $env:ASYNC_DAEMON_PID -ErrorAction SilentlyContinue
+            if ($proc) {
+              $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+            }
+          }
+
       - name: Upload E2E test results
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-install-${{ matrix.agent.name }}-windows-latest
           path: C:\e2e-results\

@@ -15,7 +15,7 @@ pub struct OAuthClient {
 /// In debug builds, HTTP is also allowed for local development.
 #[cfg(not(debug_assertions))]
 fn validate_https_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("http") {
+    if !url.starts_with("https://") {
         return Err(format!(
             "Security error: OAuth requires HTTPS. URL '{}' is not secure.",
             url
@@ -26,7 +26,7 @@ fn validate_https_url(url: &str) -> Result<(), String> {
 
 #[cfg(debug_assertions)]
 fn validate_https_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("http") {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
         return Err(format!("Invalid URL scheme: {}", url));
     }
     Ok(())

@@ -8,8 +8,7 @@ use git_ai::daemon::{
     local_socket_connects_with_timeout, open_local_socket_stream_with_timeout,
     send_control_request,
 };
-use repos::test_file::ExpectedLineExt;
-use repos::test_repo::{GitTestMode, TestRepo, get_binary_path, real_git_executable};
+use repos::test_repo::{DaemonTestScope, TestRepo, get_binary_path, real_git_executable};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -77,34 +76,30 @@ fn configure_test_daemon_env(command: &mut Command, repo: &TestRepo) {
     command.env("GIT_AI_DAEMON_TRACE_SOCKET", daemon_trace_socket_path(repo));
 }
 
-fn write_async_mode_config(repo: &TestRepo) {
+fn write_daemon_config(repo: &TestRepo) {
     let config_dir = repo.test_home_path().join(".git-ai");
-    fs::create_dir_all(&config_dir).expect("failed to create async mode config dir");
+    fs::create_dir_all(&config_dir).expect("failed to create daemon config dir");
     let config_path = config_dir.join("config.json");
     let config = serde_json::json!({
         "git_path": real_git_executable(),
         "disable_auto_updates": true,
-        "feature_flags": {
-            "async_mode": true,
-            "git_hooks_enabled": false
-        },
+        "feature_flags": {},
         "quiet": false
     });
     fs::write(
         &config_path,
-        serde_json::to_vec_pretty(&config).expect("failed to serialize async mode config"),
+        serde_json::to_vec_pretty(&config).expect("failed to serialize daemon config"),
     )
-    .expect("failed to write async mode config");
+    .expect("failed to write daemon config");
 }
 
-fn git_ai_with_async_daemon_env(repo: &TestRepo, args: &[&str]) -> Result<String, String> {
+fn git_ai_with_daemon_env(repo: &TestRepo, args: &[&str]) -> Result<String, String> {
     let daemon_home = repo.daemon_home_path().to_string_lossy().to_string();
     let control_socket = daemon_control_socket_path(repo)
         .to_string_lossy()
         .to_string();
     let trace_socket = daemon_trace_socket_path(repo).to_string_lossy().to_string();
     let envs = [
-        ("GIT_AI_ASYNC_MODE", "true"),
         ("GIT_AI_DAEMON_HOME", daemon_home.as_str()),
         ("GIT_AI_DAEMON_CONTROL_SOCKET", control_socket.as_str()),
         ("GIT_AI_DAEMON_TRACE_SOCKET", trace_socket.as_str()),
@@ -203,6 +198,20 @@ fn assert_daemon_status_ok_after_launch_repo_removed(home_repo: &TestRepo, targe
     );
 }
 
+#[allow(clippy::zombie_processes)]
+fn start_daemon(repo: &TestRepo) {
+    let mut daemon_cmd = Command::new(repos::test_repo::get_binary_path());
+    daemon_cmd
+        .arg("bg")
+        .arg("run")
+        .current_dir(repo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_test_home_env(&mut daemon_cmd, repo);
+    configure_test_daemon_env(&mut daemon_cmd, repo);
+    daemon_cmd.spawn().expect("failed to start daemon");
+}
+
 fn shutdown_daemon(home_repo: &TestRepo) {
     let output = daemon_command_output(home_repo, &["bg", "shutdown"], home_repo.test_home_path());
     assert!(
@@ -226,36 +235,15 @@ fn wait_for_child_exit(child: &mut Child) {
 }
 
 #[test]
-fn async_mode_wrapper_commit_passthrough_skips_git_ai_side_effects() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-
-    fs::write(repo.path().join("async-mode.txt"), "async mode test\n")
-        .expect("failed to write test file");
-
-    repo.git_with_env(
-        &["add", "async-mode.txt"],
-        &[("GIT_AI_ASYNC_MODE", "true")],
-        None,
-    )
-    .expect("git add should succeed in async mode");
-    repo.git_with_env(
-        &["commit", "-m", "async passthrough commit"],
-        &[("GIT_AI_ASYNC_MODE", "true")],
-        None,
-    )
-    .expect("git commit should succeed in async mode");
-}
-
-#[test]
 fn install_hooks_async_mode_sets_daemon_trace2_global_config() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
-    let output = git_ai_with_async_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
-        .expect("install-hooks should succeed in async mode");
+    let output = git_ai_with_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
+        .expect("install-hooks should succeed");
 
     assert!(
         !output.contains("trace2.eventTarget") && !output.contains("trace2.eventNesting"),
-        "async preflight should run silently without trace2 config output"
+        "install preflight should run silently without trace2 config output"
     );
 
     let expected_trace_socket = daemon_trace_socket_path(&repo);
@@ -270,10 +258,10 @@ fn install_hooks_async_mode_sets_daemon_trace2_global_config() {
 
 #[test]
 fn install_hooks_async_mode_dry_run_does_not_write_trace2_global_config() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
-    git_ai_with_async_daemon_env(&repo, &["install-hooks", "--dry-run=true"])
-        .expect("install-hooks dry-run should succeed in async mode");
+    git_ai_with_daemon_env(&repo, &["install-hooks", "--dry-run=true"])
+        .expect("install-hooks dry-run should succeed");
 
     let target = read_global_git_config(&repo, "trace2.eventTarget");
     let nesting = read_global_git_config(&repo, "trace2.eventNesting");
@@ -290,10 +278,10 @@ fn install_hooks_async_mode_dry_run_does_not_write_trace2_global_config() {
 
 #[test]
 fn install_hooks_async_mode_trace2_target_routes_real_git_trace_to_daemon() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
-    git_ai_with_async_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
-        .expect("install-hooks should succeed in async mode");
+    git_ai_with_daemon_env(&repo, &["install-hooks", "--dry-run=false"])
+        .expect("install-hooks should succeed");
 
     let start_output = daemon_command_output(&repo, &["bg", "start"], repo.path());
     assert!(
@@ -328,13 +316,21 @@ fn install_hooks_async_mode_trace2_target_routes_real_git_trace_to_daemon() {
 
 #[test]
 fn async_mode_checkpoint_starts_daemon_when_down() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-    write_async_mode_config(&repo);
+    // Test builds disable auto-spawning daemons from ensure_daemon_running
+    // to prevent process storms under parallel test load. This test verifies
+    // production-only auto-start behavior, so we manually start the daemon
+    // and then verify the checkpoint delegates to it.
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    write_daemon_config(&repo);
 
     let control = daemon_control_socket_path(&repo);
     let trace = daemon_trace_socket_path(&repo);
     let _ = fs::remove_file(&control);
     let _ = fs::remove_file(&trace);
+
+    // Manually start the daemon (production auto-start is disabled in test builds)
+    start_daemon(&repo);
+    wait_for_daemon_sockets(&repo);
 
     fs::write(
         repo.path().join("async-checkpoint.txt"),
@@ -343,10 +339,7 @@ fn async_mode_checkpoint_starts_daemon_when_down() {
     .expect("failed to write async checkpoint file");
 
     let output = repo
-        .git_ai_with_env(
-            &["checkpoint", "mock_ai", "async-checkpoint.txt"],
-            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-        )
+        .git_ai(&["checkpoint", "mock_ai", "async-checkpoint.txt"])
         .expect("async mode checkpoint should succeed");
 
     assert!(
@@ -355,14 +348,13 @@ fn async_mode_checkpoint_starts_daemon_when_down() {
         output
     );
 
-    wait_for_daemon_sockets(&repo);
     assert_daemon_status_ok_after_launch_repo_removed(&repo, &repo);
     shutdown_daemon(&repo);
 }
 
 #[test]
 fn daemon_status_does_not_self_emit_trace2_events() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
     fs::create_dir_all(repo.test_home_path()).expect("failed to create test HOME directory");
     let trace_target = DaemonConfig::trace2_event_target_for_path(&daemon_trace_socket_path(&repo));
 
@@ -442,8 +434,8 @@ fn daemon_status_does_not_self_emit_trace2_events() {
 
 #[test]
 fn daemon_run_survives_deleted_launch_repo_cwd() {
-    let launch_repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-    let target_repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let launch_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let target_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
     let mut daemon_cmd = Command::new(get_binary_path());
     daemon_cmd
@@ -467,8 +459,8 @@ fn daemon_run_survives_deleted_launch_repo_cwd() {
 
 #[test]
 fn daemon_start_survives_deleted_launch_repo_cwd() {
-    let launch_repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-    let target_repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let launch_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let target_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
     let output = daemon_command_output(&launch_repo, &["bg", "start"], launch_repo.path());
     assert!(
@@ -515,7 +507,7 @@ fn send_on_persistent_conn<R: Read + Write>(
 /// connection between requests.
 #[test]
 fn daemon_telemetry_and_cas_over_persistent_connection() {
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
     // Start the daemon
     let start_output = daemon_command_output(&repo, &["bg", "start"], repo.path());
@@ -599,169 +591,4 @@ fn daemon_telemetry_and_cas_over_persistent_connection() {
     // Clean up
     drop(reader);
     shutdown_daemon(&repo);
-}
-
-// ---------------------------------------------------------------------------
-// Post-commit stats display in async (wrapper-daemon) mode
-// ---------------------------------------------------------------------------
-
-/// Helper: create a WrapperDaemon repo with AI content, commit, and return the
-/// combined stdout+stderr output from the wrapper binary.
-fn async_commit_with_ai_content(extra_envs: &[(&str, &str)]) -> (TestRepo, String) {
-    let repo = TestRepo::new_with_mode(GitTestMode::WrapperDaemon);
-
-    // Base commit (human only).
-    let mut file = repo.filename("test.txt");
-    file.set_contents(crate::lines!["Base line 1", "Base line 2"]);
-    repo.stage_all_and_commit("Base commit").unwrap();
-
-    // Add AI-attributed lines.
-    file.insert_at(2, crate::lines!["AI line 1".ai(), "AI line 2".ai()]);
-
-    // Commit via git_with_env so we get the raw output (not NewCommit which
-    // adds its own sync + note check). We pass GIT_AI_TEST_FORCE_TTY so
-    // the wrapper treats this pipe as an interactive terminal.
-    repo.git(&["add", "-A"]).expect("add should succeed");
-    let mut envs: Vec<(&str, &str)> = vec![("GIT_AI_TEST_FORCE_TTY", "1")];
-    envs.extend_from_slice(extra_envs);
-    let output = repo
-        .git_with_env(&["commit", "-m", "AI additions"], &envs, None)
-        .expect("commit should succeed");
-    (repo, output)
-}
-
-#[test]
-fn async_mode_post_commit_shows_stats_for_ai_commit() {
-    let (_repo, output) = async_commit_with_ai_content(&[
-        ("GIT_AI_ASYNC_SHOW_COMMIT_STATS", "1"),
-        ("GIT_AI_WAIT_COMMIT_STATS", "1"),
-    ]);
-    // The wrapper should have found the authorship note and printed the
-    // stats progress bar (contains "you" label and "ai" label).
-    assert!(
-        output.contains("you") && output.contains("ai"),
-        "expected stats output in async commit, got:\n{}",
-        output
-    );
-}
-
-#[test]
-fn async_mode_post_commit_quiet_flag_suppresses_stats() {
-    let repo = TestRepo::new_with_mode(GitTestMode::WrapperDaemon);
-
-    let mut file = repo.filename("q.txt");
-    file.set_contents(crate::lines!["Base"]);
-    repo.stage_all_and_commit("Base").unwrap();
-
-    file.insert_at(1, crate::lines!["AI line".ai()]);
-    repo.git(&["add", "-A"]).expect("add");
-
-    let output = repo
-        .git_with_env(
-            &["commit", "-q", "-m", "AI quiet"],
-            &[("GIT_AI_TEST_FORCE_TTY", "1")],
-            None,
-        )
-        .expect("commit should succeed");
-
-    // With -q the wrapper should suppress all git-ai post-commit output.
-    assert!(
-        !output.contains("you") && !output.contains("[git-ai]"),
-        "expected no stats/processing output with -q, got:\n{}",
-        output
-    );
-}
-
-#[test]
-fn async_mode_post_commit_non_interactive_suppresses_stats() {
-    let repo = TestRepo::new_with_mode(GitTestMode::WrapperDaemon);
-
-    let mut file = repo.filename("ni.txt");
-    file.set_contents(crate::lines!["Base"]);
-    repo.stage_all_and_commit("Base").unwrap();
-
-    file.insert_at(1, crate::lines!["AI line".ai()]);
-    repo.git(&["add", "-A"]).expect("add");
-
-    // Commit WITHOUT GIT_AI_TEST_FORCE_TTY – the pipe means non-interactive.
-    let output = repo
-        .git_with_env(&["commit", "-m", "AI non-interactive"], &[], None)
-        .expect("commit should succeed");
-
-    assert!(
-        !output.contains("you") && !output.contains("[git-ai]"),
-        "expected no stats output in non-interactive mode, got:\n{}",
-        output
-    );
-}
-
-#[test]
-fn async_mode_post_commit_still_processing_when_no_daemon() {
-    // Use plain Wrapper mode (no daemon running) with async_mode forced via env.
-    // The wrapper will poll but never find a note, and should print a message.
-    let repo = TestRepo::new_with_mode(GitTestMode::Wrapper);
-
-    fs::write(repo.path().join("nodaemon.txt"), "hello\n").expect("write");
-    repo.git(&["add", "nodaemon.txt"]).expect("add");
-
-    // Use a very short timeout so this test doesn't stall.
-    let output = repo
-        .git_with_env(
-            &["commit", "-m", "no daemon commit"],
-            &[
-                ("GIT_AI_ASYNC_MODE", "true"),
-                ("GIT_AI_TEST_FORCE_TTY", "1"),
-                ("GIT_AI_POST_COMMIT_TIMEOUT_MS", "100"),
-            ],
-            None,
-        )
-        .expect("commit should succeed");
-
-    assert!(
-        output.contains("still processing"),
-        "expected 'still processing' message when daemon is absent, got:\n{}",
-        output
-    );
-    assert!(
-        output.contains("git-ai stats"),
-        "expected hint to run 'git-ai stats', got:\n{}",
-        output
-    );
-}
-
-#[test]
-fn async_mode_post_commit_skips_stats_for_large_commit() {
-    let repo = TestRepo::new_with_mode(GitTestMode::WrapperDaemon);
-
-    // Base commit.
-    fs::write(repo.path().join("base.txt"), "base\n").expect("write");
-    repo.git(&["add", "-A"]).expect("add");
-    repo.git_with_env(&["commit", "-m", "base"], &[], None)
-        .expect("base commit");
-
-    // Create a commit with many files exceeding the skip thresholds
-    // (STATS_SKIP_MAX_FILES_WITH_ADDITIONS = 200).
-    for i in 0..210 {
-        let path = repo.path().join(format!("file_{:04}.txt", i));
-        fs::write(&path, format!("line {}\n", i)).expect("write large file");
-    }
-    repo.git(&["add", "-A"]).expect("add");
-
-    let output = repo
-        .git_with_env(
-            &["commit", "-m", "large commit"],
-            &[("GIT_AI_TEST_FORCE_TTY", "1")],
-            None,
-        )
-        .expect("commit should succeed");
-
-    // The stats should be skipped due to the large commit size.
-    // There should either be a skip message or no stats output at all.
-    // Since these files have no AI attribution, the authorship note will
-    // be empty/minimal - the skip check runs before stats computation.
-    assert!(
-        !output.contains("you") || output.contains("Skipped"),
-        "expected either skip message or no stats bar for large commit, got:\n{}",
-        output
-    );
 }

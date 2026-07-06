@@ -1,13 +1,12 @@
-use crate::authorship::authorship_log::{LineRange, PromptRecord};
+use crate::authorship::authorship_log::{HumanRecord, LineRange, PromptRecord, SessionRecord};
+use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::{
     build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
 };
-use crate::authorship::stats::{CommitStats, stats_for_commit_stats};
 use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
-use crate::git::refs::{get_authorship, show_authorship_note};
+use crate::git::notes_api::{read_authorship as get_authorship, read_note as show_authorship_note};
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
-use git2::Oid;
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -83,8 +82,14 @@ pub struct DiffLineKey {
 pub struct DiffJson {
     /// Per-file diff information with annotations
     pub files: BTreeMap<String, FileDiffJson>,
-    /// Prompt records keyed by prompt hash
+    /// Prompt records keyed by prompt hash (old-format, bare 16-char hex)
     pub prompts: BTreeMap<String, PromptRecord>,
+    /// Session records keyed by full attestation hash (s_xxx::t_yyy)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, SessionRecord>,
+    /// Human records keyed by human hash (h_-prefixed)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub humans: BTreeMap<String, HumanRecord>,
     /// Per-hunk records for machine consumption
     #[serde(default)]
     pub hunks: Vec<DiffJsonHunk>,
@@ -100,10 +105,6 @@ pub struct DiffJson {
 pub struct DiffToolModelStats {
     #[serde(default)]
     pub ai_lines_added: u32,
-    #[serde(default)]
-    pub ai_lines_generated: u32,
-    #[serde(default)]
-    pub ai_deletions_generated: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -111,11 +112,9 @@ pub struct DiffCommitStats {
     #[serde(default)]
     pub ai_lines_added: u32,
     #[serde(default)]
-    pub ai_lines_generated: u32,
-    #[serde(default)]
-    pub ai_deletions_generated: u32,
-    #[serde(default)]
     pub human_lines_added: u32,
+    #[serde(default)]
+    pub unknown_lines_added: u32,
     #[serde(default)]
     pub git_lines_added: u32,
     #[serde(default)]
@@ -150,6 +149,8 @@ pub struct DiffJsonHunk {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub human_id: Option<String>,
 }
 
@@ -180,16 +181,19 @@ pub enum Attribution {
 struct LineAttributionDetail {
     commit_sha: Option<String>,
     prompt_id: Option<String>,
+    human_id: Option<String>,
 }
 
 #[derive(Debug)]
-struct DiffBuildArtifacts {
-    attributions: HashMap<DiffLineKey, Attribution>,
-    annotations_by_file: BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
-    prompts: BTreeMap<String, PromptRecord>,
-    json_hunks: Vec<DiffJsonHunk>,
-    commits: BTreeMap<String, DiffCommitMetadata>,
-    included_files: HashSet<String>,
+pub struct DiffBuildArtifacts {
+    pub attributions: HashMap<DiffLineKey, Attribution>,
+    pub annotations_by_file: BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
+    pub prompts: BTreeMap<String, PromptRecord>,
+    pub sessions: BTreeMap<String, SessionRecord>,
+    pub humans: BTreeMap<String, HumanRecord>,
+    pub json_hunks: Vec<DiffJsonHunk>,
+    pub commits: BTreeMap<String, DiffCommitMetadata>,
+    pub included_files: HashSet<String>,
 }
 
 // ============================================================================
@@ -352,14 +356,32 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
     let output = match parsed.options.format {
         DiffFormat::Json => {
             let mut output_prompts = artifacts.prompts.clone();
+            let mut output_sessions = artifacts.sessions.clone();
             if is_single_commit && parsed.options.all_prompts {
-                merge_missing_prompts_from_authorship_note(repo, &to_commit, &mut output_prompts);
+                merge_missing_prompts_and_sessions_from_authorship_note(
+                    repo,
+                    &to_commit,
+                    &mut output_prompts,
+                    &mut output_sessions,
+                );
             }
 
             let commit_stats = if parsed.options.include_stats {
-                let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
-                let stats = stats_for_commit_stats(repo, &to_commit, &ignore_patterns)?;
-                Some(diff_commit_stats_from_commit_stats(stats))
+                let mut stats_prompts = output_prompts.clone();
+                let mut stats_sessions = output_sessions.clone();
+                if is_single_commit && !parsed.options.all_prompts {
+                    merge_missing_prompts_and_sessions_from_authorship_note(
+                        repo,
+                        &to_commit,
+                        &mut stats_prompts,
+                        &mut stats_sessions,
+                    );
+                }
+                Some(calculate_diff_commit_stats(
+                    &artifacts,
+                    &stats_prompts,
+                    &stats_sessions,
+                ))
             } else {
                 None
             };
@@ -370,6 +392,7 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
                 &to_commit,
                 &artifacts,
                 &output_prompts,
+                &output_sessions,
                 commit_stats,
             )?;
             serde_json::to_string(&diff_json)
@@ -380,6 +403,7 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
             &from_commit,
             &to_commit,
             &artifacts.attributions,
+            &artifacts.humans,
             &artifacts.included_files,
         )?,
     };
@@ -392,18 +416,23 @@ pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String,
 // ============================================================================
 
 fn resolve_commit(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
-    // Migrated from: git rev-parse <rev>
-    // Backend: git2
-    let obj = repo.revparse_single(rev)?;
-    let commit = obj.peel_to_commit()?;
-    let sha = commit.id().to_string();
-    let _oid = Oid::from_str(&sha).map_err(|e| GitAiError::Generic(e.to_string()))?;
+    let mut args = repo.global_args_for_exec();
+    args.push("rev-parse".to_string());
+    args.push(rev.to_string());
+
+    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
+    let sha = String::from_utf8(output.stdout)
+        .map_err(|e| GitAiError::Generic(format!("Failed to parse rev-parse output: {}", e)))?
+        .trim()
+        .to_string();
+
     if sha.is_empty() {
         return Err(GitAiError::Generic(format!(
             "Could not resolve commit: {}",
             rev
         )));
     }
+
     Ok(sha)
 }
 
@@ -722,7 +751,7 @@ pub fn overlay_diff_attributions(
     to_commit: &str,
     hunks: &[DiffHunk],
 ) -> Result<HashMap<DiffLineKey, Attribution>, GitAiError> {
-    let (_, attributions, _, _, _) = build_line_attribution_data(
+    let (_, attributions, _, _, _, _, _) = build_line_attribution_data(
         repo,
         from_commit,
         to_commit,
@@ -732,12 +761,29 @@ pub fn overlay_diff_attributions(
     Ok(attributions)
 }
 
-fn build_diff_artifacts(
+pub fn build_diff_artifacts(
     repo: &Repository,
     from_commit: &str,
     to_commit: &str,
     options: &DiffCommandOptions,
 ) -> Result<DiffBuildArtifacts, GitAiError> {
+    build_diff_artifacts_with_note(repo, from_commit, to_commit, options, None)
+}
+
+pub fn build_diff_artifacts_with_note(
+    repo: &Repository,
+    from_commit: &str,
+    to_commit: &str,
+    options: &DiffCommandOptions,
+    authorship_log: Option<&AuthorshipLog>,
+) -> Result<DiffBuildArtifacts, GitAiError> {
+    let hunks = get_diff_with_line_numbers(repo, from_commit, to_commit)?;
+
+    if let Some(note) = authorship_log {
+        return build_diff_artifacts_from_hunks(repo, hunks, to_commit, Some(note));
+    }
+
+    // Slow path: no authorship log, needs blame
     let effective_patterns = effective_ignore_patterns(repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&effective_patterns);
     let diff_sections = get_diff_sections_by_file(repo, from_commit, to_commit)?;
@@ -749,7 +795,7 @@ fn build_diff_artifacts(
         })
         .collect();
 
-    let mut hunks = get_diff_with_line_numbers(repo, from_commit, to_commit)?;
+    let mut hunks = hunks;
     hunks.retain(|hunk| {
         !hunk.file_path.is_empty()
             && !should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher)
@@ -757,7 +803,7 @@ fn build_diff_artifacts(
     included_files.extend(hunks.iter().map(|h| h.file_path.clone()));
     let line_contents = build_line_content_map(&hunks);
 
-    let (annotations_by_file, attributions, line_details, prompts, mut commits) =
+    let (annotations_by_file, attributions, line_details, prompts, sessions, humans, mut commits) =
         build_line_attribution_data(repo, from_commit, to_commit, &hunks, options)?;
 
     let json_hunks = build_json_hunks(
@@ -773,6 +819,65 @@ fn build_diff_artifacts(
         attributions,
         annotations_by_file,
         prompts,
+        sessions,
+        humans,
+        json_hunks,
+        commits,
+        included_files,
+    })
+}
+
+/// Build diff artifacts from pre-computed hunks, avoiding redundant git subprocess calls.
+/// Used by the post-commit hook path where the caller already has the hunks from a single
+/// `get_diff_with_line_numbers` call.
+pub fn build_diff_artifacts_from_hunks(
+    repo: &Repository,
+    hunks: Vec<DiffHunk>,
+    to_commit: &str,
+    authorship_log: Option<&AuthorshipLog>,
+) -> Result<DiffBuildArtifacts, GitAiError> {
+    let effective_patterns = effective_ignore_patterns(repo, &[], &[]);
+    let ignore_matcher = build_ignore_matcher(&effective_patterns);
+
+    let mut hunks = hunks;
+    hunks.retain(|hunk| {
+        !hunk.file_path.is_empty()
+            && !should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher)
+    });
+
+    let included_files: HashSet<String> = hunks.iter().map(|h| h.file_path.clone()).collect();
+    let line_contents = build_line_content_map(&hunks);
+
+    let (annotations_by_file, attributions, line_details, prompts, sessions, humans, mut commits) =
+        if let Some(note) = authorship_log {
+            build_line_attribution_from_note(to_commit, &hunks, note)
+        } else {
+            (
+                BTreeMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+
+    let json_hunks = build_json_hunks(
+        repo,
+        &hunks,
+        &line_details,
+        &line_contents,
+        to_commit,
+        &mut commits,
+    )?;
+
+    Ok(DiffBuildArtifacts {
+        attributions,
+        annotations_by_file,
+        prompts,
+        sessions,
+        humans,
         json_hunks,
         commits,
         included_files,
@@ -792,6 +897,8 @@ fn build_line_attribution_data(
         HashMap<DiffLineKey, Attribution>,
         HashMap<DiffLineKey, LineAttributionDetail>,
         BTreeMap<String, PromptRecord>,
+        BTreeMap<String, SessionRecord>,
+        BTreeMap<String, HumanRecord>,
         BTreeMap<String, DiffCommitMetadata>,
     ),
     GitAiError,
@@ -801,6 +908,8 @@ fn build_line_attribution_data(
     let mut attributions: HashMap<DiffLineKey, Attribution> = HashMap::new();
     let mut line_details: HashMap<DiffLineKey, LineAttributionDetail> = HashMap::new();
     let mut prompts: BTreeMap<String, PromptRecord> = BTreeMap::new();
+    let mut sessions: BTreeMap<String, SessionRecord> = BTreeMap::new();
+    let mut humans: BTreeMap<String, HumanRecord> = BTreeMap::new();
     let mut commits: BTreeMap<String, DiffCommitMetadata> = BTreeMap::new();
 
     let added_lines_by_file = collect_lines_by_file(hunks, LineSide::New);
@@ -818,6 +927,8 @@ fn build_line_attribution_data(
             &mut attributions,
             &mut line_details,
             &mut prompts,
+            &mut sessions,
+            &mut humans,
             &mut commits,
         );
     }
@@ -838,6 +949,8 @@ fn build_line_attribution_data(
                 &mut attributions,
                 &mut line_details,
                 &mut prompts,
+                &mut sessions,
+                &mut humans,
                 &mut commits,
             );
         }
@@ -848,8 +961,151 @@ fn build_line_attribution_data(
         attributions,
         line_details,
         prompts,
+        sessions,
+        humans,
         commits,
     ))
+}
+
+#[allow(clippy::type_complexity)]
+fn build_line_attribution_from_note(
+    to_commit: &str,
+    hunks: &[DiffHunk],
+    note: &AuthorshipLog,
+) -> (
+    BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
+    HashMap<DiffLineKey, Attribution>,
+    HashMap<DiffLineKey, LineAttributionDetail>,
+    BTreeMap<String, PromptRecord>,
+    BTreeMap<String, SessionRecord>,
+    BTreeMap<String, HumanRecord>,
+    BTreeMap<String, DiffCommitMetadata>,
+) {
+    let mut annotations_by_file: BTreeMap<String, BTreeMap<String, Vec<LineRange>>> =
+        BTreeMap::new();
+    let mut attributions: HashMap<DiffLineKey, Attribution> = HashMap::new();
+    let mut line_details: HashMap<DiffLineKey, LineAttributionDetail> = HashMap::new();
+    let prompts: BTreeMap<String, PromptRecord> = note.metadata.prompts.clone();
+    let sessions: BTreeMap<String, SessionRecord> = note.metadata.sessions.clone();
+    let humans: BTreeMap<String, HumanRecord> = note.metadata.humans.clone();
+    let commits: BTreeMap<String, DiffCommitMetadata> = BTreeMap::new();
+
+    let added_lines_by_file = collect_lines_by_file(hunks, LineSide::New);
+    for (file_path, lines) in &added_lines_by_file {
+        let file_attestation = note
+            .attestations
+            .iter()
+            .find(|fa| &fa.file_path == file_path);
+
+        let mut file_annotations: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
+
+        for line in lines {
+            let key = DiffLineKey {
+                file: file_path.clone(),
+                line: *line,
+                side: LineSide::New,
+            };
+
+            let mut found_hash: Option<&str> = None;
+            if let Some(fa) = file_attestation {
+                for entry in &fa.entries {
+                    if entry.line_ranges.iter().any(|r| r.contains(*line)) {
+                        found_hash = Some(&entry.hash);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(hash) = found_hash {
+                let is_prompt = prompts.contains_key(hash) || hash.starts_with("s_");
+                let is_human = hash.starts_with("h_");
+
+                let (prompt_id, human_id, attribution) = if is_prompt {
+                    let tool = prompts
+                        .get(hash)
+                        .map(|p| p.agent_id.tool.clone())
+                        .unwrap_or_else(|| {
+                            let session_key = extract_session_id(hash);
+                            sessions
+                                .get(session_key)
+                                .map(|s| s.agent_id.tool.clone())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        });
+                    (Some(hash.to_string()), None, Attribution::Ai(tool))
+                } else if is_human {
+                    (
+                        None,
+                        Some(hash.to_string()),
+                        Attribution::Human(hash.to_string()),
+                    )
+                } else {
+                    (None, None, Attribution::NoData)
+                };
+
+                if let Some(ref pid) = prompt_id {
+                    file_annotations
+                        .entry(pid.clone())
+                        .or_default()
+                        .push(LineRange::Single(*line));
+                }
+
+                attributions.insert(key.clone(), attribution);
+                line_details.insert(
+                    key,
+                    LineAttributionDetail {
+                        commit_sha: Some(to_commit.to_string()),
+                        prompt_id,
+                        human_id,
+                    },
+                );
+            } else {
+                attributions.insert(key.clone(), Attribution::NoData);
+                line_details.insert(
+                    key,
+                    LineAttributionDetail {
+                        commit_sha: Some(to_commit.to_string()),
+                        prompt_id: None,
+                        human_id: None,
+                    },
+                );
+            }
+        }
+
+        if !file_annotations.is_empty() {
+            annotations_by_file.insert(file_path.clone(), file_annotations);
+        }
+    }
+
+    // Deleted lines: include with NoData attribution (no blame)
+    // Use file_path (new name) for DiffLineKey to match build_json_hunk_segments lookup
+    for hunk in hunks {
+        for line in &hunk.deleted_lines {
+            let key = DiffLineKey {
+                file: hunk.file_path.clone(),
+                line: *line,
+                side: LineSide::Old,
+            };
+            attributions.insert(key.clone(), Attribution::NoData);
+            line_details.insert(
+                key,
+                LineAttributionDetail {
+                    commit_sha: None,
+                    prompt_id: None,
+                    human_id: None,
+                },
+            );
+        }
+    }
+
+    (
+        annotations_by_file,
+        attributions,
+        line_details,
+        prompts,
+        sessions,
+        humans,
+        commits,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -866,6 +1122,8 @@ fn apply_blame_for_side(
     attributions: &mut HashMap<DiffLineKey, Attribution>,
     line_details: &mut HashMap<DiffLineKey, LineAttributionDetail>,
     prompts: &mut BTreeMap<String, PromptRecord>,
+    sessions: &mut BTreeMap<String, SessionRecord>,
+    humans: &mut BTreeMap<String, HumanRecord>,
     commits: &mut BTreeMap<String, DiffCommitMetadata>,
 ) {
     if lines.is_empty() {
@@ -908,9 +1166,34 @@ fn apply_blame_for_side(
     };
 
     for (prompt_id, prompt_record) in &analysis.prompt_records {
-        prompts
-            .entry(prompt_id.clone())
-            .or_insert_with(|| prompt_record.clone());
+        if prompt_id.starts_with("s_") {
+            // Session-format attestation: look up the SessionRecord from blame analysis
+            let session_key = extract_session_id(prompt_id);
+            if let Some(session_record) = analysis.session_records.get(session_key) {
+                sessions
+                    .entry(session_key.to_string())
+                    .or_insert_with(|| session_record.clone());
+            } else {
+                // Fallback: convert PromptRecord back to SessionRecord
+                sessions
+                    .entry(session_key.to_string())
+                    .or_insert_with(|| SessionRecord {
+                        agent_id: prompt_record.agent_id.clone(),
+                        human_author: prompt_record.human_author.clone(),
+                        custom_attributes: prompt_record.custom_attributes.clone(),
+                    });
+            }
+        } else {
+            prompts
+                .entry(prompt_id.clone())
+                .or_insert_with(|| prompt_record.clone());
+        }
+    }
+
+    for (human_id, human_record) in &analysis.humans {
+        humans
+            .entry(human_id.clone())
+            .or_insert_with(|| human_record.clone());
     }
 
     let mut line_to_commit: HashMap<u32, String> = HashMap::new();
@@ -937,6 +1220,12 @@ fn apply_blame_for_side(
                 None
             };
 
+            let human_id = if author_marker.starts_with("h_") {
+                Some(author_marker.clone())
+            } else {
+                None
+            };
+
             let attribution = if let Some(ref id) = prompt_id {
                 let tool = analysis
                     .prompt_records
@@ -949,7 +1238,7 @@ fn apply_blame_for_side(
                     .push(*line);
                 Attribution::Ai(tool)
             } else if author_marker.starts_with("h_") {
-                // Historical h_ human attestation marker.
+                // Known human attestation (h_-prefixed hash from KnownHuman checkpoint)
                 Attribution::Human(author_marker.clone())
             } else {
                 // Legacy or unrecognized marker (e.g. "human") — treat as unattested
@@ -961,6 +1250,7 @@ fn apply_blame_for_side(
                 LineAttributionDetail {
                     commit_sha: line_to_commit.get(line).cloned(),
                     prompt_id,
+                    human_id,
                 },
             );
         } else {
@@ -970,6 +1260,7 @@ fn apply_blame_for_side(
                 LineAttributionDetail {
                     commit_sha: None,
                     prompt_id: None,
+                    human_id: None,
                 },
             );
         }
@@ -1178,6 +1469,13 @@ fn build_json_hunk_segments(
             return;
         }
         let content_hash = hash_hunk_content(current_contents);
+        let session_id = current_prompt_id.as_ref().and_then(|id| {
+            if id.starts_with("s_") {
+                Some(extract_session_id(id).to_string())
+            } else {
+                None
+            }
+        });
         segments.push(DiffJsonHunk {
             commit_sha: current_commit_sha.clone(),
             content_hash,
@@ -1187,6 +1485,7 @@ fn build_json_hunk_segments(
             end_line: *current_end,
             file_path: diff_hunk.file_path.clone(),
             prompt_id: current_prompt_id.clone(),
+            session_id,
             human_id: current_human_id.clone(),
         });
         *current_start = 0;
@@ -1206,6 +1505,7 @@ fn build_json_hunk_segments(
         };
         let detail = line_details.get(&key);
         let prompt_id = detail.and_then(|d| d.prompt_id.clone());
+        let human_id = detail.and_then(|d| d.human_id.clone());
         let original_commit_sha = if matches!(side, LineSide::Old) {
             detail.and_then(|d| d.commit_sha.clone())
         } else {
@@ -1227,6 +1527,7 @@ fn build_json_hunk_segments(
         let can_extend = current_start != 0
             && *line == current_end + 1
             && prompt_id == current_prompt_id
+            && human_id == current_human_id
             && original_commit_sha == current_original_commit_sha
             && commit_sha == current_commit_sha;
 
@@ -1244,6 +1545,7 @@ fn build_json_hunk_segments(
             current_start = *line;
             current_end = *line;
             current_prompt_id = prompt_id.clone();
+            current_human_id = human_id.clone();
             current_original_commit_sha = original_commit_sha.clone();
             current_commit_sha = commit_sha;
         } else {
@@ -1332,19 +1634,46 @@ fn format_git_ident(name: &str, email: &str) -> String {
     }
 }
 
-fn merge_missing_prompts_from_authorship_note(
+fn merge_missing_prompts_and_sessions_from_authorship_note(
     repo: &Repository,
     commit_sha: &str,
     prompts: &mut BTreeMap<String, PromptRecord>,
+    sessions: &mut BTreeMap<String, SessionRecord>,
 ) {
     if let Some(authorship_log) = get_authorship(repo, commit_sha) {
-        for (prompt_id, prompt_record) in authorship_log.metadata.prompts {
-            prompts.entry(prompt_id).or_insert(prompt_record);
+        for (prompt_id, prompt_record) in &authorship_log.metadata.prompts {
+            prompts
+                .entry(prompt_id.clone())
+                .or_insert_with(|| prompt_record.clone());
+        }
+        // Insert session records keyed by session ID only (s_xxx)
+        for file_attestation in &authorship_log.attestations {
+            for entry in &file_attestation.entries {
+                if entry.hash.starts_with("s_") {
+                    let session_key = extract_session_id(&entry.hash);
+                    if let Some(session_record) = authorship_log.metadata.sessions.get(session_key)
+                    {
+                        sessions
+                            .entry(session_key.to_string())
+                            .or_insert_with(|| session_record.clone());
+                    }
+                }
+            }
         }
     }
 }
 
-#[cfg(test)]
+/// Extract session ID from a combined session::trace ID
+/// For session-format IDs like "s_xxx::t_yyy", returns "s_xxx"
+/// For other IDs, returns the original ID unchanged
+fn extract_session_id(id: &str) -> &str {
+    if id.starts_with("s_") {
+        id.split("::").next().unwrap_or(id)
+    } else {
+        id
+    }
+}
+
 fn line_range_len(range: &LineRange) -> u32 {
     match range {
         LineRange::Single(_) => 1,
@@ -1352,51 +1681,26 @@ fn line_range_len(range: &LineRange) -> u32 {
     }
 }
 
-fn diff_commit_stats_from_commit_stats(stats: CommitStats) -> DiffCommitStats {
-    let tool_model_breakdown = stats
-        .tool_model_breakdown
-        .into_iter()
-        .map(|(key, tool_stats)| {
-            (
-                key,
-                DiffToolModelStats {
-                    ai_lines_added: tool_stats.ai_additions,
-                    ai_lines_generated: tool_stats.total_ai_additions,
-                    ai_deletions_generated: tool_stats.total_ai_deletions,
-                },
-            )
-        })
-        .collect();
-
-    DiffCommitStats {
-        ai_lines_added: stats.ai_additions,
-        ai_lines_generated: stats.total_ai_additions,
-        ai_deletions_generated: stats.total_ai_deletions,
-        human_lines_added: stats.human_additions,
-        git_lines_added: stats.git_diff_added_lines,
-        git_lines_deleted: stats.git_diff_deleted_lines,
-        tool_model_breakdown,
-    }
-}
-
-#[cfg(test)]
 fn calculate_diff_commit_stats(
     artifacts: &DiffBuildArtifacts,
     prompts: &BTreeMap<String, PromptRecord>,
+    sessions: &BTreeMap<String, SessionRecord>,
 ) -> DiffCommitStats {
     let mut stats = DiffCommitStats::default();
-    let mut ai_lines_added_by_tool_model: BTreeMap<String, u32> = BTreeMap::new();
 
     for annotations in artifacts.annotations_by_file.values() {
         for (prompt_id, ranges) in annotations {
             let landed_lines = ranges.iter().map(line_range_len).sum::<u32>();
             stats.ai_lines_added += landed_lines;
-            if let Some(prompt_record) = prompts.get(prompt_id) {
-                let key = format!(
-                    "{}::{}",
-                    prompt_record.agent_id.tool, prompt_record.agent_id.model
-                );
-                *ai_lines_added_by_tool_model.entry(key).or_default() += landed_lines;
+            let session_key = extract_session_id(prompt_id);
+            let key = prompts
+                .get(prompt_id)
+                .map(|r| &r.agent_id)
+                .or_else(|| sessions.get(session_key).map(|r| &r.agent_id))
+                .map(|agent_id| format!("{}::{}", agent_id.tool, agent_id.model));
+            if let Some(key) = key {
+                let tool_stats = stats.tool_model_breakdown.entry(key).or_default();
+                tool_stats.ai_lines_added += landed_lines;
             }
         }
     }
@@ -1407,34 +1711,17 @@ fn calculate_diff_commit_stats(
         }
         match attribution {
             Attribution::Human(_) => stats.human_lines_added += 1,
-            Attribution::NoData => stats.human_lines_added += 1,
+            Attribution::NoData => stats.unknown_lines_added += 1,
             Attribution::Ai(_) => {}
         }
     }
-    stats.git_lines_added = stats.ai_lines_added + stats.human_lines_added;
+    stats.git_lines_added =
+        stats.ai_lines_added + stats.human_lines_added + stats.unknown_lines_added;
 
     for hunk in &artifacts.json_hunks {
         if hunk.hunk_kind == "deletion" {
             stats.git_lines_deleted += hunk.end_line.saturating_sub(hunk.start_line) + 1;
         }
-    }
-
-    for prompt_record in prompts.values() {
-        stats.ai_lines_generated += prompt_record.total_additions;
-        stats.ai_deletions_generated += prompt_record.total_deletions;
-
-        let key = format!(
-            "{}::{}",
-            prompt_record.agent_id.tool, prompt_record.agent_id.model
-        );
-        let tool_stats = stats.tool_model_breakdown.entry(key).or_default();
-        tool_stats.ai_lines_generated += prompt_record.total_additions;
-        tool_stats.ai_deletions_generated += prompt_record.total_deletions;
-    }
-
-    for (key, ai_lines_added) in ai_lines_added_by_tool_model {
-        let tool_stats = stats.tool_model_breakdown.entry(key).or_default();
-        tool_stats.ai_lines_added += ai_lines_added;
     }
 
     stats
@@ -1451,6 +1738,7 @@ fn build_diff_json(
     to_commit: &str,
     artifacts: &DiffBuildArtifacts,
     prompts: &BTreeMap<String, PromptRecord>,
+    sessions: &BTreeMap<String, SessionRecord>,
     commit_stats: Option<DiffCommitStats>,
 ) -> Result<DiffJson, GitAiError> {
     let mut files: BTreeMap<String, FileDiffJson> = BTreeMap::new();
@@ -1484,6 +1772,8 @@ fn build_diff_json(
     Ok(DiffJson {
         files,
         prompts: prompts.clone(),
+        sessions: sessions.clone(),
+        humans: artifacts.humans.clone(),
         hunks: artifacts.json_hunks.clone(),
         commits: artifacts.commits.clone(),
         commit_stats,
@@ -1600,6 +1890,7 @@ pub fn format_annotated_diff(
     from_commit: &str,
     to_commit: &str,
     attributions: &HashMap<DiffLineKey, Attribution>,
+    humans: &BTreeMap<String, HumanRecord>,
     included_files: &HashSet<String>,
 ) -> Result<String, GitAiError> {
     let sections = get_diff_sections_by_file(repo, from_commit, to_commit)?;
@@ -1620,14 +1911,26 @@ pub fn format_annotated_diff(
                 if line.starts_with("diff --git") {
                     in_hunk = false;
                 }
-                result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
+                result.push_str(&format_line(
+                    line,
+                    LineType::DiffHeader,
+                    use_color,
+                    None,
+                    humans,
+                ));
             } else if line.starts_with("@@ ") {
                 in_hunk = true;
                 if let Some((old_start, new_start)) = parse_hunk_header_for_line_nums(line) {
                     old_line_num = old_start;
                     new_line_num = new_start;
                 }
-                result.push_str(&format_line(line, LineType::HunkHeader, use_color, None));
+                result.push_str(&format_line(
+                    line,
+                    LineType::HunkHeader,
+                    use_color,
+                    None,
+                    humans,
+                ));
             } else if in_hunk && line.starts_with('-') {
                 let key = DiffLineKey {
                     file: file_path.clone(),
@@ -1640,6 +1943,7 @@ pub fn format_annotated_diff(
                     LineType::Deletion,
                     use_color,
                     attribution,
+                    humans,
                 ));
                 old_line_num += 1;
             } else if in_hunk && line.starts_with('+') {
@@ -1654,16 +1958,35 @@ pub fn format_annotated_diff(
                     LineType::Addition,
                     use_color,
                     attribution,
+                    humans,
                 ));
                 new_line_num += 1;
             } else if in_hunk && line.starts_with(' ') {
-                result.push_str(&format_line(line, LineType::Context, use_color, None));
+                result.push_str(&format_line(
+                    line,
+                    LineType::Context,
+                    use_color,
+                    None,
+                    humans,
+                ));
                 old_line_num += 1;
                 new_line_num += 1;
             } else if line.starts_with("Binary files") {
-                result.push_str(&format_line(line, LineType::Binary, use_color, None));
+                result.push_str(&format_line(
+                    line,
+                    LineType::Binary,
+                    use_color,
+                    None,
+                    humans,
+                ));
             } else {
-                result.push_str(&format_line(line, LineType::Context, use_color, None));
+                result.push_str(&format_line(
+                    line,
+                    LineType::Context,
+                    use_color,
+                    None,
+                    humans,
+                ));
             }
         }
     }
@@ -1727,9 +2050,10 @@ fn format_line(
     line_type: LineType,
     use_color: bool,
     attribution: Option<&Attribution>,
+    humans: &BTreeMap<String, HumanRecord>,
 ) -> String {
     let annotation = if let Some(attr) = attribution {
-        format_attribution(attr)
+        format_attribution(attr, humans)
     } else {
         String::new()
     };
@@ -1770,10 +2094,18 @@ fn format_line(
     }
 }
 
-fn format_attribution(attribution: &Attribution) -> String {
+fn format_attribution(attribution: &Attribution, humans: &BTreeMap<String, HumanRecord>) -> String {
     match attribution {
         Attribution::Ai(tool) => format!("🤖{}", tool),
-        Attribution::Human(username) => format!("👤{}", username),
+        Attribution::Human(human_id) => {
+            // Resolve human_id (h_-prefixed hash) to actual author name
+            if let Some(human_record) = humans.get(human_id) {
+                format!("👤{}", human_record.author)
+            } else {
+                // Fallback to showing the ID if not found in humans map
+                format!("👤{}", human_id)
+            }
+        }
         Attribution::NoData => "[no-data]".to_string(),
     }
 }
@@ -1848,6 +2180,7 @@ pub fn get_diff_json_filtered(
         &to_commit,
         &artifacts,
         &artifacts.prompts,
+        &artifacts.sessions,
         None,
     )?;
 
@@ -1872,12 +2205,19 @@ pub fn get_diff_json_filtered(
             .retain(|hunk| kept_files.contains(&hunk.file_path));
     }
 
-    // Filter prompts to only those specified (if any)
+    // Filter prompts/sessions to only those specified (if any)
     if let Some(ref prompt_ids) = options.prompt_ids {
         let prompt_id_set: HashSet<&String> = prompt_ids.iter().collect();
         diff_json
             .prompts
             .retain(|key, _| prompt_id_set.contains(key));
+        // Session keys are session IDs only, but prompt_ids may contain combined IDs
+        // Extract session IDs from prompt_ids for session filtering
+        let session_id_set: HashSet<&str> =
+            prompt_ids.iter().map(|id| extract_session_id(id)).collect();
+        diff_json
+            .sessions
+            .retain(|key, _| session_id_set.contains(key.as_str()));
     }
 
     let mut referenced_commit_shas: HashSet<String> = HashSet::new();
@@ -1901,7 +2241,6 @@ pub fn get_diff_json_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authorship::transcript::Message;
     use crate::authorship::working_log::AgentId;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -2195,26 +2534,46 @@ mod tests {
 
     #[test]
     fn test_format_attribution_ai() {
+        let humans = BTreeMap::new();
         let attr = Attribution::Ai("cursor".to_string());
-        assert_eq!(format_attribution(&attr), "🤖cursor");
+        assert_eq!(format_attribution(&attr, &humans), "🤖cursor");
 
         let attr = Attribution::Ai("claude".to_string());
-        assert_eq!(format_attribution(&attr), "🤖claude");
+        assert_eq!(format_attribution(&attr, &humans), "🤖claude");
     }
 
     #[test]
     fn test_format_attribution_human() {
-        let attr = Attribution::Human("alice".to_string());
-        assert_eq!(format_attribution(&attr), "👤alice");
+        let mut humans = BTreeMap::new();
+        humans.insert(
+            "h_alice123".to_string(),
+            HumanRecord {
+                author: "alice".to_string(),
+            },
+        );
+        humans.insert(
+            "h_bob456".to_string(),
+            HumanRecord {
+                author: "bob@example.com".to_string(),
+            },
+        );
 
-        let attr = Attribution::Human("bob@example.com".to_string());
-        assert_eq!(format_attribution(&attr), "👤bob@example.com");
+        let attr = Attribution::Human("h_alice123".to_string());
+        assert_eq!(format_attribution(&attr, &humans), "👤alice");
+
+        let attr = Attribution::Human("h_bob456".to_string());
+        assert_eq!(format_attribution(&attr, &humans), "👤bob@example.com");
+
+        // Test fallback when human_id not in map
+        let attr = Attribution::Human("h_unknown".to_string());
+        assert_eq!(format_attribution(&attr, &humans), "👤h_unknown");
     }
 
     #[test]
     fn test_format_attribution_no_data() {
+        let humans = BTreeMap::new();
         let attr = Attribution::NoData;
-        assert_eq!(format_attribution(&attr), "[no-data]");
+        assert_eq!(format_attribution(&attr, &humans), "[no-data]");
     }
 
     #[test]
@@ -2418,7 +2777,7 @@ index abc123..def456 100644
     }
 
     #[test]
-    fn test_calculate_diff_commit_stats_counts_no_data_added_lines_as_human() {
+    fn test_calculate_diff_commit_stats_tracks_unknown_added_lines() {
         fn prompt_record(tool: &str, model: &str, additions: u32, deletions: u32) -> PromptRecord {
             PromptRecord {
                 agent_id: AgentId {
@@ -2427,13 +2786,12 @@ index abc123..def456 100644
                     model: model.to_string(),
                 },
                 human_author: None,
-                messages: vec![Message::user("u".to_string(), None)],
                 total_additions: additions,
                 total_deletions: deletions,
                 accepted_lines: 0,
                 overriden_lines: 0,
-                messages_url: None,
                 custom_attributes: None,
+                messages_url: None,
             }
         }
 
@@ -2462,7 +2820,7 @@ index abc123..def456 100644
             },
             Attribution::NoData,
         );
-        // Old-side no-data should not affect added-line stats.
+        // Old-side no-data should not affect unknown_lines_added.
         attributions.insert(
             DiffLineKey {
                 file: "f.rs".to_string(),
@@ -2484,6 +2842,8 @@ index abc123..def456 100644
             attributions,
             annotations_by_file,
             prompts: prompts.clone(),
+            humans: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             json_hunks: vec![DiffJsonHunk {
                 commit_sha: "abc".to_string(),
                 content_hash: "hash".to_string(),
@@ -2493,27 +2853,26 @@ index abc123..def456 100644
                 end_line: 6,
                 file_path: "f.rs".to_string(),
                 prompt_id: None,
+                session_id: None,
                 human_id: None,
             }],
             commits: BTreeMap::new(),
             included_files: HashSet::new(),
         };
 
-        let stats = calculate_diff_commit_stats(&artifacts, &prompts);
+        let sessions: BTreeMap<String, SessionRecord> = BTreeMap::new();
+        let stats = calculate_diff_commit_stats(&artifacts, &prompts, &sessions);
         assert_eq!(stats.ai_lines_added, 1);
-        assert_eq!(stats.human_lines_added, 2);
+        assert_eq!(stats.human_lines_added, 1);
+        assert_eq!(stats.unknown_lines_added, 1);
         assert_eq!(stats.git_lines_added, 3);
         assert_eq!(stats.git_lines_deleted, 2);
-        assert_eq!(stats.ai_lines_generated, 5);
-        assert_eq!(stats.ai_deletions_generated, 2);
 
         let breakdown = stats
             .tool_model_breakdown
             .get("cursor::gpt-4o")
             .expect("expected cursor::gpt-4o breakdown entry");
         assert_eq!(breakdown.ai_lines_added, 1);
-        assert_eq!(breakdown.ai_lines_generated, 5);
-        assert_eq!(breakdown.ai_deletions_generated, 2);
     }
 
     #[test]

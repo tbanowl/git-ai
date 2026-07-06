@@ -9,6 +9,8 @@ mod github_copilot;
 mod jetbrains;
 mod opencode;
 mod pi;
+#[cfg(windows)]
+mod visual_studio;
 mod vscode;
 mod windsurf;
 
@@ -23,6 +25,8 @@ pub use github_copilot::GitHubCopilotInstaller;
 pub use jetbrains::JetBrainsInstaller;
 pub use opencode::OpenCodeInstaller;
 pub use pi::PiInstaller;
+#[cfg(windows)]
+pub use visual_studio::VisualStudioInstaller;
 pub use vscode::VSCodeInstaller;
 pub use windsurf::WindsurfInstaller;
 
@@ -30,7 +34,7 @@ use super::hook_installer::HookInstaller;
 
 /// Get all available hook installers
 pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
-    vec![
+    let mut installers: Vec<Box<dyn HookInstaller>> = vec![
         Box::new(ClaudeCodeInstaller),
         Box::new(CodexInstaller),
         Box::new(CursorInstaller),
@@ -43,25 +47,11 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
         Box::new(DroidInstaller),
         Box::new(FirebenderInstaller),
         Box::new(JetBrainsInstaller),
-        // Box::new(WindsurfInstaller),
-    ]
-}
+    ];
 
-/// Get all available hook installers
-pub fn get_min_installers() -> Vec<Box<dyn HookInstaller>> {
-    vec![
-        Box::new(ClaudeCodeInstaller),
-        // Box::new(CodexInstaller),
-        // Box::new(CursorInstaller),
-        Box::new(VSCodeInstaller),
-        // Box::new(GitHubCopilotInstaller),
-        // Box::new(AmpInstaller),
-        Box::new(OpenCodeInstaller),
-        // Box::new(PiInstaller),
-        // Box::new(GeminiInstaller),
-        // Box::new(DroidInstaller),
-        // Box::new(FirebenderInstaller),
-        // Box::new(JetBrainsInstaller),
-        // Box::new(WindsurfInstaller),
-    ]
+    #[cfg(windows)]
+    installers.push(Box::new(VisualStudioInstaller));
+
+    installers.push(Box::new(WindsurfInstaller));
+    installers
 }
